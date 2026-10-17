@@ -549,3 +549,34 @@ async def import_legacy_mem0() -> dict:
     created = await engine._store_call(import_values)
     return {"ok": True, "found": len(values), "created": created,
             "status": "pending_review"}
+
+
+class AgentToolCall(BaseModel):
+    """One memory tool call from an external Agent (stdio MCP proxy)."""
+    model_config = ConfigDict(extra="forbid")
+    args: dict[str, Any] = Field(default_factory=dict)
+    session_id: str = Field(default="", max_length=128)
+    client: str = Field(default="", max_length=64)
+
+
+@router.get("/agent/tools")
+async def agent_tool_specs():
+    from .memory_tool_specs import SERVER_NAME, TOOL_SPECS
+    return {"server": SERVER_NAME, "tools": TOOL_SPECS}
+
+
+@router.post("/agent/tools/{tool_name}")
+async def agent_tool_call(tool_name: str, body: AgentToolCall):
+    """Same contract as the in-process MCP tools; errors are 200 + is_error.
+
+    The response mirrors an MCP tool result so the stdio proxy can forward it
+    unchanged and the Agent sees identical text from every client.
+    """
+    from . import memory_agent
+    from .memory_tool_specs import TOOL_SPECS
+    if tool_name not in TOOL_SPECS:
+        raise HTTPException(404, "unknown memory tool")
+    text, is_error = await memory_agent.run_tool_safely(
+        tool_name, body.args, session_id=body.session_id,
+        client=body.client or "external")
+    return {"text": text, "is_error": is_error}

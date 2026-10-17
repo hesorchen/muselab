@@ -45,9 +45,39 @@ discovered by the SDK. An authenticated, explicit approval installs it under
 `~/.claude/skills/muselab-generated-<name>/SKILL.md`; disabling moves it out of
 the discoverable directory while preserving its audit trail.
 
+## Agent-autonomous memory
+
+In active mode every chat session gets the in-process MCP server `muselab-memory`, so the Agent can call:
+
+| Tool | Purpose |
+| --- | --- |
+| `memory_search` | Hybrid keyword + semantic search with an optional kind filter; rewrite the query and retry on a miss |
+| `memory_get_evidence` | Trace a memory, evidence (`ev_…`) or Episode (`ep_…`) back to the original user/assistant messages, tool records and neighbouring context; long content is paged |
+| `memory_write` | Save one durable fact, preference, decision or lesson; exact duplicates are ignored and similar memories are returned for merging |
+| `memory_update` | Correct or rewrite any memory (including user-confirmed ones) as a new `supersedes` version; the old version stays in history |
+| `memory_delete` | Forget a wrong, obsolete or duplicate memory and remove its vector |
+
+The Agent may modify any memory without confirmation. Every write, update and delete is audited (`agent_write` / `agent_update` / `agent_delete`); new versions are `inferred` and carry the session source and the edit reason, so the memory center can inspect and revert them. Tool output is always marked as untrusted background data.
+
+Per-turn recall is controlled by `retrieval.recall_mode`:
+
+- `hint` (default): inject only candidate IDs and ~160-character previews, and nudge the Agent to search and trace on demand;
+- `inject`: inject the full recalled facts (previous behaviour);
+- `tool-only`: no pre-recall, only a reminder that memory tools exist.
+
+`hint` and `tool-only` apply only when the session's client actually has the memory tools attached; otherwise recall falls back to `inject`, so no recalled content is lost.
+
+Other Agent CLIs (Claude Code, Ducc, …) can share the same memory through the stdio bridge, which forwards calls to the running MuseLab via the token-protected `/api/memory/agent/tools/<tool>`:
+
+```bash
+claude mcp add muselab-memory -e MUSELAB_URL=http://127.0.0.1:8765 \
+  -e MUSELAB_TOKEN=<token> -e MUSELAB_MEMORY_CLIENT=claude-code -- \
+  python3 /path/to/muselab/scripts/muselab_memory_mcp.py
+```
+
 ## Source evidence tracebacks
 
-Memory sources can link to Episodes, conversation messages, and tool records. Open a source to return to its session. An explicit message source with a valid message ID can also locate the message; Episode and tool-evidence sources usually locate the session. Missing records or entries without sources may not support a traceback.
+Memory sources can link to Episodes, conversation messages, and tool records. Open a source to return to its session. Conversation-turn evidence records its message ID, so it jumps straight to the original message, and jumpable sources are listed first. Tool evidence and Agent-written session sources locate the session. Missing records or entries without sources may not support a traceback.
 
 “Copy evidence” copies session evidence locators, including session and workspace information and original record paths. It does not copy the full conversation or recreate the execution environment. Locators may contain private paths and identifiers; inspect and redact them before sharing publicly.
 

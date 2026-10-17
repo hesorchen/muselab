@@ -64,9 +64,39 @@ CLI JSONL 证据
 `~/.claude/skills/muselab-generated-<name>/SKILL.md`。禁用会移出可发现目录并保留
 审计记录。
 
+## Agent 自主记忆
+
+主动模式下，每个聊天会话会挂载进程内 MCP 服务 `muselab-memory`，Agent 可自行调用：
+
+| 工具 | 作用 |
+| --- | --- |
+| `memory_search` | 关键词＋语义混合检索，可按类型过滤；未命中时可改写查询再检索 |
+| `memory_get_evidence` | 从记忆、证据（`ev_…`）或 Episode（`ep_…`）回溯原始用户／助手消息、工具记录与相邻上下文，长内容分页返回 |
+| `memory_write` | 写入一条可长期复用的事实、偏好、决策或经验；完全相同的记忆不重复写入，并返回相近记忆供合并 |
+| `memory_update` | 更正或改写任意记忆（含用户确认过的记忆），生成 `supersedes` 新版本，旧版本保留在历史中 |
+| `memory_delete` | 删除错误、过时或重复的记忆，同时清理向量索引 |
+
+Agent 可以不经确认地修改任何记忆。所有写入、更正和删除都会记录审计（`agent_write`／`agent_update`／`agent_delete`），新版本标记为 `inferred` 并附带会话来源与修改原因，可在记忆中心查看和回退。工具返回的内容一律标记为不可信背景数据。
+
+每轮召回方式由“每轮召回方式”（`retrieval.recall_mode`）控制：
+
+- `hint`（默认）：只注入候选记忆的编号与约 160 字摘要，并提示 Agent 按需检索与回溯；
+- `inject`：注入完整召回内容（旧行为）；
+- `tool-only`：不预召回，只提醒记忆工具可用。
+
+`hint` 与 `tool-only` 仅在当前会话的客户端确实挂载了记忆工具时生效，否则自动回退为 `inject`，保证不会丢失召回内容。
+
+其他 Agent CLI（Claude Code、Ducc 等）可通过 stdio 桥接共享同一份记忆，调用会经带 Token 鉴权的 `/api/memory/agent/tools/<tool>` 转发到运行中的 MuseLab：
+
+```bash
+claude mcp add muselab-memory -e MUSELAB_URL=http://127.0.0.1:8765 \
+  -e MUSELAB_TOKEN=<token> -e MUSELAB_MEMORY_CLIENT=claude-code -- \
+  python3 /path/to/muselab/scripts/muselab_memory_mcp.py
+```
+
 ## 现场证据回溯
 
-记忆来源可以关联 Episode、会话消息和工具调用记录。通过来源入口可返回相关会话；显式消息来源包含有效消息标识时，还可定位到对应消息。Episode 或工具证据来源通常定位到会话，记录缺失或没有来源的条目可能无法回溯。
+记忆来源可以关联 Episode、会话消息和工具调用记录。通过来源入口可返回相关会话；对话轮次证据会记录对应的消息标识，因此可直接定位到原消息，可定位的来源排在最前。工具证据与 Agent 写入的会话来源定位到会话，记录缺失或没有来源的条目可能无法回溯。
 
 “复制现场证据”复制的是会话证据定位信息，包括会话、工作区和原始记录路径，而不是完整对话正文，也不会重建当时的执行环境。定位信息可能包含私有路径与标识，公开分享前应检查并脱敏。
 

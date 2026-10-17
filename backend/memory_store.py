@@ -1335,10 +1335,16 @@ class MemoryStore:
                     session_id = str(row["primary_session_id"]) if row else None
                 elif source_type == "evidence":
                     row = conn.execute(
-                        "SELECT session_id FROM evidence WHERE id=? AND owner_id=?",
+                        "SELECT session_id,source_ref FROM evidence "
+                        "WHERE id=? AND owner_id=?",
                         (source_id, owner_id),
                     ).fetchone()
                     session_id = str(row["session_id"]) if row else None
+                    if row:
+                        message_id = self._evidence_message_id(
+                            session_id, row["source_ref"])
+                elif source_type == "session":
+                    session_id = source_id
                 elif source_type == "message" and ":" in source_id:
                     candidate_session, candidate_message = source_id.split(":", 1)
                     if self._valid_uuid(candidate_session):
@@ -1363,7 +1369,86 @@ class MemoryStore:
                 continue
             seen.add(key)
             deduped.append(site)
+        # The UI opens the first site: prefer an exact message over a session.
+        deduped.sort(key=lambda site: not site["can_jump_to_message"])
         return deduped
+
+    @classmethod
+    def _evidence_message_id(cls, session_id: str | None,
+                             source_ref: str | None) -> str | None:
+        """Return the assistant message UUID recorded for a chat-turn evidence.
+
+        Turn evidence is stored as ``<session>:<assistant-uuid>:<role>``; tool
+        evidence uses CLI tool ids and only resolves to its session.
+        """
+        parts = str(source_ref or "").split(":")
+        if (len(parts) == 3 and parts[0] == session_id
+                and parts[2] in {"user", "assistant"} and cls._valid_uuid(parts[1])):
+            return parts[1]
+        return None
+
+    def evidence_context(self, owner_id: str, evidence_id: str, *,
+                         before: int = 2, after: int = 2) -> dict | None:
+        """Owner-scoped evidence plus its neighbours in the same session."""
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT rowid AS seq,* FROM evidence WHERE id=? AND owner_id=?",
+                (evidence_id, owner_id)).fetchone()
+            if row is None:
+                return None
+            target = self._row(row) or {}
+            previous = conn.execute(
+                """SELECT * FROM evidence WHERE owner_id=? AND session_id=?
+                   AND (created_at<? OR (created_at=? AND rowid<?))
+                   ORDER BY created_at DESC, rowid DESC LIMIT ?""",
+                (owner_id, target["session_id"], target["created_at"],
+                 target["created_at"], target["seq"], max(0, before))).fetchall()
+            following = conn.execute(
+                """SELECT * FROM evidence WHERE owner_id=? AND session_id=?
+                   AND (created_at>? OR (created_at=? AND rowid>?))
+                   ORDER BY created_at, rowid LIMIT ?""",
+                (owner_id, target["session_id"], target["created_at"],
+                 target["created_at"], target["seq"], max(0, after))).fetchall()
+        target.pop("seq", None)
+        return {"target": target,
+                "before": [self._row(item) or {} for item in reversed(previous)],
+                "after": [self._row(item) or {} for item in following]}
+
+    def evidence_near(self, owner_id: str, session_id: str, at: float, *,
+                      before: int = 2, after: int = 2) -> list[dict]:
+        """Session evidence around a timestamp (for session-level sources)."""
+        with self._lock, self._connect() as conn:
+            previous = conn.execute(
+                """SELECT * FROM evidence WHERE owner_id=? AND session_id=?
+                   AND created_at<? ORDER BY created_at DESC, rowid DESC LIMIT ?""",
+                (owner_id, session_id, at, max(0, before))).fetchall()
+            following = conn.execute(
+                """SELECT * FROM evidence WHERE owner_id=? AND session_id=?
+                   AND created_at>=? ORDER BY created_at, rowid LIMIT ?""",
+                (owner_id, session_id, at, max(0, after))).fetchall()
+        return [self._row(item) or {} for item in [*reversed(previous), *following]]
+
+    def find_active_duplicate(self, owner_id: str, content: str) -> dict | None:
+        """Exact (whitespace-normalised) active duplicate, if one exists."""
+        normalized = " ".join(str(content).split())
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id,content FROM memories WHERE owner_id=? AND status='active' "
+                "AND content=?", (owner_id, normalized)).fetchall()
+            if not rows and normalized != content:
+                rows = conn.execute(
+                    "SELECT id,content FROM memories WHERE owner_id=? "
+                    "AND status='active' AND content=?",
+                    (owner_id, content)).fetchall()
+        return self.memory(str(rows[0]["id"])) if rows else None
+
+    def open_episode_id(self, owner_id: str, session_id: str) -> str | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """SELECT id FROM episodes WHERE owner_id=? AND primary_session_id=?
+                   AND status='open' ORDER BY updated_at DESC LIMIT 1""",
+                (owner_id, session_id)).fetchone()
+        return str(row["id"]) if row else None
 
     def update_memory(self, memory_id: str, *, content: str | None = None,
                       status: str | None = None, kind: str | None = None,
@@ -1399,7 +1484,10 @@ class MemoryStore:
         return self.memory(memory_id)
 
     def supersede_memory(self, memory_id: str, owner_id: str, content: str,
-                         *, kind: str | None = None) -> dict:
+                         *, kind: str | None = None, authority: str = "confirmed",
+                         confidence: float = 1.0,
+                         extra_sources: list[dict] | None = None,
+                         attributes: dict | None = None) -> dict:
         # Three atomic steps rather than one transaction: _write_tx is not
         # reentrant (create_memory's own audit/read helpers open sibling
         # connections that would block on the outer write lock).  The order is
@@ -1410,11 +1498,12 @@ class MemoryStore:
             raise KeyError(memory_id)
         if old["status"] in {"superseded", "deleted"}:
             raise ValueError(f"memory is {old['status']} and cannot be corrected")
+        merged_attributes = {**(old.get("attributes") or {}), **(attributes or {})}
         new = self.create_memory(
-            owner_id, kind or old["kind"], content, authority="confirmed",
-            confidence=1.0, attributes=old.get("attributes"), tags=old.get("tags"),
+            owner_id, kind or old["kind"], content, authority=authority,
+            confidence=confidence, attributes=merged_attributes, tags=old.get("tags"),
             sources=[{"source_type": "memory", "source_id": memory_id,
-                      "relation": "supersedes"}],
+                      "relation": "supersedes"}, *(extra_sources or [])],
         )
         self.update_memory(memory_id, status="superseded")
         self.add_relation("memory", new["id"], "supersedes", "memory", memory_id)

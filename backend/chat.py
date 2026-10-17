@@ -93,6 +93,7 @@ from .ask_user_question import (
 )
 from . import permission_request as perm
 from . import memory_client as mem0
+from . import memory_agent
 from . import observability as obs
 from . import replay_io
 from .private_storage import (
@@ -4138,6 +4139,30 @@ async def _build_and_connect_client(
             obs.diagnostic_line(
                 f"[chat] mcp merge failed sid={session_id[:8]} "
                 f"exc={type(e).__name__}; external MCP disabled for this client\n")
+    if side_question_runtime:
+        memory_agent.detach_session(session_id)
+    else:
+        # Agent-autonomous memory: search / evidence / write / update / delete.
+        # Attached only while native memory is active; the recall hook reads
+        # the same registry to decide between hint and full injection.
+        try:
+            memory_server = await obs.to_thread_io(
+                "chat.memory_tools", session_id,
+                lambda: memory_agent.session_server(session_id))
+        except Exception as e:
+            memory_agent.detach_session(session_id)
+            memory_server = None
+            obs.diagnostic_line(
+                f"[chat] memory tools unavailable sid={session_id[:8]} "
+                f"exc={type(e).__name__}\n")
+        if memory_server is not None:
+            mcp_dict[memory_agent.SERVER_NAME] = memory_server
+            # Allow rules only: the Agent may use (and freely edit) memory
+            # without a permission prompt per call.
+            opts_kwargs["allowed_tools"] = [
+                *opts_kwargs.get("allowed_tools", []),
+                *memory_agent.QUALIFIED_TOOL_NAMES,
+            ]
     opts_kwargs["mcp_servers"] = mcp_dict
     # Enable extended thinking for models whose provider endpoint handles
     # the standard Anthropic thinking config. Some vendors (e.g. Qianfan)

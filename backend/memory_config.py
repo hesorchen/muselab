@@ -54,6 +54,11 @@ class RetrievalConfig(BaseModel):
     # One end-to-end recall budget. Zero waits for every enabled stage without
     # a timer; preserve the existing key so saved configurations keep working.
     soft_timeout_ms: int = Field(default=0, ge=0)
+    # How the per-turn hook uses recall when the Agent has memory tools:
+    #   inject    - full recalled facts in the prompt (pre-tool behaviour)
+    #   hint      - IDs + short previews; the Agent searches/reads on demand
+    #   tool-only - no pre-recall; only a reminder that memory tools exist
+    recall_mode: Literal["inject", "hint", "tool-only"] = "hint"
 
 
 class ConsolidationConfig(BaseModel):

@@ -1720,15 +1720,27 @@ class MemoryEngine:
                         (memory_id,))
             await self._store_call(mark_pending)
 
-    async def recall(self, query: str, session_id: str) -> list[dict]:
+    async def recall(self, query: str, session_id: str, *,
+                     limit: int | None = None, kind: str | None = None,
+                     origin: str = "hook") -> list[dict]:
+        """Hybrid recall.
+
+        ``origin="hook"`` is the per-turn pre-recall that owns the session's
+        live receipt. ``origin="agent"`` is an explicit Agent search: it uses
+        only the Agent's query, honours its limit/kind filter, is logged as a
+        recall receipt, and never replaces the hook receipt of the turn.
+        """
         started = time.perf_counter()
         cfg = await self._config_async()
         timeout_ms = cfg.retrieval.soft_timeout_ms
         deadline = started + timeout_ms / 1000 if timeout_ms else None
         query = str(query).strip()[:8000]
-        self._recall_trace.pop(session_id, None)
+        agent = origin == "agent"
+        if not agent:
+            self._recall_trace.pop(session_id, None)
         if cfg.mode != "active" or not query:
             return []
+        final_limit = max(1, min(int(limit or cfg.retrieval.final_limit), 20))
         recall_id = MemoryStore.new_recall_id()
         perf_event("memory.recall_start", recall_id=recall_id,
                    session=obs.short_id(session_id), timeout_ms=timeout_ms)
@@ -1770,12 +1782,15 @@ class MemoryEngine:
 
         try:
             with recall_request_budget(deadline), provider_transport_scope(self._provider_http):
-                recent = await stage("recent", lambda: self._recall_store_call(
+                # An Agent query is already self-contained; mixing in the
+                # previous turns would dilute a deliberately rewritten query.
+                recent = [] if agent else await stage("recent", lambda: self._recall_store_call(
                     lambda store: store.recent_evidence(
                         cfg.owner_id, session_id, role="user", limit=2), deadline=deadline,
                     recall_id=recall_id, stage="recent"))
                 result = await self._recall_candidates(
-                    cfg, query, recent, deadline, stages, stage, recall_id)
+                    cfg, query, recent, deadline, stages, stage, recall_id,
+                    final_limit=final_limit, kind=kind)
                 return result
         except asyncio.CancelledError:
             cancelled = True
@@ -1792,20 +1807,34 @@ class MemoryEngine:
             latency = (time.perf_counter() - started) * 1000
             self._schedule_recall_telemetry(
                 recall_id=recall_id, owner_id=cfg.owner_id, session_id=session_id,
-                query=query, results=result, latency_ms=latency, status=status)
+                query=query, results=[
+                    {**item, "channels": [*item.get("channels", []), "agent"]}
+                    for item in result] if agent else result,
+                latency_ms=latency, status=status)
             fields = {f"{name}_status": value for name, value in stages.items()}
-            self._recall_trace[session_id] = {
-                "id": recall_id, "count": len(result), "latency_ms": round(latency, 1),
-                "status": status, **fields,
-                "items": [{"id": item["id"], "kind": item["kind"],
-                           "content": item["content"], "score": round(item["score"], 5),
-                           "sources": item.get("sources", [])} for item in result]}
-            perf_event("memory.recall_finish", recall_id=recall_id,
-                       session=obs.short_id(session_id) or "none",
-                       duration_ms=round(latency, 1), count=len(result),
-                       status=status, timeout_ms=timeout_ms, **fields)
+            if agent:
+                perf_event("memory.agent_search_finish", recall_id=recall_id,
+                           session=obs.short_id(session_id) or "none",
+                           duration_ms=round(latency, 1), count=len(result),
+                           status=status)
+                for item in result:
+                    item["recall_id"] = recall_id
+            else:
+                self._recall_trace[session_id] = {
+                    "id": recall_id, "count": len(result), "latency_ms": round(latency, 1),
+                    "status": status, **fields,
+                    "items": [{"id": item["id"], "kind": item["kind"],
+                               "content": item["content"], "score": round(item["score"], 5),
+                               "sources": item.get("sources", [])} for item in result]}
+                perf_event("memory.recall_finish", recall_id=recall_id,
+                           session=obs.short_id(session_id) or "none",
+                           duration_ms=round(latency, 1), count=len(result),
+                           status=status, timeout_ms=timeout_ms, **fields)
 
-    async def _recall_candidates(self, cfg, query, recent, deadline, stages, stage, recall_id):
+    async def _recall_candidates(self, cfg, query, recent, deadline, stages, stage, recall_id,
+                                 *, final_limit: int | None = None,
+                                 kind: str | None = None):
+        final_limit = final_limit or cfg.retrieval.final_limit
         prior = [str(item.get("content", ""))[:1000] for item in recent
                  if item.get("content")]
         # Bound what goes to the embedder. Local CPU BGE-M3 latency scales
@@ -1913,12 +1942,14 @@ class MemoryEngine:
                 value["score"] += 1.0 / (60 + rank + 1)
                 value["channels"].append(row.get("channel", "unknown"))
         candidates = sorted(fused.values(), key=lambda item: item["score"], reverse=True)
-        candidate_limit = max(cfg.retrieval.final_limit * 3, 12)
+        candidate_limit = max(final_limit * 3, 12)
         candidate_rows = candidates[:candidate_limit]
         hydrated: list[dict] = []
         for candidate in candidate_rows:
             memory = memory_by_id.get(candidate["id"])
             if not memory or memory.get("status") != "active":
+                continue
+            if kind and memory.get("kind") != kind:
                 continue
             authority_boost = {"confirmed": 1.3, "inferred": 1.0}.get(
                 memory.get("authority"), 0.8)
@@ -1940,7 +1971,7 @@ class MemoryEngine:
                     item["score"] = by_index.get(index, 0)
                     item["channels"].append("rerank")
                 hydrated.sort(key=lambda item: item["score"], reverse=True)
-        return hydrated[:cfg.retrieval.final_limit]
+        return hydrated[:final_limit]
 
     def peek_recall_trace(self, session_id: str) -> dict | None:
         """Share the live receipt with the hook without consuming the SSE receipt."""
@@ -2004,21 +2035,23 @@ class MemoryEngine:
         return memory
 
     async def correct_memory(self, memory_id: str, content: str,
-                             *, kind: str | None = None) -> dict:
+                             *, kind: str | None = None, **supersede) -> dict:
+        """Supersede a memory. ``supersede`` forwards authority/confidence/
+        extra_sources/attributes; the defaults keep user corrections confirmed."""
         async with self._vector_mutation_lock:
             return await self._join_vector_write(
-                self._correct_memory(memory_id, content, kind=kind))
+                self._correct_memory(memory_id, content, kind=kind, **supersede))
 
     async def forget_memory(self, memory_id: str) -> bool:
         async with self._vector_mutation_lock:
             return await self._join_vector_write(self._forget_memory(memory_id))
 
     async def _correct_memory(self, memory_id: str, content: str,
-                             *, kind: str | None = None) -> dict:
+                             *, kind: str | None = None, **supersede) -> dict:
         cfg = await self._config_async()
         memory = await self._store_call(
             lambda store: store.supersede_memory(
-                memory_id, cfg.owner_id, content, kind=kind))
+                memory_id, cfg.owner_id, content, kind=kind, **supersede))
         if cfg.enabled:
             queue_unindex = False
             try:

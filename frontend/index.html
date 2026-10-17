@@ -4601,6 +4601,13 @@
                    :value="settings.memory.config.retrieval.soft_timeout_ms / 1000"
                    @input="settings.memory.config.retrieval.soft_timeout_ms = Math.round(Number($event.target.value) * 1000)" /></div>
           <div class="settings-hint" x-text="lang==='zh' ? '0 表示无超时。' : '0 means no timeout.'"></div>
+          <div class="settings-row"><label for="setting-settings-memory-config-retrieval-recall-mode" x-text="lang==='zh' ? '每轮召回方式' : 'Per-turn recall'"></label>
+            <select id="setting-settings-memory-config-retrieval-recall-mode" class="settings-input" x-model="settings.memory.config.retrieval.recall_mode">
+              <option value="hint" x-text="lang==='zh' ? '提示（编号＋摘要，Agent 按需检索）' : 'Hint (ids + previews, Agent searches on demand)'"></option>
+              <option value="inject" x-text="lang==='zh' ? '注入（完整召回内容）' : 'Inject (full recalled facts)'"></option>
+              <option value="tool-only" x-text="lang==='zh' ? '仅工具（不预召回）' : 'Tools only (no pre-recall)'"></option>
+            </select></div>
+          <div class="settings-hint" x-text="lang==='zh' ? '启用后 Agent 可通过记忆工具自主检索、溯源、写入、修改和删除记忆；提示与仅工具模式只在会话已挂载记忆工具时生效，否则回退为注入。' : 'In active mode the Agent can search, trace, write, update and delete memories through memory tools. Hint and tools-only apply only when the session has the tools attached; otherwise recall falls back to inject.'"></div>
           <div class="settings-row"><label for="setting-settings-memory-config-retrieval-final-limit" x-text="lang==='zh' ? '最终召回条数' : 'Final recall limit'"></label>
             <input id="setting-settings-memory-config-retrieval-final-limit" class="settings-input" type="number" min="1" max="20"
                    x-model.number="settings.memory.config.retrieval.final_limit" /></div>
