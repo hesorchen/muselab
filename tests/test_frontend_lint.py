@@ -5501,7 +5501,7 @@ def test_auto_compact_drives_the_same_ui_as_a_manual_one():
 
     # The emitter is injected, not closed over: merge_q is one scope deeper.
     assert "async def _emit_side(evt: dict) -> None:" in chat
-    assert "await _preflight_compact_if_needed(_emit_side)" in chat
+    assert "await _preflight_compact_if_needed(emit_side, context_probe)" in chat
     # A UI cue must never kill the turn it describes.
     helper = chat[chat.index("async def _emit_compact("):]
     helper = helper[:helper.index("async def _preflight_compact_if_needed(")]
