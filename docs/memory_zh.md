@@ -7,15 +7,21 @@ MuseLab 的长期记忆是默认关闭的可选能力。它面向长期业务背
 
 ## 架构
 
-```text
-CLI JSONL 证据
-  → SQLite Registry（真相源、来源、版本、冲突、审核、队列）
-  → Episode（跨多轮任务经历）
-  → Dreamer（候选事实／决策／反思）
-  → Verifier（证据、冲突和未来价值检查）
-  → lexical + dense + metadata 混合召回
-  → 有界、不可信的聊天上下文
+```mermaid
+flowchart LR
+    J["CLI JSONL 证据"] --> E["Episode<br/>跨多轮任务经历"]
+    E --> D["Dreamer<br/>候选事实 / 决策 / 反思"]
+    D --> V["Verifier<br/>证据、冲突、价值检查"]
+    V -->|"inferred"| R[("SQLite Registry<br/>真相源：来源、版本、冲突、审核、队列")]
+    U["脑形按钮 / 记忆中心"] -->|"confirmed"| R
+    A["Agent 记忆工具<br/>write / update / delete"] -->|"inferred + 审计"| R
+    R -.->|"可重建索引"| X[("Qdrant / pgvector")]
+    R --> H["混合召回<br/>lexical + dense + metadata"]
+    X --> H
+    H --> C["有界、不可信的聊天上下文"]
 ```
+
+写入有三个入口：后台做梦整理、用户在界面确认、Agent 通过工具主动维护，最终都落到同一个 Registry。
 
 一个用户只有一个逻辑记忆池。工作区、业务、主题和实体是软元数据，不是彼此隔绝的
 “记忆空间”。向量数据库只保存可重建的检索索引；切换 Embedding 模型或数据库后可
@@ -59,6 +65,17 @@ CLI JSONL 证据
 分类器；用户点击后，内容以 `confirmed` 权威级别写入。更正会建立 `supersedes`
 关系，忘记会同时使 Registry 条目失效并清理向量索引。
 
+```mermaid
+stateDiagram-v2
+    [*] --> active: 通过校验 / 用户确认 / Agent 写入
+    [*] --> pending_review: 价值较低或影子模式
+    [*] --> quarantined: 与已有记忆冲突
+    pending_review --> active: 人工审核（升为 confirmed）
+    active --> superseded: 更正（用户或 Agent），生成新版本
+    active --> deleted: 忘记（用户或 Agent）
+    pending_review --> deleted: 忘记
+```
+
 后台 Worker 只能生成 Skill 草稿。草稿保存在 SQLite 中，不在 SDK 可发现目录。
 只有带现有 Token 鉴权的用户明确点击“审核并启用”，才会安装到
 `~/.claude/skills/muselab-generated-<name>/SKILL.md`。禁用会移出可发现目录并保留
@@ -78,6 +95,35 @@ CLI JSONL 证据
 
 Agent 可以不经确认地修改任何记忆。所有写入、更正和删除都会记录审计（`agent_write`／`agent_update`／`agent_delete`），新版本标记为 `inferred` 并附带会话来源与修改原因，可在记忆中心查看和回退。工具返回的内容一律标记为不可信背景数据。
 
+一轮对话中 Agent 使用记忆的典型过程：
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant H as 提交前召回 Hook
+    participant A as Agent
+    participant M as muselab-memory 工具
+    participant R as Registry
+    U->>H: 发送消息
+    H->>R: 混合召回
+    R-->>H: 候选记忆
+    H-->>A: memory_hint：编号 + 摘要（hint 模式）
+    opt 需要背景
+        A->>M: memory_search（可多次、可改写查询）
+        M->>R: 检索并记录召回日志
+        R-->>M: 记忆 + 来源编号
+    end
+    opt 需要原文
+        A->>M: memory_get_evidence
+        M-->>A: 原消息 / 工具记录 / 相邻上下文（分页）
+    end
+    opt 发现值得记或需要更正
+        A->>M: memory_write / update / delete
+        M->>R: 写入新版本 + 审计
+    end
+    A-->>U: 回答
+```
+
 每轮召回方式由“每轮召回方式”（`retrieval.recall_mode`）控制：
 
 - `hint`（默认）：只注入候选记忆的编号与约 160 字摘要，并提示 Agent 按需检索与回溯；
@@ -86,7 +132,26 @@ Agent 可以不经确认地修改任何记忆。所有写入、更正和删除�
 
 `hint` 与 `tool-only` 仅在当前会话的客户端确实挂载了记忆工具时生效，否则自动回退为 `inject`，保证不会丢失召回内容。
 
+```mermaid
+flowchart TD
+    S["每轮开始"] --> Q{"本会话已挂载记忆工具？"}
+    Q -->|"否"| I["inject：注入完整召回内容"]
+    Q -->|"是"| M{"recall_mode"}
+    M -->|"inject"| I
+    M -->|"hint"| HN["hint：候选编号 + 摘要<br/>Agent 按需检索"]
+    M -->|"tool-only"| T["tool-only：不预召回<br/>只提示工具可用"]
+```
+
 其他 Agent CLI（Claude Code、Ducc 等）可通过 stdio 桥接共享同一份记忆，调用会经带 Token 鉴权的 `/api/memory/agent/tools/<tool>` 转发到运行中的 MuseLab：
+
+```mermaid
+flowchart LR
+    W["MuseLab 网页会话"] -->|"进程内 SDK MCP"| T["记忆工具实现"]
+    C["Claude Code / Ducc / Codex"] -->|"stdio"| B["scripts/muselab_memory_mcp.py"]
+    B -->|"HTTP + X-Auth-Token"| P["/api/memory/agent/tools/{tool}"]
+    P --> T
+    T --> R[("Registry + 向量索引")]
+```
 
 ```bash
 claude mcp add muselab-memory -e MUSELAB_URL=http://127.0.0.1:8765 \
@@ -97,6 +162,19 @@ claude mcp add muselab-memory -e MUSELAB_URL=http://127.0.0.1:8765 \
 ## 现场证据回溯
 
 记忆来源可以关联 Episode、会话消息和工具调用记录。通过来源入口可返回相关会话；对话轮次证据会记录对应的消息标识，因此可直接定位到原消息，可定位的来源排在最前。工具证据与 Agent 写入的会话来源定位到会话，记录缺失或没有来源的条目可能无法回溯。
+
+```mermaid
+flowchart LR
+    M["记忆"] --> S["来源记录"]
+    S --> E["Episode<br/>任务经历"]
+    S --> V["Evidence<br/>消息 / 工具调用"]
+    S --> SS["会话<br/>Agent 写入来源"]
+    S --> O["旧版本记忆<br/>supersedes"]
+    E --> V
+    V -->|"对话轮次证据"| MSG["定位到原消息"]
+    V -->|"工具证据"| SES["定位到会话"]
+    SS --> SES
+```
 
 “复制现场证据”复制的是会话证据定位信息，包括会话、工作区和原始记录路径，而不是完整对话正文，也不会重建当时的执行环境。定位信息可能包含私有路径与标识，公开分享前应检查并脱敏。
 

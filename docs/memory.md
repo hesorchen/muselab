@@ -13,6 +13,22 @@ versions, conflicts, review state, jobs, and audit events. Qdrant or pgvector
 is only a rebuildable dense index. Retrieval fuses SQLite FTS, dense similarity,
 metadata, authority, and confidence, with an optional reranker.
 
+```mermaid
+flowchart LR
+    J["CLI JSONL evidence"] --> E["Episode<br/>multi-turn task experience"]
+    E --> D["Dreamer<br/>candidate facts / decisions / reflections"]
+    D --> V["Verifier<br/>evidence, conflict, value checks"]
+    V -->|"inferred"| R[("SQLite Registry<br/>source of truth: provenance, versions, conflicts, review, jobs")]
+    U["Brain button / Memory Center"] -->|"confirmed"| R
+    A["Agent memory tools<br/>write / update / delete"] -->|"inferred + audit"| R
+    R -.->|"rebuildable index"| X[("Qdrant / pgvector")]
+    R --> H["Hybrid recall<br/>lexical + dense + metadata"]
+    X --> H
+    H --> C["Bounded, untrusted chat context"]
+```
+
+Memories are written through three entry points — background dreaming, user confirmation in the UI, and Agent tool calls — all landing in the same Registry.
+
 Each user has one logical memory pool. Workspaces, domains, topics, and entities are soft metadata, not isolated memory stores. Rebuild the retrieval index from the Registry after changing the embedding model or vector database.
 
 ## Setup
@@ -40,6 +56,17 @@ message is a deterministic confirmed-memory action; natural-language
 "remember/correct/forget" classification is not required. Corrections retain a
 `supersedes` edge and forgetting also removes the vector entry.
 
+```mermaid
+stateDiagram-v2
+    [*] --> active: verified / user confirmed / Agent write
+    [*] --> pending_review: low value or shadow mode
+    [*] --> quarantined: conflicts with existing memory
+    pending_review --> active: manual review (becomes confirmed)
+    active --> superseded: correction by user or Agent, new version
+    active --> deleted: forget (user or Agent)
+    pending_review --> deleted: forget
+```
+
 Workers can create Skill drafts only. A draft remains in SQLite and cannot be
 discovered by the SDK. An authenticated, explicit approval installs it under
 `~/.claude/skills/muselab-generated-<name>/SKILL.md`; disabling moves it out of
@@ -59,6 +86,35 @@ In active mode every chat session gets the in-process MCP server `muselab-memory
 
 The Agent may modify any memory without confirmation. Every write, update and delete is audited (`agent_write` / `agent_update` / `agent_delete`); new versions are `inferred` and carry the session source and the edit reason, so the memory center can inspect and revert them. Tool output is always marked as untrusted background data.
 
+A typical turn in which the Agent uses memory:
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant H as Pre-submit recall hook
+    participant A as Agent
+    participant M as muselab-memory tools
+    participant R as Registry
+    U->>H: send message
+    H->>R: hybrid recall
+    R-->>H: candidate memories
+    H-->>A: memory_hint: IDs + previews (hint mode)
+    opt needs background
+        A->>M: memory_search (repeatable, query may be rewritten)
+        M->>R: search and log recall
+        R-->>M: memories + source IDs
+    end
+    opt needs original text
+        A->>M: memory_get_evidence
+        M-->>A: original messages / tool records / neighbouring context (paged)
+    end
+    opt something worth keeping or fixing
+        A->>M: memory_write / update / delete
+        M->>R: new version + audit
+    end
+    A-->>U: answer
+```
+
 Per-turn recall is controlled by `retrieval.recall_mode`:
 
 - `hint` (default): inject only candidate IDs and ~160-character previews, and nudge the Agent to search and trace on demand;
@@ -67,7 +123,26 @@ Per-turn recall is controlled by `retrieval.recall_mode`:
 
 `hint` and `tool-only` apply only when the session's client actually has the memory tools attached; otherwise recall falls back to `inject`, so no recalled content is lost.
 
+```mermaid
+flowchart TD
+    S["Turn starts"] --> Q{"Memory tools attached to this session?"}
+    Q -->|"no"| I["inject: full recalled content"]
+    Q -->|"yes"| M{"recall_mode"}
+    M -->|"inject"| I
+    M -->|"hint"| HN["hint: candidate IDs + previews<br/>Agent searches on demand"]
+    M -->|"tool-only"| T["tool-only: no pre-recall<br/>only a tool reminder"]
+```
+
 Other Agent CLIs (Claude Code, Ducc, …) can share the same memory through the stdio bridge, which forwards calls to the running MuseLab via the token-protected `/api/memory/agent/tools/<tool>`:
+
+```mermaid
+flowchart LR
+    W["MuseLab web session"] -->|"in-process SDK MCP"| T["Memory tool implementation"]
+    C["Claude Code / Ducc / Codex"] -->|"stdio"| B["scripts/muselab_memory_mcp.py"]
+    B -->|"HTTP + X-Auth-Token"| P["/api/memory/agent/tools/{tool}"]
+    P --> T
+    T --> R[("Registry + vector index")]
+```
 
 ```bash
 claude mcp add muselab-memory -e MUSELAB_URL=http://127.0.0.1:8765 \
@@ -78,6 +153,19 @@ claude mcp add muselab-memory -e MUSELAB_URL=http://127.0.0.1:8765 \
 ## Source evidence tracebacks
 
 Memory sources can link to Episodes, conversation messages, and tool records. Open a source to return to its session. Conversation-turn evidence records its message ID, so it jumps straight to the original message, and jumpable sources are listed first. Tool evidence and Agent-written session sources locate the session. Missing records or entries without sources may not support a traceback.
+
+```mermaid
+flowchart LR
+    M["Memory"] --> S["Source record"]
+    S --> E["Episode<br/>task experience"]
+    S --> V["Evidence<br/>message / tool call"]
+    S --> SS["Session<br/>Agent-written source"]
+    S --> O["Older memory version<br/>supersedes"]
+    E --> V
+    V -->|"conversation-turn evidence"| MSG["Jump to original message"]
+    V -->|"tool evidence"| SES["Open session"]
+    SS --> SES
+```
 
 “Copy evidence” copies session evidence locators, including session and workspace information and original record paths. It does not copy the full conversation or recreate the execution environment. Locators may contain private paths and identifiers; inspect and redact them before sharing publicly.
 

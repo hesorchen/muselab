@@ -58,7 +58,7 @@
 | **Agent execution and extensions** | Tool calls, subagent timelines, code diffs, Hook status, and model usage, with support for Skills, MCP, and Hook configuration |
 | **Continuous session workflows** | Session tabs, background execution, persistent message queues, session forks, and last-turn retries |
 | **Global task management** | Task states and results across sessions, with background tasks, scheduled tasks, and push notifications |
-| **Long-term memory** | Dreaming to consolidate task experience, hybrid recall, source evidence tracebacks, and manual correction; disabled by default and configured separately |
+| **Long-term memory** | Dreaming to consolidate task experience; the Agent searches, traces source evidence and maintains memories through MCP tools, and external CLIs such as Claude Code or Ducc can share the same memory; supports manual correction, disabled by default and configured separately |
 | **Multiple models and providers** | Claude OAuth, API keys, Codex through a separate local gateway, and configurable Anthropic-compatible endpoints |
 | **File previews and editing** | Markdown, HTML, images, PDF, XLSX, CSV, TSV, and text previews, with Markdown editing and split preview |
 | **Desktop, mobile, and Apple Watch** | Desktop browsers and the mobile PWA share working files and sessions, with English/Chinese UI and multiple themes; Apple Watch Shortcuts support dictation, recent sessions, reply reading, and follow-up messages |
