@@ -20,6 +20,26 @@ Use application schedules for plans that must survive a session runtime ending o
 - A completed run writes history and increments the unread count. With Web Push configured, completion can also be delivered while the page is closed, without reply content in the notification body.
 - Deleting a task does not delete sessions it created or reused.
 
+Startup catch-up, the scheduler tick, and manual runs all enter the same run path:
+
+```mermaid
+flowchart TD
+    Start["Service startup"] --> Load["Load tasks from scheduler.json"]
+    Load --> Next["Recompute each next run"]
+    Load --> Missed{"Most recent run<br/>missed while down?"}
+    Missed -->|"yes"| Catch["One catch-up run<br/>staggered across tasks"]
+    Next --> Tick["Scheduler tick in<br/>the backend loop"]
+    Tick --> Due{"Enabled task<br/>past its next run?"}
+    Due -->|"no"| Tick
+    Due -->|"yes"| Advance["Advance next run<br/>disable once tasks"]
+    Advance --> Run["Execute run"]
+    Catch --> Run
+    Manual["Run now API"] -.->|"next run unchanged"| Run
+    Run --> Hist["Append history<br/>increment unread"]
+    Hist --> Store[("scheduler.json")]
+    Hist -.->|"Web Push configured"| Push["Completion notification<br/>without reply text"]
+```
+
 ## Schedule kinds
 
 | Kind | Rule |
@@ -45,6 +65,19 @@ Compatibility order:
 - `reuse`: bind one session and append every run to its context.
 
 Only one run of a task may execute at a time. A manual run that overlaps a scheduled run is serialized to prevent interleaved output on a shared SDK session.
+
+```mermaid
+flowchart TD
+    Req["Scheduled, catch-up<br/>or manual run"] --> Busy{"Another run of<br/>this task active?"}
+    Busy -->|"yes"| Wait["Wait for it to finish"]
+    Busy -->|"no"| Mode{"Session mode"}
+    Wait --> Mode
+    Mode -->|"fresh"| New["Create a new session<br/>for this run"]
+    Mode -->|"reuse"| Bound["Use the bound session"]
+    New --> Turn["Unattended Agent turn<br/>tools, MCP and Skills"]
+    Bound --> Turn
+    Turn --> Hist["History entry<br/>and unread count"]
+```
 
 ## API
 

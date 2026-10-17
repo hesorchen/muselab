@@ -140,7 +140,7 @@ sequenceDiagram
     V-->>SDK: streaming response
     SDK-->>API: SDK messages
     API-->>B: SSE events
-    Note over B,API: browser disconnects; turn continues
+    Note over B,API: browser disconnects, turn continues
     B->>API: new ticket + empty-prompt reconnect
     API-->>B: spool replay + live tail
     API-->>B: done / cancelled / error

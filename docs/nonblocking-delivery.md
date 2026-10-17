@@ -23,6 +23,77 @@ server-accepted until its acknowledgement is known.
 - Late Stop requests cannot pause or interrupt a successor turn.
 - Browser outbox records keep their receipt owner across runtime handoff.
 
+Lifecycle of one browser outbox record:
+
+```mermaid
+stateDiagram-v2
+    state "Ready, saved locally" as Ready
+    state "Sending original request" as Sending
+    state "Waiting for receipt" as Waiting
+    state "Failed, content retained" as Failed
+
+    [*] --> Ready: snapshot persisted, then composer cleared
+    Ready --> [*]: cancelled before first send
+    Ready --> Sending: POST with the original message ID
+    Sending --> [*]: accepted
+    Sending --> Failed: rejected
+    Sending --> Waiting: response lost, 409 or 425
+    Waiting --> Sending: receipt not_found, replay the same ID
+    Waiting --> Waiting: still pending, poll again
+    Waiting --> [*]: accepted or cancelled
+    Waiting --> Failed: receipt failed
+
+    note right of Ready
+        If local storage fails,
+        the draft stays in the composer.
+    end note
+```
+
+The server receipt decides what a POST with a known message ID may do:
+
+```mermaid
+flowchart TD
+    P["POST with session,<br/>kind and message ID"] --> L{"Receipt for this ID?"}
+    L -->|"none"| N["Insert pending,<br/>run admission once"]
+    L -->|"cancelled tombstone"| C409["409, never executes"]
+    L -->|"cancel_requested"| R425["425, query the receipt"]
+    L -->|"pending, accepted or failed"| FP{"Same request<br/>fingerprint?"}
+    FP -->|"no"| D409["409, ID reuse rejected"]
+    FP -->|"yes, pending"| R425
+    FP -->|"yes, settled"| OUT["Return the stored outcome"]
+    N --> F{"Cancel arrived<br/>during admission?"}
+    F -->|"no"| OK["Record accepted or failed"]
+    F -->|"yes"| STOP["Record cancelled, stop only its turn<br/>or withdraw its queue item"]
+```
+
+Cancellation and Stop act on one identity and never on a successor:
+
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant API as muselab
+    participant R as Receipts
+    participant Q as Queue file
+
+    Note over B,Q: Cancel before the POST arrives
+    B->>API: cancel message ID
+    API->>R: insert cancelled tombstone
+    B->>API: delayed POST with the same ID
+    API-->>B: 409, not executed
+    Note over B,Q: Stop a running reply
+    B->>API: Stop with turn ID and pending snapshot IDs
+    alt turn ID is still the current turn
+        API->>Q: hold snapshot items, remember IDs not yet queued
+        API->>API: interrupt that turn only
+    else a successor is running
+        API-->>B: stale, nothing held or interrupted
+    end
+    B->>API: late POST for a held ID
+    API->>Q: enqueue it as held
+    B->>API: Resume
+    API->>Q: release holds, review records untouched
+```
+
 ## Regression gates
 
 tests/test_nonblocking_delivery.py covers explicit holds, restart, late POSTs,

@@ -39,10 +39,17 @@ SDK `0.2.149` 以及其内置 Claude CLI `2.1.252`。这套基线包含这条链
 Codex 缓存 token 统计、reasoning effort、工具调用回放和 Anthropic 响应
 转换修复。
 
-```text
-muselab → Claude Agent SDK → Anthropic Messages 请求
-        → 127.0.0.1 上的 Codex Gateway
-        → 用户自己已认证的 Codex/OpenAI 后端
+```mermaid
+flowchart LR
+    subgraph HOST["本机"]
+        M["muselab 后端"] --> SDK["Claude Agent SDK<br/>及内置 CLI"]
+        GW["Codex Gateway<br/>监听 loopback"]
+    end
+    BE["用户已认证的<br/>Codex 或 OpenAI 后端"]
+    SDK -->|"Anthropic Messages 请求"| GW
+    GW -->|"转换后的 Codex 请求"| BE
+    BE -.->|"流式响应"| GW
+    GW -.->|"Anthropic 形状的 SSE"| SDK
 ```
 
 ## 内置内容
@@ -72,6 +79,39 @@ muselab → Claude Agent SDK → Anthropic Messages 请求
   与 concurrency 的上限；
 - 开启 thinking 时映射为 `reasoning.summary: auto`；关闭时不发送该标记；
 - Fast 独立映射为 `service_tier: priority`。
+
+从会话控件到线路字段的完整路径：
+
+```mermaid
+flowchart LR
+    subgraph UI["muselab 会话控件"]
+        EF["Effort"]
+        TH["Thinking 开关"]
+        FA["Fast"]
+    end
+    subgraph HDR["CLI 发送的 header"]
+        HE["X-MuseLab-Effort"]
+        HT["X-MuseLab-Thinking<br/>summarized"]
+        HS["X-MuseLab-Service-Tier<br/>fast"]
+    end
+    subgraph PAY["CLIProxyAPI payload 规则<br/>协议转换后应用"]
+        PA["删除 reasoning.effort<br/>沿用 catalog 默认值"]
+        PL["reasoning.effort<br/>取同名值"]
+        PU["reasoning.effort max"]
+        PS["reasoning.summary auto"]
+        PT["service_tier priority"]
+    end
+    SUB["限制 subagent<br/>spawn depth 与并发"]
+    EF --> HE
+    EF -->|"ultra"| SUB
+    TH -->|"开启"| HT
+    FA -->|"开启"| HS
+    HE -->|"auto"| PA
+    HE -->|"low 到 max"| PL
+    HE -->|"ultra"| PU
+    HT --> PS
+    HS --> PT
+```
 
 ## 启用方式
 
@@ -141,15 +181,28 @@ catalog 请求成功说明新配置已经启动；静态规则检查则证明必
 
 muselab 采用的参考方案是把 **CLIProxyAPI** 放在 muselab 旁边作为本地 sidecar：
 
-```text
-浏览器
-  → muselab 后端
-  → Claude Agent SDK
-  → Anthropic Messages API 请求（model: codex:gpt-5.6-sol）
-  → muselab 剥掉 codex: 前缀（model: gpt-5.6-sol）
-  → http://127.0.0.1:8317/v1/messages
-  → CLIProxyAPI
-  → 用户已登录 / 已授权的 Codex 后端
+```mermaid
+sequenceDiagram
+    participant B as 浏览器
+    participant M as muselab 后端
+    participant SDK as Claude Agent SDK 与 CLI
+    participant G as loopback 上的 CLIProxyAPI
+    participant C as Codex 后端
+
+    B->>M: 发送回合，模型为带 codex 前缀的 gpt-5.6-sol
+    M->>M: 剥掉 codex 前缀，设置 base URL、key 和 X-MuseLab header
+    M->>SDK: 以模型 gpt-5.6-sol 启动或复用 client
+    SDK->>G: POST /v1/messages，携带 x-api-key
+    G->>G: 转换为 Codex 形状，应用 payload 规则
+    G->>C: 使用用户的 Codex 认证发起请求
+    C-->>G: 流式响应
+    G-->>SDK: Anthropic SSE 事件
+    opt 模型请求调用工具
+        SDK->>SDK: 在本地执行工具
+        SDK->>G: 携带 tool_result 的下一次请求
+    end
+    SDK-->>M: SDK 消息
+    M-->>B: SSE 事件
 ```
 
 这套方案的边界是：
@@ -257,6 +310,21 @@ Codex SDK client 时，muselab 会通过 `CLAUDE_CODE_MAX_CONTEXT_TOKENS` 注入
   内置 fallback 会标为估算。
 
 发送新消息前，muselab 会先调用 SDK 的上下文统计；如果接近 effective window，会优先执行 Claude Code 原生 `/compact`，再发送用户消息。这样比等一轮回复成功后的事后 compact 更早，能减少 gateway 在请求入口直接报 `input exceeds the context window` 的概率。如果旧压缩配置创建的 Codex runtime 报成功或返回隐藏在系统消息中的 API 错误、但实测 token 没有下降，muselab 会安全重建 runtime 并只重试一次 `/compact`；有后台任务时不会断开 runtime，恢复过程也不会重复发送用户消息。
+
+```mermaid
+flowchart TD
+    U["新的用户消息"] --> P["向 SDK 查询<br/>当前上下文用量"]
+    P --> Q1{"接近有效窗口？"}
+    Q1 -->|"否"| S["发送用户消息"]
+    Q1 -->|"是"| C["执行原生 /compact"]
+    C --> Q2{"token 实测下降？"}
+    Q2 -->|"是"| S
+    Q2 -->|"否，Codex runtime<br/>且无后台任务"| R["重建 runtime<br/>最多重试一次 /compact"]
+    Q2 -->|"否，其他情况"| F["本回合报错结束<br/>不重发用户消息"]
+    R --> Q3{"token 实测下降？"}
+    Q3 -->|"是"| S
+    Q3 -->|"否"| F
+```
 
 如果实际运行仍报 `input exceeds the context window`，通常说明 gateway 转换层、所选后端模型或账号档位的有效窗口更小，或当前会话已经超过到连 `/compact` 也无法进入模型。此时可以新开会话、手动降低 `CODEX_GATEWAY_CONTEXT_LIMIT`、压缩历史，或切到上下文窗口已确认更大的模型 / gateway 路径。
 

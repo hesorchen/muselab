@@ -41,6 +41,23 @@ first mints a 60-second, one-use ticket bound to the exact resolved file and
 workspace. HTML and SVG previews use a sandbox CSP. The HTML preview bridge for
 scroll and image interaction is injected only for files up to 12 MiB.
 
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant API as Files API
+
+    B->>API: POST /api/files/download-ticket with X-Auth-Token and path
+    API->>API: resolve the exact file in the selected workspace
+    API-->>B: one-use ticket bound to that file and workspace, valid 60 seconds
+    B->>API: GET /api/files/download with path, workspace and ticket
+    API->>API: resolve the path again, check ticket scope and expiry, consume it
+    alt ticket invalid, expired or for another file
+        API-->>B: 401
+    else ticket valid
+        API-->>B: file as an attachment
+    end
+```
+
 `list` accepts `sort=name` (default), `mtime_desc`, or `mtime_asc`. Directories stay first, and sorting is applied before the 500-entry cap. The file panel remembers this choice and updates modification-time ordering after file changes.
 
 Preview limits:
@@ -71,6 +88,25 @@ Browser uploads use a random `upload_id` to stage bytes before explicitly commit
 
 A same-name upload first moves the old file into the dustbin and then atomically replaces it, preserving recovery. Dangerous executable extensions and sensitive filenames are rejected by default.
 
+```mermaid
+stateDiagram-v2
+    state "Streaming to a temporary file" as Streaming
+    state "Staged, awaiting commit" as Staged
+    state "Saving" as Saving
+    state "Saved at the destination" as Saved
+    state "Discarded, temporary file removed" as Discarded
+
+    [*] --> Streaming : upload
+    Streaming --> Staged : body received, upload_id present
+    Streaming --> Saving : body received, legacy call without upload_id
+    Staged --> Saving : commit
+    Saving --> Saved : old same-name file to dustbin, then atomic replace
+    Streaming --> Discarded : cancel, 10-minute lease ends or graceful shutdown
+    Staged --> Discarded : cancel, 10-minute lease ends or graceful shutdown
+    Saved --> [*]
+    Discarded --> [*]
+```
+
 ### Dustbin
 
 | Method and path | Purpose |
@@ -90,6 +126,20 @@ Each workspace has its own `.muselab-dustbin/`:
 
 Payload and manifest share one opaque ID. The default retention is 30 days, configurable through `MUSELAB_TRASH_TTL_DAYS`; `0` disables automatic cleanup.
 
+```mermaid
+stateDiagram-v2
+    state "In the workspace" as Live
+    state "In the dustbin as payload and manifest" as Trashed
+    state "Permanently removed" as Gone
+
+    [*] --> Live
+    Live --> Trashed : soft delete or same-name upload
+    Live --> Gone : delete with permanent=true
+    Trashed --> Live : restore
+    Trashed --> Gone : purge, empty or retention expiry
+    Gone --> [*]
+```
+
 ## Path and sensitive-file defenses
 
 Workspace-relative paths go through normalization:
@@ -98,6 +148,27 @@ Workspace-relative paths go through normalization:
 2. Reject `..` components and resolve the relative path under the selected workspace.
 3. Follow actual symlinks and verify the real target stays inside the selected root or another registered workspace; targets outside all registered workspaces are rejected.
 4. Apply internal-state and sensitive-file exclusions, including to resolved symlink targets.
+
+```mermaid
+flowchart TD
+    R["Files API request"] --> WQ{"workspace query parameter?"}
+    WQ -->|"no"| WH{"X-Muselab-Workspace header?"}
+    WQ -->|"yes"| REG{"Registered workspace?"}
+    WH -->|"yes"| REG
+    WH -->|"no"| DEF["Default MUSELAB_ROOT"]
+    REG -->|"yes"| LEX{"NUL byte or .. component?"}
+    DEF --> LEX
+    LEX -->|"no"| RES["Resolve under the selected workspace,<br/>following actual symlinks"]
+    RES --> IN{"Real target inside the selected root<br/>or another registered workspace?"}
+    IN -->|"yes"| EXC{"Internal state or sensitive file?"}
+    EXC -->|"no"| MUT{"Write, upload, rename or backup<br/>into the dustbin?"}
+    MUT -->|"no"| OK["Handler runs, paths returned<br/>relative to the workspace"]
+    REG -->|"no"| X["Rejected"]
+    LEX -->|"yes"| X
+    IN -->|"no"| X
+    EXC -->|"yes"| X
+    MUT -->|"yes"| X
+```
 
 Typical blocked content includes `.env`, private keys, certificates, SSH credentials, cloud credentials, and common token files. Write, upload, rename, and backup operations cannot directly modify `.muselab-dustbin/`; only dedicated dustbin endpoints may do so.
 

@@ -4,6 +4,21 @@
 
 muselab 以 **Claude Agent SDK** 作为唯一对话后端。非 Claude 模型通过会话级环境变量覆盖，将 SDK 指向各厂商的 Anthropic 兼容端点。**所有提供商均获得完整 agent loop**——而非仅限对话功能。muselab 自身不实现 OpenAI 原生协议；如果后端不是 Anthropic 兼容端点，需要在前面放一层网关。
 
+路由的整体形状如下（环境变量细节见[模型路由](routing_zh.md)）：
+
+```mermaid
+flowchart LR
+    PK["模型下拉"] --> Q{"模型 ID 命中<br/>某个 provider 前缀？"}
+    Q -->|"否"| CL["Claude 路线<br/>claude login 凭据"]
+    Q -->|"是"| EO["会话级环境变量覆盖<br/>厂商 base URL 与 key"]
+    CL --> SDK["Claude Agent SDK<br/>所有提供商共用一套 agent loop"]
+    EO --> SDK
+    SDK -->|"Claude"| AN["Anthropic API"]
+    SDK -->|"厂商"| VE["Anthropic 兼容<br/>厂商端点"]
+    SDK -->|"网关"| GW["Anthropic 兼容网关<br/>如 Codex Gateway"]
+    GW -->|"协议转换"| NB["非 Anthropic 后端"]
+```
+
 | 提供商 | 启用方式 | 工具调用 | 在哪里拿 key |
 |---|---|---|---|
 | **Anthropic Claude** | 执行一次 `claude login` | ✅ | 复用 Pro / Max OAuth，无需 API key |
@@ -34,6 +49,27 @@ muselab 不再直接启动 Codex，也不持有 Codex OAuth 状态。把生图�
 之后，可以让凭据和进程边界与 Web 应用解耦。生成结果仍会作为普通 muselab
 图片附件暂存，因此可预览、画笔标注，并加入当前聊天发送。生图请求会作为后台
 任务执行，并保留在生图历史里，刷新页面也不会丢掉已完成结果。
+
+```mermaid
+sequenceDiagram
+    participant C as Composer
+    participant M as muselab 后端
+    participant J as 后台生图任务
+    participant I as OpenAI 兼容 Images API
+
+    C->>M: 创建生图任务
+    M->>J: 启动任务
+    M-->>C: 任务已受理
+    J->>I: 携带生图 API key 的请求
+    I-->>J: 生成的图片
+    J->>M: 图片与状态写入生图历史
+    loop 任务排队或生成中时轮询，刷新后同样适用
+        C->>M: 读取生图历史
+    end
+    C->>M: 加入一张生成图
+    M-->>C: 暂存为图片附件
+    Note over C: 预览、画笔标注、加入当前聊天发送
+```
 
 ## 对话中切换模型
 

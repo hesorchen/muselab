@@ -67,12 +67,34 @@ use path metadata to handle indexing delay and capped directory listings without
 refreshing the entire workspace. Browser tests assert that the selected row is
 inside the scroll viewport, not merely present in the DOM.
 
+```mermaid
+flowchart TD
+    A["File tab click or Reveal action"] --> B["New request sequence,<br/>bound to workspace generation"]
+    B --> C["Expand tree ancestors"]
+    C --> D{"Row missing from<br/>tree listing?"}
+    D -->|"yes"| E["Read metadata for that path only,<br/>no workspace refresh"]
+    D -->|"no"| F["Record pending reveal target"]
+    E --> F
+    F --> G{"Still the newest request<br/>for the same generation?"}
+    G -->|"no"| X["Discard stale reveal"]
+    G -->|"yes"| H{"Files pane visible?"}
+    H -->|"no"| I["Wait for resize observation"]
+    I --> H
+    H -->|"yes"| J["Position the logical virtual row<br/>in the real scroll container"]
+    J --> K["Highlight the mounted row"]
+```
+
 ## 4. Message rendering
 
 The assistant Markdown pipeline is:
 
-```text
-streamed text → Markdown parse → HTML sanitization → final math and path enhancement
+```mermaid
+flowchart LR
+    S["Streamed text"] -->|"segment or turn completes"| P["Markdown parse"]
+    P --> H["HTML sanitization"]
+    H --> M["Math typesetting"]
+    M --> L["File path enhancement"]
+    L --> O["Final message HTML"]
 ```
 
 The streaming path skips expensive KaTeX and file-path traversal. The final
@@ -119,6 +141,30 @@ The server sends a heartbeat every 15 seconds. After 40 seconds of total
 silence, the client uses an activity probe and disk replay to recover without
 executing an already-completed turn again.
 
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant S as muselab
+
+    B->>S: POST turn request, X-Auth-Token header, JSON body
+    S-->>B: short-lived one-time ticket
+    B->>S: open EventSource with only the ticket in the URL
+    Note over B,S: an older backend answering 404 or 405 selects the legacy URL protocol
+    loop while the turn runs
+        S-->>B: text, thinking, tool, question and permission events
+        S-->>B: heartbeat every 15 s
+    end
+    opt 40 s of total silence
+        B->>S: activity probe
+        alt turn still running
+            S-->>B: reconnect and replay missed events from disk
+        else turn already completed
+            S-->>B: reply recovered from disk, turn not re-run
+        end
+    end
+    S-->>B: done, cancelled or error
+```
+
 The server-side message queue is independent of the page connection. Users can
 send while Muse is replying; queued messages run in order and may continue
 after the page closes. Errors, stops, questions, and permission waits pause the
@@ -158,6 +204,17 @@ When a backgrounded PWA returns, it compares asset versions and reloads if they
 changed and no stream is active. This prevents stale JavaScript from talking to
 a newer backend. See [Mobile](mobile.md) for installation, HTTPS, and push
 limitations.
+
+```mermaid
+flowchart TD
+    W["Web Push arrives"] --> V{"Any visible<br/>muselab window?"}
+    V -->|"yes"| SUP["Suppress the notification"]
+    V -->|"no"| SHOW["Show the notification"]
+    R["Backgrounded PWA becomes visible"] --> C["Compare asset version<br/>with the server"]
+    C --> D{"Changed and<br/>no stream active?"}
+    D -->|"yes"| RL["Reload the page"]
+    D -->|"no"| K["Keep running"]
+```
 
 ## 9. Internationalization and accessibility
 

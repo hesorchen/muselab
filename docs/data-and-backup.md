@@ -7,6 +7,33 @@ long-term memory adds a SQLite Registry, so a complete migration covers
 workspaces, repository state, Claude CLI data, memory data, and optional
 browser-local preferences.
 
+How the durable pieces relate:
+
+```mermaid
+flowchart LR
+    subgraph WS["Workspaces"]
+        P["Primary MUSELAB_ROOT<br/>user files, attachments, dustbin"]
+        G["Global state in primary .muselab<br/>workspaces, scheduler, Push, memory"]
+        A["Additional workspaces<br/>user files and own dustbin"]
+    end
+    subgraph REPO["Repository state"]
+        C["Config<br/>env, MCP, provider overrides"]
+        S["Sessions directory<br/>sidecars, queues, delivery records"]
+        I["Transcript indexes<br/>derived cache"]
+    end
+    subgraph CLI["CLI data outside workspaces"]
+        J[("Claude CLI JSONL")]
+        V[("Third-party JSONL<br/>isolated vendor-cli state")]
+    end
+    G -->|"registers"| A
+    P -->|"Claude sessions"| J
+    A -->|"Claude sessions"| J
+    P -->|"third-party sessions"| V
+    A -->|"third-party sessions"| V
+    I -.->|"rebuilt from"| J
+    I -.->|"rebuilt from"| V
+```
+
 ## Primary workspace
 
 Back up the complete `$MUSELAB_ROOT/` when practical. In addition to user files, it contains:
@@ -57,6 +84,23 @@ main-chain appends update display coordinates incrementally; branch changes,
 compaction, and duplicate UUIDs use the full chain resolver. These caches may
 be omitted from backups; keep session sidecars, queues, and canonical JSONL.
 
+```mermaid
+flowchart TD
+    J[("Canonical CLI JSONL<br/>authoritative")]
+    O["Open session history"] --> L{"Index usable?"}
+    L -->|"missing, corrupt, legacy JSON<br/>or incompatible"| RB["Rebuild all descriptors<br/>from JSONL"]
+    L -->|"yes"| A["Describe only<br/>newly appended lines"]
+    A --> M{"Ordinary main-chain append?"}
+    M -->|"yes"| INC["Update display coordinates<br/>incrementally"]
+    M -->|"branch, compaction<br/>or duplicate UUID"| FULL["Run the full chain resolver"]
+    RB --> FULL
+    INC --> W["One SQLite transaction<br/>new descriptors and source checkpoint"]
+    FULL --> W
+    W --> X[("Transcript index<br/>derived cache")]
+    J -.->|"read, never rewritten"| RB
+    J -.->|"read, never rewritten"| A
+```
+
 
 Task delivery adds three private locations under `$MUSELAB_SESSIONS_DIR/`:
 
@@ -93,6 +137,17 @@ directory. Existing persistent files are never overwritten; any conflicting
 legacy files are preserved under `vendor-cli/.migration-conflicts/` for manual
 recovery. The one exception is a valid, newer JSONL tail written by the old
 process during a rolling restart: unique records are appended safely.
+
+```mermaid
+flowchart TD
+    L["Legacy temp-dir state<br/>present after upgrade"] --> E["Take each legacy entry"]
+    E --> Q1{"Same path already in<br/>persistent vendor-cli?"}
+    Q1 -->|"no"| MV["Move it into the<br/>persistent directory"]
+    Q1 -->|"both are directories"| E
+    Q1 -->|"yes, other conflict"| Q2{"Valid JSONL with<br/>newer records?"}
+    Q2 -->|"yes"| AP["Append unique records<br/>to the persistent copy"]
+    Q2 -->|"no"| CF["Keep the persistent file<br/>move legacy copy to<br/>.migration-conflicts"]
+```
 
 ## Ephemeral or unnecessary state
 

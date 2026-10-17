@@ -48,10 +48,17 @@ Claude Agent SDK `0.2.149`, and its bundled Claude CLI `2.1.252`. This baseline
 includes fixes relevant to this bridge for Codex cache-token accounting,
 reasoning effort, tool-call replay, and Anthropic response translation.
 
-```text
-muselab → Claude Agent SDK → Anthropic Messages request
-        → Codex Gateway on 127.0.0.1
-        → user-authenticated Codex/OpenAI backend
+```mermaid
+flowchart LR
+    subgraph HOST["Local machine"]
+        M["muselab backend"] --> SDK["Claude Agent SDK<br/>and bundled CLI"]
+        GW["Codex Gateway<br/>on loopback"]
+    end
+    BE["User-authenticated<br/>Codex or OpenAI backend"]
+    SDK -->|"Anthropic Messages request"| GW
+    GW -->|"translated Codex request"| BE
+    BE -.->|"streaming response"| GW
+    GW -.->|"Anthropic-shaped SSE"| SDK
 ```
 
 ## What is built in
@@ -86,6 +93,39 @@ Anthropic-to-Codex translation:
 - enabled thinking maps to `reasoning.summary: auto`; disabling thinking omits
   the marker and therefore does not request a summary;
 - Fast maps independently to `service_tier: priority`.
+
+The full path from session control to wire field:
+
+```mermaid
+flowchart LR
+    subgraph UI["muselab session controls"]
+        EF["Effort"]
+        TH["Thinking toggle"]
+        FA["Fast"]
+    end
+    subgraph HDR["Headers sent by the CLI"]
+        HE["X-MuseLab-Effort"]
+        HT["X-MuseLab-Thinking<br/>summarized"]
+        HS["X-MuseLab-Service-Tier<br/>fast"]
+    end
+    subgraph PAY["CLIProxyAPI payload rules<br/>after translation"]
+        PA["reasoning.effort removed<br/>catalog default applies"]
+        PL["reasoning.effort<br/>same value"]
+        PU["reasoning.effort max"]
+        PS["reasoning.summary auto"]
+        PT["service_tier priority"]
+    end
+    SUB["Bounded subagent<br/>spawn depth and concurrency"]
+    EF --> HE
+    EF -->|"ultra"| SUB
+    TH -->|"enabled"| HT
+    FA -->|"on"| HS
+    HE -->|"auto"| PA
+    HE -->|"low to max"| PL
+    HE -->|"ultra"| PU
+    HT --> PS
+    HS --> PT
+```
 
 ## Enable it
 
@@ -164,15 +204,28 @@ experience. It does not bypass real upstream quota or model-level 429s.
 muselab's reference setup runs **CLIProxyAPI** next to muselab as a local
 sidecar:
 
-```text
-browser
-  → muselab backend
-  → Claude Agent SDK
-  → Anthropic Messages API request (model: codex:gpt-5.6-sol)
-  → muselab strips the codex: prefix (model: gpt-5.6-sol)
-  → http://127.0.0.1:8317/v1/messages
-  → CLIProxyAPI
-  → user-authenticated Codex backend
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant M as muselab backend
+    participant SDK as Claude Agent SDK and CLI
+    participant G as CLIProxyAPI on loopback
+    participant C as Codex backend
+
+    B->>M: send turn, model codex-prefixed gpt-5.6-sol
+    M->>M: strip codex prefix, set base URL, key and X-MuseLab headers
+    M->>SDK: start or reuse client with model gpt-5.6-sol
+    SDK->>G: POST /v1/messages with x-api-key
+    G->>G: translate to Codex shape, apply payload rules
+    G->>C: request with the user's Codex auth
+    C-->>G: streaming response
+    G-->>SDK: Anthropic SSE events
+    opt model requested a tool
+        SDK->>SDK: run the tool locally
+        SDK->>G: next request with tool_result
+    end
+    SDK-->>M: SDK messages
+    M-->>B: SSE events
 ```
 
 The boundary is:
@@ -319,6 +372,21 @@ created with older compaction settings reports success or an in-band API error
 but makes no measurable room, muselab safely rebuilds that runtime and retries
 `/compact` once. It never performs this rebuild while a background task is
 attached, and it never retries the user's prompt as part of recovery.
+
+```mermaid
+flowchart TD
+    U["New user message"] --> P["Ask the SDK for<br/>current context usage"]
+    P --> Q1{"Close to the<br/>effective window?"}
+    Q1 -->|"no"| S["Send the user message"]
+    Q1 -->|"yes"| C["Run native /compact"]
+    C --> Q2{"Measurable room made?"}
+    Q2 -->|"yes"| S
+    Q2 -->|"no, Codex runtime with<br/>no background task"| R["Rebuild the runtime<br/>retry /compact at most once"]
+    Q2 -->|"no, otherwise"| F["Turn ends with an error<br/>prompt is not resent"]
+    R --> Q3{"Measurable room made?"}
+    Q3 -->|"yes"| S
+    Q3 -->|"no"| F
+```
 
 A gateway can still fail with `input exceeds the context window` if its
 translation layer, selected backend model, or account tier has an even smaller

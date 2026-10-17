@@ -45,11 +45,56 @@ Profile 存储在主工作区的
 长期 token 不进入 WebSocket URL。ticket 有效期为 30 秒且只能使用一次，服务端
 还会校验浏览器 Origin。
 
+```mermaid
+sequenceDiagram
+    participant B as 浏览器 xterm.js
+    participant S as muselab
+    participant P as Shell PTY
+
+    B->>S: 携带 X-Auth-Token 头 POST 申请 ticket
+    S-->>B: 一次性 ticket，有效 30 秒
+    B->>S: 建立 WebSocket，ticket 作为子协议
+    S->>S: 校验 Origin，一次性消费 ticket
+    alt Origin 不符，或 ticket 过期、已用或不存在
+        S-->>B: 拒绝连接
+    else 接受
+        S-->>B: ready 与终端状态
+        opt 较早输出已被挤出缓冲
+            S-->>B: 截断提示
+        end
+        S-->>B: 回放开始、缓冲输出、回放结束
+        Note over B: 回放触发的设备查询响应不回送进程
+        B->>S: 键盘输入与尺寸变化
+        S->>P: 输入
+        P-->>S: 输出，追加到有限缓冲
+        S-->>B: 实时输出
+    end
+```
+
 终端在服务端保留有限输出缓冲。浏览器重连后会回放仍在缓冲中的输出；如果更早
 内容已经被截断，终端会显示提示。页面断开不会立刻停止进程，超过 detached TTL
 后才由服务端回收。回放期间，前端不会把历史设备查询重新产生的终端响应发送给
 当前进程，以免出现 `0;276;0c` 一类控制序列残片。已退出终端也会在 exited TTL
 后清理。
+
+单个终端在服务端的生命周期：
+
+```mermaid
+stateDiagram-v2
+    state "运行中，无浏览器连接" as Detached
+    state "运行中，浏览器已连接" as Attached
+    state "已退出，保留记录" as Exited
+    state "已移除" as Removed
+    [*] --> Detached : 新建终端，普通 Shell 或 Profile
+    Detached --> Attached : 浏览器凭 ticket 连接
+    Attached --> Detached : 最后一个浏览器断开
+    Attached --> Exited : Shell 进程退出
+    Detached --> Exited : Shell 进程退出
+    Attached --> Removed : 显式关闭或全部关闭
+    Detached --> Removed : 显式关闭，或超过 detached TTL
+    Exited --> Removed : 超过 exited TTL 或显式关闭
+    Removed --> [*]
+```
 
 ## 输入与 scrollback
 

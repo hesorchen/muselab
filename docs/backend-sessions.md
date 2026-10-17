@@ -107,6 +107,29 @@ An active turn does not discard later messages. They enter `<sid>.queue.json` an
 
 The invariant is per-message ownership: failure/cancellation cannot change another message's scheduling, and lack of a delivery receipt never authorizes automatic replay.
 
+Lifecycle of one queue item while the process keeps running:
+
+```mermaid
+stateDiagram-v2
+    state "Waiting in FIFO" as Waiting
+    state "Held by Stop" as Held
+    state "Claimed, no turn id yet" as Claimed
+    state "Bound to its turn id" as Bound
+    state "Review, queue_issue set" as Review
+
+    [*] --> Waiting: enqueued within cap 10
+    Waiting --> Held: Stop holds the snapshot
+    Held --> Waiting: Resume
+    Waiting --> Claimed: drain claims the head
+    Claimed --> Waiting: start race lost, back to head
+    Claimed --> Review: attachment_unavailable or failed
+    Claimed --> Bound: turn started
+    Bound --> [*]: turn succeeded, claim acknowledged
+    Bound --> Review: cancelled or failed
+    Waiting --> [*]: edited or removed by id
+    Review --> [*]: edited or removed by id
+```
+
 ## Attachments
 
 `POST /api/chat/upload-image` keeps its historical name but accepts:
@@ -126,6 +149,23 @@ On send:
 - Chat bubbles use small thumbnails; originals are served by `GET /api/chat/attachments/{sid}/{filename}?token=...`.
 
 The SDK writes the user-message UUID later, so muselab first stores metadata in `pending_attachments` and binds it FIFO to the next matching user message. This queue is capped at 50 bundles and entries older than 24 hours are pruned.
+
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant M as muselab
+    participant SC as Sidecar
+    participant CLI as Claude CLI JSONL
+
+    B->>M: send with attachment ids
+    M->>M: save originals under .muselab-attach
+    M->>CLI: user turn with image and document blocks
+    M->>SC: append bundle to pending_attachments
+    CLI->>CLI: write the user message with its UUID
+    B->>M: load session history
+    M->>SC: pop the oldest bundle, bind it to that UUID
+    M-->>B: bubbles with thumbnails and original URLs
+```
 
 ## Forking and deletion
 
@@ -149,5 +189,24 @@ Starting a turn writes `$MUSELAB_SESSIONS_DIR/active_turns/<sid>.json`; normal c
 | Server queue | Restored from the queue file and drained by a later turn |
 | Unsent attachments | Lost and must be uploaded again |
 | Active turn | Offered as interrupted; not rerun automatically |
+
+Startup recovery order:
+
+```mermaid
+flowchart TD
+    S["Process start"] --> Q["Recover every queue file"]
+    Q --> C{"Inflight claim?"}
+    C -->|"bound to a turn id"| U["Back at head as<br/>delivery_unknown"]
+    C -->|"unbound"| H["Back at head,<br/>no issue"]
+    Q --> A["Active native adjustments<br/>become delivery_unknown"]
+    U --> R["Reconcile durable<br/>attachment references"]
+    H --> R
+    A --> R
+    R --> RT["Runtime recovery"]
+    RT --> D["Drain sessions that<br/>have runnable items"]
+    S --> T[("active_turns sentinels")]
+    T --> I["Offer interrupted turns<br/>to the user"]
+    I --> N["User decides whether to resend;<br/>no automatic retry"]
+```
 
 See [Data and backup](data-and-backup.md) for migration paths.

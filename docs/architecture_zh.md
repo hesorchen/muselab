@@ -4,26 +4,36 @@
 
 muselab 是一个无前端构建步骤的自托管工作台。浏览器负责文件、预览、终端和会话交互；FastAPI 负责鉴权、持久状态与实时传输；所有模型调用统一经过 Claude Agent SDK。
 
-```text
-浏览器
-├── 文件树与全局搜索
-├── 文件预览、编辑器与真实 PTY 终端
-├── 多工作区、多会话、队列与活动中心
-└── 设置、Providers、Skills、MCP、定时任务
-        │
-        ├── HTTP / ticket SSE
-        └── ticket WebSocket
-                │
-FastAPI
-├── Files / Workspaces / Preview
-├── Chat / Sessions / Replay spool / Attachments
-├── Terminals / Profiles / PTY workers
-├── Scheduler / Push / Activity
-└── Settings / Providers / MCP / Skills
-                │
-Claude Agent SDK → claude CLI
-├── Claude OAuth
-└── Anthropic-compatible providers
+```mermaid
+flowchart TD
+    subgraph BR["浏览器"]
+        direction LR
+        B1["文件树、全局搜索、<br/>预览与编辑器"]
+        B2["多工作区、多会话、<br/>队列与活动中心"]
+        B3["真实 PTY 终端"]
+        B4["设置、Providers、Skills、<br/>MCP 与定时任务"]
+    end
+    subgraph API["FastAPI"]
+        direction LR
+        F["Files、Workspaces、Preview"]
+        C["Chat、Sessions、<br/>Replay spool、Attachments"]
+        T["Terminals、Profiles、<br/>PTY workers"]
+        S["Scheduler、Push、Activity"]
+        P["Settings、Providers、<br/>MCP、Skills"]
+    end
+    SDK["Claude Agent SDK"]
+    CLI["claude CLI"]
+    OA["Claude OAuth"]
+    VP["Anthropic 兼容 Provider"]
+
+    BR -->|"已鉴权 HTTP"| API
+    B2 -->|"ticket SSE"| C
+    B3 -->|"ticket WebSocket"| T
+    C -->|"Agent 回合"| SDK
+    S -->|"定时执行"| SDK
+    SDK --> CLI
+    CLI --> OA
+    CLI --> VP
 ```
 
 ## 关键设计
@@ -102,6 +112,26 @@ $MUSELAB_ROOT/
 6. 事件写入 replay spool 并流向浏览器；断线后可按 cursor 补发。
 7. Claude CLI 持久化 transcript，muselab 更新 sidecar、用量、活动状态和通知。
 
+```mermaid
+sequenceDiagram
+    participant B as 浏览器
+    participant API as FastAPI
+    participant SP as Replay spool
+    participant SDK as Agent SDK 与 claude CLI
+
+    B->>API: 以 X-Auth-Token 调用 POST /api/chat/stream/start，携带回合参数
+    API-->>B: 短期、单次使用的 ticket
+    B->>API: 用 ticket 建立 SSE
+    API->>SDK: 按会话、模型与推理参数取得或建立 client，cwd 为会话绑定工作区
+    SDK->>SDK: 加载 CLAUDE.md、Skills 与 MCP，运行工具和模型循环
+    SDK-->>API: SDK 消息
+    API->>SP: 逐条写入事件
+    API-->>B: 经 SSE 推送事件
+    Note over B,SP: 断线后浏览器按 cursor 继续
+    SDK->>SDK: CLI 持久化 transcript
+    API->>API: 更新 sidecar、用量、活动状态和通知
+```
+
 非空会话切换模型时，UI 会创建一个空会话并保留原会话，避免跨 Provider thinking signature 冲突。后端 API 仍允许显式更新会话模型，因此 API 调用者需要自行承担上下文兼容性。
 
 ## 终端链路
@@ -110,6 +140,26 @@ $MUSELAB_ROOT/
 2. 后端创建独立 PTY worker，并只向终端进程传递安全环境变量集合。
 3. 浏览器取得短期、单次使用的 WebSocket ticket，再以同源 WebSocket 连接。
 4. 后端在内存中维护有界输出缓冲；页面暂时离开后可重放，超过保留时间或服务重启后进程会终止。
+
+```mermaid
+sequenceDiagram
+    participant B as 浏览器
+    participant API as FastAPI
+    participant W as PTY worker
+
+    B->>API: 在当前工作区新建终端，可选 Profile
+    API->>W: 启动独立 worker，只传安全环境变量集合
+    API->>W: 若选了 Profile，写入启动命令
+    B->>API: 申请 WebSocket ticket
+    API-->>B: 短期、单次使用的 ticket
+    B->>API: 携带 ticket 建立同源 WebSocket
+    API-->>B: 重放有界输出缓冲
+    B->>API: 键盘输入
+    API->>W: 输入
+    W-->>API: PTY 输出，同时追加进缓冲
+    API-->>B: 实时输出
+    Note over API,W: 超过保留时间或服务重启后进程终止
+```
 
 终端是真实的服务用户 shell，不受 Files API 的工作区路径边界约束。只应把 muselab 暴露给可信用户。
 

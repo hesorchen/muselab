@@ -24,6 +24,27 @@
 | `intake.sh` | 可选生成通用工作区 `CLAUDE.md`；不创建其他目录，覆写前会备份已有文件。| `MUSELAB_LOCALE=zh\|en` |
 | `lint.sh` | 对已追踪文件执行静态检查与隐私泄露检测。| `MUSELAB_LEAK_BLACKLIST` |
 
+安装脚本之间的衔接关系：
+
+```mermaid
+flowchart TD
+    Q["quick-install.sh"] --> R{"以 root 运行？"}
+    R -->|"是"| X["拒绝执行"]
+    R -->|"否"| OS{"检测 OS"}
+    OS -->|"其他"| X
+    OS -->|"Linux 或 macOS"| UV["缺少 uv 时安装"]
+    UV -->|"移交，保留交互输入"| P{"平台"}
+    V[("versions.env<br/>固定工具版本")] -.->|"被引用"| L1
+    V -.->|"被引用"| MAC
+    P -->|"Linux 或 WSL2"| L1["1. 前置检查"]
+    L1 --> L2["2. 依赖安装<br/>uv sync --frozen"]
+    L2 --> L3["3. 主工作区与 .env"]
+    L3 --> L4["4. systemd 用户单元"]
+    L4 --> L5["5. linger 检查"]
+    L3 -.->|"MUSELAB_SKIP_SERVICE=1"| SKIP["不注册服务"]
+    P -->|"macOS"| MAC["步骤相同，注册<br/>launchd LaunchAgent"]
+```
+
 ---
 
 ## 2. 服务管理
@@ -65,6 +86,22 @@ tail -f ~/Library/Logs/muselab/stderr.log
 **阶段 1 —— 构建器：** 基础镜像 `python:3.12-slim`；复制固定版本的 `uv`/`uvx`；通过 `uv sync --frozen --no-dev --no-install-project` 仅安装生产 Python 依赖。
 
 **阶段 2 —— 运行时：** 全新 `python:3.12-slim`；安装 `curl`、`git`、Node 20 与固定版本的 Claude Code CLI；从构建器复制预构建的 `.venv`，并复制 `backend/`、`frontend/`、空的 `skills/` 扩展槽与 `scripts/templates/`；创建非 root 用户 `muse`；暴露端口 8765；声明针对 `/api/health` 的 `HEALTHCHECK`。
+
+```mermaid
+flowchart LR
+    subgraph B["阶段 1 - 构建器"]
+        B1["python:3.12-slim"] --> B2["固定版本的 uv 与 uvx"]
+        B2 --> B3["uv sync --frozen --no-dev<br/>--no-install-project"]
+        B3 --> VENV[(".venv")]
+    end
+    subgraph RT["阶段 2 - 运行时"]
+        R1["全新 python:3.12-slim"] --> R2["curl、git、Node.js、<br/>固定版本 Claude Code CLI"]
+        R2 --> R3["复制应用代码：backend、frontend、<br/>空 skills 扩展槽、templates"]
+        R3 --> R4["非 root 用户 muse"]
+        R4 --> R5["端口 8765 与<br/>/api/health 健康检查"]
+    end
+    VENV -->|"复制预构建产物"| R3
+```
 
 ### docker-compose.yml
 
@@ -172,6 +209,22 @@ make run
 | `e2e` | Ubuntu | 完整 Chromium 回归，最多重试两次，最终失败阻塞 |
 | `docker-smoke` | Ubuntu | 构建并加载单架构镜像，以隔离状态启动；检查 health、首页、静态脚本与容器 HEALTHCHECK |
 | `docker` | Ubuntu，仅 main／tag | 依赖以上全部 job 成功，再发布多架构 GHCR 镜像 |
+
+发布 job 以全部质量 job 为前置：
+
+```mermaid
+flowchart LR
+    T["推送 main、v*.*.* tag<br/>或向 main 发起 PR"] --> test["test"]
+    T --> lint["lint"]
+    T --> fl["frontend-lint"]
+    T --> sec["security"]
+    T --> ec["e2e-core"]
+    T --> e2e["e2e"]
+    T --> ds["docker-smoke"]
+    test & lint & fl & sec & ec & e2e & ds -->|"全部成功"| G{"是 PR？"}
+    G -->|"是"| STOP["不发布"]
+    G -->|"否，main 或 tag"| D["docker<br/>发布多架构 GHCR 镜像"]
+```
 
 仓库当前只有 `ci.yml`。没有额外的 `install-test.yml` 或四系统真实安装矩阵。
 容器启动检查与安装脚本的隔离测试有明确范围，不能代替每个系统上的完整安装验证。

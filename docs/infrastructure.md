@@ -24,6 +24,27 @@ All automation lives in `scripts/`. Each script is standalone bash and runs from
 | `intake.sh` | Optionally creates a generic workspace `CLAUDE.md` without creating other directories; backs up an existing file before replacement. | `MUSELAB_LOCALE=zh\|en` |
 | `lint.sh` | Runs repository consistency and privacy-leak checks. | `MUSELAB_LEAK_BLACKLIST` |
 
+How the install scripts chain together:
+
+```mermaid
+flowchart TD
+    Q["quick-install.sh"] --> R{"Running as root?"}
+    R -->|"yes"| X["Refuse"]
+    R -->|"no"| OS{"Detect OS"}
+    OS -->|"other"| X
+    OS -->|"Linux or macOS"| UV["Install uv if missing"]
+    UV -->|"hand off, interactive input preserved"| P{"Platform"}
+    V[("versions.env<br/>pinned tool versions")] -.->|"sourced by"| L1
+    V -.->|"sourced by"| MAC
+    P -->|"Linux or WSL2"| L1["1. Prerequisites"]
+    L1 --> L2["2. Dependencies<br/>uv sync --frozen"]
+    L2 --> L3["3. Primary workspace and .env"]
+    L3 --> L4["4. systemd user unit"]
+    L4 --> L5["5. Linger check"]
+    L3 -.->|"MUSELAB_SKIP_SERVICE=1"| SKIP["No service registered"]
+    P -->|"macOS"| MAC["Same steps, registers<br/>a launchd LaunchAgent"]
+```
+
 ---
 
 ## 2. Service management
@@ -65,6 +86,22 @@ The `Dockerfile` uses two stages to keep the final image slim:
 **Stage 1 — builder:** `python:3.12-slim` base; copies pinned `uv`/`uvx`; installs production Python dependencies with `uv sync --frozen --no-dev --no-install-project`.
 
 **Stage 2 — runtime:** fresh `python:3.12-slim`; installs `curl`, `git`, Node 20, and a pinned Claude Code CLI; copies the pre-built `.venv`, `backend/`, `frontend/`, the empty `skills/` extension slot, and `scripts/templates/`; creates a non-root `muse` user; exposes port 8765; and declares an `/api/health` health check.
+
+```mermaid
+flowchart LR
+    subgraph B["Stage 1 - builder"]
+        B1["python:3.12-slim"] --> B2["Pinned uv and uvx"]
+        B2 --> B3["uv sync --frozen --no-dev<br/>--no-install-project"]
+        B3 --> VENV[(".venv")]
+    end
+    subgraph RT["Stage 2 - runtime"]
+        R1["Fresh python:3.12-slim"] --> R2["curl, git, Node.js,<br/>pinned Claude Code CLI"]
+        R2 --> R3["Copy app code: backend, frontend,<br/>empty skills slot, templates"]
+        R3 --> R4["Non-root muse user"]
+        R4 --> R5["Port 8765 and<br/>health check on /api/health"]
+    end
+    VENV -->|"copied pre-built"| R3
+```
 
 ### docker-compose.yml
 
@@ -172,6 +209,22 @@ Triggers: pushes to `main`, version tags `v*.*.*`, and PRs targeting `main`.
 | `e2e` | Ubuntu | Full Chromium suite, at most two retries; final failures block |
 | `docker-smoke` | Ubuntu | Build/load a single-arch image, boot isolated state, verify health, homepage, static JS and Docker HEALTHCHECK |
 | `docker` | Ubuntu, main/tags only | Publish multi-arch GHCR images after all jobs above succeed |
+
+The publish job is gated on every quality job:
+
+```mermaid
+flowchart LR
+    T["Push to main, v*.*.* tag,<br/>or PR to main"] --> test["test"]
+    T --> lint["lint"]
+    T --> fl["frontend-lint"]
+    T --> sec["security"]
+    T --> ec["e2e-core"]
+    T --> e2e["e2e"]
+    T --> ds["docker-smoke"]
+    test & lint & fl & sec & ec & e2e & ds -->|"all succeed"| G{"Pull request?"}
+    G -->|"yes"| STOP["No publish"]
+    G -->|"no, main or tag"| D["docker<br/>multi-arch GHCR publish"]
+```
 
 The repository currently has only `ci.yml`. There is no additional
 `install-test.yml` or four-platform live installer matrix. Container startup and

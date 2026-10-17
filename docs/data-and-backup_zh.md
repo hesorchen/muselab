@@ -6,6 +6,33 @@ muselab 的核心会话仍以 CLI JSONL 为真相源；启用长期记忆时会�
 Registry。完整迁移需要同时考虑工作目录、仓库状态、Claude CLI 数据、记忆目录和
 浏览器本地偏好。
 
+各类持久数据的关系：
+
+```mermaid
+flowchart LR
+    subgraph WS["工作目录"]
+        P["主 MUSELAB_ROOT<br/>用户文件、附件、回收站"]
+        G["主目录 .muselab 中的全局状态<br/>工作目录、定时任务、Push、记忆"]
+        A["额外工作目录<br/>用户文件及自己的回收站"]
+    end
+    subgraph REPO["仓库状态"]
+        C["配置<br/>env、MCP、provider 覆盖"]
+        S["会话目录<br/>sidecar、队列、交付记录"]
+        I["Transcript 索引<br/>派生缓存"]
+    end
+    subgraph CLI["工作目录之外的 CLI 数据"]
+        J[("Claude CLI JSONL")]
+        V[("第三方 JSONL<br/>隔离的 vendor-cli 状态")]
+    end
+    G -->|"登记"| A
+    P -->|"Claude 会话"| J
+    A -->|"Claude 会话"| J
+    P -->|"第三方会话"| V
+    A -->|"第三方会话"| V
+    I -.->|"从中重建"| J
+    I -.->|"从中重建"| V
+```
+
 ## 主工作目录
 
 建议完整备份 `$MUSELAB_ROOT/`。除用户文件外，它还包含：
@@ -53,6 +80,23 @@ CLI JSONL 始终是权威来源；索引缺失、损坏、旧 JSON 格式或版�
 不会重写对话。普通主链追加增量更新显示坐标，分叉、压缩和重复 UUID 则使用完整链解析兜底。
 这些缓存可以不备份；会话 sidecar、队列与 canonical JSONL 仍须保留。
 
+```mermaid
+flowchart TD
+    J[("canonical CLI JSONL<br/>权威来源")]
+    O["打开会话历史"] --> L{"索引可用？"}
+    L -->|"缺失、损坏、旧 JSON<br/>或版本不兼容"| RB["从 JSONL 重建<br/>全部描述符"]
+    L -->|"是"| A["只描述<br/>新追加的行"]
+    A --> M{"普通主链追加？"}
+    M -->|"是"| INC["增量更新显示坐标"]
+    M -->|"分叉、压缩<br/>或重复 UUID"| FULL["使用完整链解析"]
+    RB --> FULL
+    INC --> W["一次 SQLite 事务<br/>新增描述符与源文件检查点"]
+    FULL --> W
+    W --> X[("Transcript 索引<br/>派生缓存")]
+    J -.->|"只读，从不重写"| RB
+    J -.->|"只读，从不重写"| A
+```
+
 
 任务交付功能在 `$MUSELAB_SESSIONS_DIR/` 下增加三个私有位置：
 
@@ -84,6 +128,17 @@ CLI JSONL 始终是权威来源；索引缺失、损坏、旧 JSON 格式或版�
 持久文件不会被覆盖；若存在同路径冲突，旧文件会保存在
 `vendor-cli/.migration-conflicts/` 供手动恢复。唯一例外是滚动重启时旧进程补写的
 有效、更新 JSONL 尾部；其中不重复的记录会安全追加到持久副本。
+
+```mermaid
+flowchart TD
+    L["升级后存在<br/>旧临时目录状态"] --> E["逐项处理旧条目"]
+    E --> Q1{"持久 vendor-cli 中<br/>已有同路径？"}
+    Q1 -->|"否"| MV["移入持久目录"]
+    Q1 -->|"两边都是目录"| E
+    Q1 -->|"是，其他冲突"| Q2{"有效且更新的 JSONL？"}
+    Q2 -->|"是"| AP["把不重复的记录<br/>追加到持久副本"]
+    Q2 -->|"否"| CF["保留持久文件<br/>旧副本移入<br/>.migration-conflicts"]
+```
 
 ## 不持久化或无需迁移
 

@@ -24,6 +24,26 @@ Git changes and file checkpoints. The panel is useful in non-Git workspaces too.
   status. At most 30 tasks and 300 tools per task are presented; the historical
   read is capped at 2 MiB. Inspect the transcript for earlier evidence.
 
+Where each piece of evidence comes from:
+
+```mermaid
+flowchart TD
+    Task["New task"] --> Base["Record workspace, Git start commit<br/>and checkpoint boundary"]
+    Base --> Query["Send query to the SDK"]
+    Query --> Replay["Replayed user message"]
+    Replay -->|"message UUID"| CP["File checkpoint ID"]
+    Query --> Hooks["Pre and post tool hooks"]
+    Query --> Msgs["SDK tool use and<br/>tool result messages"]
+    Hooks -->|"main-agent Write, Edit<br/>and NotebookEdit"| Obs["File fingerprints<br/>before and after"]
+    Hooks --> Tools["Tool records<br/>status, command, exit code"]
+    Msgs --> Tools
+    Tools --> Panel["Task delivery panel"]
+    Base -->|"diff from start commit"| Panel
+    CP --> Panel
+    Obs --> Scope["Restore preview scope"]
+    Hist[("Canonical transcript tail<br/>last 2 MiB")] -.->|"older sessions only"| Panel
+```
+
 The environment panel shows the registered workspace, branch/worktree, dirty
 state, backend and host. The service origin is the authenticated browser origin.
 Chat and preview headers have no persistent environment labels. Inspect session
@@ -46,6 +66,31 @@ output, and disable filesystem-monitor commands from Git configuration.
    public SDK operation once and verifies each observed file afterward. A failed
    or uncertain result is shown with a recovery ID; do not infer success from
    the SDK control response alone.
+
+```mermaid
+sequenceDiagram
+    participant U as Browser
+    participant M as MuseLab
+    participant W as Workspace files
+    participant S as Agent SDK
+
+    U->>M: Preview restore scope
+    M->>M: Idle checks for this and overlapping sessions
+    M->>W: Fingerprint every observed file
+    alt Scope complete and safe
+        M-->>U: Paths, actions and one-use token valid for 2 minutes
+        Note over M,W: Linux file notifications watch the scope
+    else Unknown or unsafe scope
+        M-->>U: Issues, restore disabled
+    end
+    U->>M: Restore with token and explicit confirmation
+    M->>M: Repeat idle checks and consume the token
+    M->>W: Re-fingerprint, then write private recovery backup
+    M->>S: rewind_files with the checkpoint ID, once
+    S->>W: Restore modified files, remove created files
+    M->>W: Verify each observed file
+    M-->>U: Per-file verification and recovery ID, or uncertain outcome with recovery ID
+```
 
 The current Python SDK has **no public dry-run argument and returns no file
 list**. The preview is MuseLab's observation of main-agent Write, Edit and

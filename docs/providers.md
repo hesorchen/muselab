@@ -9,6 +9,21 @@ agent loop** — not just chat. muselab itself never implements OpenAI-native
 protocols; if a backend is not Anthropic-compatible, put a gateway in front
 of it.
 
+The shape of that routing (environment details are in [Model routing](routing.md)):
+
+```mermaid
+flowchart LR
+    PK["Model picker"] --> Q{"Model id matches a<br/>provider prefix?"}
+    Q -->|"no"| CL["Claude route<br/>claude login credentials"]
+    Q -->|"yes"| EO["Per-session env override<br/>vendor base URL and key"]
+    CL --> SDK["Claude Agent SDK<br/>one agent loop for every provider"]
+    EO --> SDK
+    SDK -->|"Claude"| AN["Anthropic API"]
+    SDK -->|"vendor"| VE["Anthropic-compatible<br/>vendor endpoint"]
+    SDK -->|"gateway"| GW["Anthropic-compatible gateway<br/>such as Codex Gateway"]
+    GW -->|"translates"| NB["Non-Anthropic backend"]
+```
+
 | Provider | How to enable | Tool use | Where to get the key |
 |---|---|---|---|
 | **Anthropic Claude** | `claude login` once | ✅ | Reuses Pro / Max OAuth; no API key |
@@ -43,6 +58,27 @@ the web application. Generated images are staged as ordinary muselab image
 attachments, so they can be previewed, annotated, and sent into the current
 chat. Requests run as background jobs and remain available in the image history
 drawer after a page refresh.
+
+```mermaid
+sequenceDiagram
+    participant C as Composer
+    participant M as muselab backend
+    participant J as Background image job
+    participant I as OpenAI-compatible Images API
+
+    C->>M: create image job
+    M->>J: start job
+    M-->>C: job accepted
+    J->>I: image request with the image API key
+    I-->>J: generated images
+    J->>M: save images and status to image history
+    loop while the job is queued or running, also after refresh
+        C->>M: read image history
+    end
+    C->>M: attach a generated image
+    M-->>C: staged image attachment
+    Note over C: preview, annotate, send into the current chat
+```
 
 ## Switching model mid-conversation
 

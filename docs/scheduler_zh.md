@@ -20,6 +20,26 @@ muselab 可以按计划运行保存好的 prompt。调度器运行在后端 asyn
 - 运行完成后会写入历史并增加未读数。配置 Web Push 后，页面关闭时也可收到不含回复正文的完成通知。
 - 删除任务不会删除它已创建或复用的会话。
 
+启动补跑、调度器 tick 与手动运行都进入同一条运行路径：
+
+```mermaid
+flowchart TD
+    Start["服务启动"] --> Load["从 scheduler.json 加载任务"]
+    Load --> Next["重新计算每个任务的下次运行"]
+    Load --> Missed{"停机期间错过<br/>最近一次运行？"}
+    Missed -->|"是"| Catch["每个任务补跑一次<br/>多个任务错峰"]
+    Next --> Tick["后端循环中的<br/>调度器 tick"]
+    Tick --> Due{"已启用且到达<br/>下次运行时间？"}
+    Due -->|"否"| Tick
+    Due -->|"是"| Advance["推进下次运行时间<br/>once 任务停用"]
+    Advance --> Run["执行运行"]
+    Catch --> Run
+    Manual["立即运行 API"] -.->|"不改变下次运行时间"| Run
+    Run --> Hist["写入历史<br/>未读数加一"]
+    Hist --> Store[("scheduler.json")]
+    Hist -.->|"已配置 Web Push"| Push["完成通知<br/>不含回复正文"]
+```
+
 ## 调度类型
 
 | 类型 | 触发规则 |
@@ -45,6 +65,19 @@ muselab 可以按计划运行保存好的 prompt。调度器运行在后端 asyn
 - `reuse`：任务绑定一个会话，后续运行持续追加上下文。
 
 每个任务同一时刻只允许一次运行。手动“立即运行”与计划触发撞车时也会串行执行，避免共享 SDK 会话产生交错输出。
+
+```mermaid
+flowchart TD
+    Req["计划、补跑<br/>或手动运行"] --> Busy{"该任务已有<br/>运行在进行？"}
+    Busy -->|"是"| Wait["等待其结束"]
+    Busy -->|"否"| Mode{"会话模式"}
+    Wait --> Mode
+    Mode -->|"fresh"| New["为本次运行<br/>创建新会话"]
+    Mode -->|"reuse"| Bound["使用绑定会话"]
+    New --> Turn["无人值守 Agent 回合<br/>工具、MCP 与 Skills"]
+    Bound --> Turn
+    Turn --> Hist["历史记录<br/>与未读数"]
+```
 
 ## API
 

@@ -4,26 +4,36 @@
 
 muselab is a self-hosted workspace with no frontend build step. The browser owns file, preview, terminal, and session interaction; FastAPI owns authentication, persistent state, and real-time transport; every model call goes through the Claude Agent SDK.
 
-```text
-Browser
-├── File tree and global search
-├── File previews, editor, and real PTY terminals
-├── Workspaces, sessions, queues, and activity center
-└── Settings, providers, Skills, MCP, and scheduled tasks
-        │
-        ├── HTTP / ticket SSE
-        └── ticket WebSocket
-                │
-FastAPI
-├── Files / Workspaces / Preview
-├── Chat / Sessions / Replay spool / Attachments
-├── Terminals / Profiles / PTY workers
-├── Scheduler / Push / Activity
-└── Settings / Providers / MCP / Skills
-                │
-Claude Agent SDK → claude CLI
-├── Claude OAuth
-└── Anthropic-compatible providers
+```mermaid
+flowchart TD
+    subgraph BR["Browser"]
+        direction LR
+        B1["File tree, global search,<br/>previews and editor"]
+        B2["Workspaces, sessions,<br/>queues and activity center"]
+        B3["Real PTY terminals"]
+        B4["Settings, providers, Skills,<br/>MCP and scheduled tasks"]
+    end
+    subgraph API["FastAPI"]
+        direction LR
+        F["Files, Workspaces, Preview"]
+        C["Chat, Sessions,<br/>Replay spool, Attachments"]
+        T["Terminals, Profiles,<br/>PTY workers"]
+        S["Scheduler, Push, Activity"]
+        P["Settings, Providers,<br/>MCP, Skills"]
+    end
+    SDK["Claude Agent SDK"]
+    CLI["claude CLI"]
+    OA["Claude OAuth"]
+    VP["Anthropic-compatible providers"]
+
+    BR -->|"authenticated HTTP"| API
+    B2 -->|"ticket SSE"| C
+    B3 -->|"ticket WebSocket"| T
+    C -->|"agent turns"| SDK
+    S -->|"scheduled runs"| SDK
+    SDK --> CLI
+    CLI --> OA
+    CLI --> VP
 ```
 
 ## Key design decisions
@@ -105,6 +115,26 @@ working directory cannot move the state root.
 6. Events are written to the replay spool and streamed to the browser. A reconnect can resume from its cursor.
 7. The Claude CLI persists the transcript while muselab updates sidecars, usage, activity state, and notifications.
 
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant API as FastAPI
+    participant SP as Replay spool
+    participant SDK as Agent SDK and claude CLI
+
+    B->>API: POST /api/chat/stream/start with X-Auth-Token and turn parameters
+    API-->>B: short-lived single-use ticket
+    B->>API: open SSE with the ticket
+    API->>SDK: get or create the client for session, model and reasoning, cwd is the session workspace
+    SDK->>SDK: load CLAUDE.md, Skills and MCP, run the tool and model loop
+    SDK-->>API: SDK messages
+    API->>SP: write each event
+    API-->>B: stream events over SSE
+    Note over B,SP: after a disconnect the browser resumes from its cursor
+    SDK->>SDK: CLI persists the transcript
+    API->>API: update sidecars, usage, activity and notifications
+```
+
 When switching models from a non-empty session, the UI creates a new empty
 session and leaves the original untouched, avoiding cross-provider
 thinking-signature failures. The backend API still allows an explicit
@@ -116,6 +146,26 @@ session-model update, so API callers own the compatibility risk.
 2. The backend creates an independent PTY worker and passes only a safe environment allowlist to the terminal process.
 3. The browser obtains a short-lived, single-use WebSocket ticket, then connects over a same-origin WebSocket.
 4. The backend keeps a bounded in-memory output buffer for replay. Processes end after retention limits or service restart.
+
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant API as FastAPI
+    participant W as PTY worker
+
+    B->>API: create a terminal in the active workspace, optional profile
+    API->>W: spawn an independent worker with a safe environment allowlist
+    API->>W: profile startup command, if one was chosen
+    B->>API: request a WebSocket ticket
+    API-->>B: short-lived single-use ticket
+    B->>API: same-origin WebSocket presenting the ticket
+    API-->>B: replay the bounded output buffer
+    B->>API: keyboard input
+    API->>W: input
+    W-->>API: PTY output, also appended to the buffer
+    API-->>B: live output
+    Note over API,W: the process ends after retention limits or service restart
+```
 
 A terminal is a real shell running as the service user. It is not constrained by the Files API workspace boundary. Expose muselab only to trusted users.
 

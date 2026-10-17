@@ -35,6 +35,23 @@
 
 `raw` 用于 iframe 和图片，仍接受查询参数 token。`download` 不再把可复用的应用 token 放入 URL：前端会先签发一个有效期 60 秒、只能使用一次，并绑定到具体文件和工作目录的票据。HTML/SVG 预览使用 sandbox CSP；HTML 预览桥仅对不超过 12 MiB 的文件注入滚动和图片交互支持。
 
+```mermaid
+sequenceDiagram
+    participant B as 浏览器
+    participant API as 文件 API
+
+    B->>API: 以 X-Auth-Token 调用 POST /api/files/download-ticket，提交 path
+    API->>API: 在选中工作目录内解析出确切文件
+    API-->>B: 绑定该文件与工作目录的一次性票据，有效 60 秒
+    B->>API: GET /api/files/download，携带 path、workspace 与 ticket
+    API->>API: 重新解析路径，校验票据作用域与有效期，并消耗票据
+    alt 票据无效、过期或属于其他文件
+        API-->>B: 401
+    else 票据有效
+        API-->>B: 以附件形式返回文件
+    end
+```
+
 `list` 接受 `sort=name`（默认）、`mtime_desc` 或 `mtime_asc`。目录始终在前，排序发生在截取 500 项之前。文件面板会记住选择，并在文件修改后更新按时间排序的顺序。
 
 预览限制：
@@ -65,6 +82,25 @@
 
 同名上传会先把原文件移入回收站，再原子替换，因而可以恢复。危险可执行扩展名和敏感文件名默认禁止上传。
 
+```mermaid
+stateDiagram-v2
+    state "流式写入临时文件" as Streaming
+    state "已暂存，等待确认" as Staged
+    state "保存中" as Saving
+    state "已保存到目标路径" as Saved
+    state "已丢弃，临时文件已清理" as Discarded
+
+    [*] --> Streaming : 上传
+    Streaming --> Staged : 接收完毕，带 upload_id
+    Streaming --> Saving : 接收完毕，不带 upload_id 的兼容调用
+    Staged --> Saving : commit
+    Saving --> Saved : 同名旧文件移入回收站，再原子替换
+    Streaming --> Discarded : 取消、10 分钟租期到期或正常停机
+    Staged --> Discarded : 取消、10 分钟租期到期或正常停机
+    Saved --> [*]
+    Discarded --> [*]
+```
+
 ### 回收站
 
 | 方法与路径 | 用途 |
@@ -84,6 +120,20 @@
 
 载荷与 manifest 使用同一个不可猜测 ID。默认保留 30 天，可用 `MUSELAB_TRASH_TTL_DAYS` 调整；设为 `0` 表示不自动清理。
 
+```mermaid
+stateDiagram-v2
+    state "位于工作目录" as Live
+    state "位于回收站，载荷加 manifest" as Trashed
+    state "已永久删除" as Gone
+
+    [*] --> Live
+    Live --> Trashed : 软删除或同名上传
+    Live --> Gone : 以 permanent=true 删除
+    Trashed --> Live : 恢复
+    Trashed --> Gone : purge、清空或超过保留期
+    Gone --> [*]
+```
+
 ## 路径与敏感文件防护
 
 工作区相对路径都经过规范化：
@@ -92,6 +142,27 @@
 2. 拒绝 `..` 路径组件，将相对路径解析到选中的工作目录；
 3. 跟随实际符号链接后，检查真实目标位于选中目录或另一个已登记工作目录内；拒绝位于所有已登记工作目录之外的目标；
 4. 内部状态与敏感文件限制仍然适用，包括符号链接解析后的目标。
+
+```mermaid
+flowchart TD
+    R["文件 API 请求"] --> WQ{"带 workspace 查询参数？"}
+    WQ -->|"否"| WH{"带 X-Muselab-Workspace header？"}
+    WQ -->|"是"| REG{"是已登记工作目录？"}
+    WH -->|"是"| REG
+    WH -->|"否"| DEF["默认 MUSELAB_ROOT"]
+    REG -->|"是"| LEX{"含 NUL 字节或 .. 组件？"}
+    DEF --> LEX
+    LEX -->|"否"| RES["在选中工作目录下解析，<br/>跟随实际符号链接"]
+    RES --> IN{"真实目标位于选中目录<br/>或另一个已登记工作目录内？"}
+    IN -->|"是"| EXC{"内部状态或敏感文件？"}
+    EXC -->|"否"| MUT{"写入、上传、重命名或备份<br/>落到回收站内？"}
+    MUT -->|"否"| OK["执行处理，返回<br/>相对工作目录的路径"]
+    REG -->|"否"| X["拒绝"]
+    LEX -->|"是"| X
+    IN -->|"否"| X
+    EXC -->|"是"| X
+    MUT -->|"是"| X
+```
 
 被屏蔽的典型内容包括 `.env`、私钥、证书、SSH 凭据、云凭据和常见 token 文件。写入、上传、重命名和备份不能直接修改 `.muselab-dustbin/`；回收站只能通过专用端点管理。
 

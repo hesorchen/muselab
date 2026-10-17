@@ -100,6 +100,29 @@ $MUSELAB_ROOT/.muselab-attach/<sid>/
 - 空且未暂停时删除 queue 文件。
 - `image_ids` 引用 10 分钟有效的内存暂存附件；排队过久时附件可能过期，但文本仍会发送。
 
+进程持续运行时，单条队列消息的生命周期：
+
+```mermaid
+stateDiagram-v2
+    state "FIFO 中等待" as Waiting
+    state "被停止操作暂停" as Held
+    state "已领取，尚无 turn id" as Claimed
+    state "已绑定 turn id" as Bound
+    state "待处理，带 queue_issue" as Review
+
+    [*] --> Waiting: 入队，受 10 条上限约束
+    Waiting --> Held: 停止时暂停快照
+    Held --> Waiting: 继续
+    Waiting --> Claimed: 排空任务领取队首
+    Claimed --> Waiting: 启动竞争失败，回到队首
+    Claimed --> Review: attachment_unavailable 或 failed
+    Claimed --> Bound: 回合已启动
+    Bound --> [*]: 回合成功，确认领取
+    Bound --> Review: cancelled 或 failed
+    Waiting --> [*]: 按 ID 编辑或删除
+    Review --> [*]: 按 ID 编辑或删除
+```
+
 ## 附件
 
 `POST /api/chat/upload-image` 虽保留历史名称，但支持：
@@ -119,6 +142,23 @@ $MUSELAB_ROOT/.muselab-attach/<sid>/
 - 图片气泡使用小缩略图，原图通过 `GET /api/chat/attachments/{sid}/{filename}?token=...` 获取。
 
 消息 UUID 由 SDK 稍后写入 JSONL，因此 muselab 先把附件记录放入 `pending_attachments`，再按 FIFO 绑定到下一个匹配的用户消息。队列最多 50 组，并清理超过 24 小时的记录。
+
+```mermaid
+sequenceDiagram
+    participant B as 浏览器
+    participant M as muselab
+    participant SC as Sidecar
+    participant CLI as Claude CLI JSONL
+
+    B->>M: 携带附件 ID 发送
+    M->>M: 原文件保存到 .muselab-attach
+    M->>CLI: 带图片和文档块的用户回合
+    M->>SC: 附件组追加到 pending_attachments
+    CLI->>CLI: 写入带 UUID 的用户消息
+    B->>M: 加载会话历史
+    M->>SC: 弹出最早的附件组并绑定到该 UUID
+    M-->>B: 带缩略图和原图地址的消息气泡
+```
 
 ## 分支与删除
 
@@ -142,5 +182,24 @@ $MUSELAB_ROOT/.muselab-attach/<sid>/
 | 服务端队列 | 从 queue 文件恢复，后续回合会继续排空 |
 | 未发送附件 | 丢失，需要重新上传 |
 | 进行中回合 | 作为中断项提示，不自动重跑 |
+
+启动恢复顺序：
+
+```mermaid
+flowchart TD
+    S["进程启动"] --> Q["恢复每个 queue 文件"]
+    Q --> C{"存在 inflight 领取？"}
+    C -->|"已绑定 turn id"| U["以 delivery_unknown<br/>回到队首"]
+    C -->|"未绑定"| H["回到队首，<br/>不标记问题"]
+    Q --> A["进行中的原生调整<br/>标记为 delivery_unknown"]
+    U --> R["核对持久附件引用"]
+    H --> R
+    A --> R
+    R --> RT["运行时恢复"]
+    RT --> D["为有可执行消息的<br/>会话启动排空"]
+    S --> T[("active_turns 哨兵")]
+    T --> I["向用户提示中断回合"]
+    I --> N["由用户决定是否重发；<br/>不自动重试"]
+```
 
 备份与迁移路径见[数据与备份](data-and-backup_zh.md)。

@@ -27,6 +27,24 @@ Sending a message uses two requests:
 
 The ticket is removed from memory on first redemption, keeping the prompt and long-lived token out of the SSE URL. The legacy `GET /stream?token=...` query form remains only for old-client compatibility and should not be used by new integrations.
 
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant API as muselab
+    participant TS as In-memory ticket table
+
+    B->>API: POST /api/chat/stream/start, X-Auth-Token header, JSON body
+    API->>TS: store the turn parameters under a random ticket, valid 60 seconds
+    API-->>B: ticket
+    B->>API: GET /api/chat/stream?ticket=...
+    API->>TS: remove the ticket on first redemption
+    alt ticket unknown, already used or expired
+        API-->>B: 401
+    else ticket valid
+        API-->>B: SSE events for the stored parameters
+    end
+```
+
 ## Terminal WebSocket ticket
 
 Real terminals use a separate two-step exchange:
@@ -35,6 +53,24 @@ Real terminals use a separate two-step exchange:
 2. The backend returns a single-use ticket valid for 30 seconds. The browser presents both `muselab-terminal-v1` and the ticket as WebSocket subprotocols.
 
 Only a SHA-256 digest of the ticket is stored. Redemption is bound to the terminal ID; when a WebSocket `Origin` is present, its host must match the request `Host`. The long-lived token is never placed in the WebSocket URL.
+
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant API as muselab
+
+    B->>API: POST /api/terminals/ID/ticket with X-Auth-Token
+    API->>API: store only the SHA-256 digest, bound to the terminal ID, valid 30 seconds
+    API-->>B: ticket
+    B->>API: WebSocket offering subprotocols muselab-terminal-v1 and the ticket
+    API->>API: if Origin is present, its host must equal Host
+    API->>API: remove the digest, check terminal ID and expiry
+    alt any check fails
+        API-->>B: connection closed
+    else all checks pass
+        API-->>B: accept with muselab-terminal-v1
+    end
+```
 
 ## Authority boundaries
 
@@ -52,6 +88,27 @@ The Files API path boundary does **not** constrain Agent tools or real terminals
 - Preview terminals are real Unix PTYs and can access paths outside the workspace with the muselab service user's OS authority.
 - Terminal processes receive a minimal environment and do not inherit `MUSELAB_TOKEN` or provider API keys. This reduces credential exposure but does not restrict filesystem permissions.
 
+```mermaid
+flowchart TD
+    H["Token holder"] -->|"UI and API"| M["muselab service"]
+    subgraph OSU["OS authority of the muselab service user"]
+        M
+        FA["Files API"]
+        AG["Agent tools<br/>Bash, Read, Write and others"]
+        TM["Real terminals<br/>Unix PTY, minimal environment"]
+        WS[("Default and registered workspaces")]
+        ANY[("Any other path the service user can reach")]
+    end
+    M --> FA
+    M --> AG
+    M --> TM
+    FA -->|"path boundary"| WS
+    AG -->|"SDK permission mode"| WS
+    AG -->|"SDK permission mode"| ANY
+    TM --> WS
+    TM -->|"no path boundary"| ANY
+```
+
 Set `MUSELAB_TERMINAL_ENABLED=0` when terminals are not needed. On production or shared machines, run muselab as a dedicated unprivileged user and use containers, VMs, or OS permissions for real isolation.
 
 ## Provider credential isolation
@@ -66,6 +123,19 @@ restarts and temporary-directory cleanup. Only `~/.claude/skills/` is mapped
 into the isolated root so user Skills remain available; settings, hooks,
 plugins, credentials, and other provider keys stay isolated. `MUSELAB_TOKEN`
 is not passed to that subprocess.
+
+```mermaid
+flowchart LR
+    subgraph BE["muselab backend"]
+        ENV["Process environment<br/>incl. MUSELAB_TOKEN and all provider keys"]
+        SEL["Selected provider<br/>endpoint and credentials"]
+    end
+    ENV -->|"process, proxy and TLS<br/>variables only"| RE["Replacement environment"]
+    SEL --> RE
+    RE --> CLI["claude CLI subprocess<br/>for a non-Anthropic provider"]
+    CLI -->|"CLAUDE_CONFIG_DIR"| CFG[("Persistent per-user vendor-cli root<br/>Claude OAuth credential removed")]
+    US[("User Skills directory")] -->|"the only mapped entry"| CFG
+```
 
 ## Settings writes
 

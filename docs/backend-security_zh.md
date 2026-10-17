@@ -23,6 +23,24 @@ muselab 是单用户应用。一个共享 token 保护 UI 与 API，但该 token
 
 ticket 首次兑换时立即从内存删除，因此 prompt 和长期 token 不进入 SSE URL。旧版 `GET /stream?token=...` 查询参数形式仅为兼容旧客户端保留，不应作为新集成方式。
 
+```mermaid
+sequenceDiagram
+    participant B as 浏览器
+    participant API as muselab
+    participant TS as 内存 ticket 表
+
+    B->>API: POST /api/chat/stream/start，X-Auth-Token header，JSON body
+    API->>TS: 以随机 ticket 保存回合参数，有效 60 秒
+    API-->>B: ticket
+    B->>API: GET /api/chat/stream?ticket=...
+    API->>TS: 首次兑换即删除 ticket
+    alt ticket 不存在、已用过或已过期
+        API-->>B: 401
+    else ticket 有效
+        API-->>B: 按保存的参数推送 SSE 事件
+    end
+```
+
 ## 终端 WebSocket ticket
 
 真实终端采用独立的两步鉴权：
@@ -31,6 +49,24 @@ ticket 首次兑换时立即从内存删除，因此 prompt 和长期 token 不�
 2. 后端返回 30 秒有效、单次使用的 ticket；浏览器通过 WebSocket subprotocol 同时发送 `muselab-terminal-v1` 与该 ticket。
 
 服务端只保存 ticket 的 SHA-256 摘要，兑换时绑定终端 ID；请求带有 WebSocket `Origin` 时，还会校验其与请求 `Host` 一致。浏览器不会把长期 token 放入 WebSocket URL。
+
+```mermaid
+sequenceDiagram
+    participant B as 浏览器
+    participant API as muselab
+
+    B->>API: 以 X-Auth-Token 调用 POST /api/terminals/ID/ticket
+    API->>API: 只保存 SHA-256 摘要，绑定终端 ID，有效 30 秒
+    API-->>B: ticket
+    B->>API: WebSocket，subprotocol 同时提供 muselab-terminal-v1 与 ticket
+    API->>API: 若带 Origin，其 host 必须等于 Host
+    API->>API: 删除摘要，校验终端 ID 与有效期
+    alt 任一校验失败
+        API-->>B: 关闭连接
+    else 全部通过
+        API-->>B: 以 muselab-terminal-v1 接受连接
+    end
+```
 
 ## 权限边界
 
@@ -48,6 +84,27 @@ ticket 首次兑换时立即从内存删除，因此 prompt 和长期 token 不�
 - 预览区终端是真实 Unix PTY，能以 muselab 服务用户权限访问工作目录之外的路径。
 - 终端进程使用最小环境白名单，不继承 `MUSELAB_TOKEN` 或 provider API key；这能减少凭据泄露，但不能限制文件系统权限。
 
+```mermaid
+flowchart TD
+    H["token 持有者"] -->|"UI 与 API"| M["muselab 服务"]
+    subgraph OSU["muselab 服务用户的操作系统权限"]
+        M
+        FA["文件 API"]
+        AG["Agent 工具<br/>Bash、Read、Write 等"]
+        TM["真实终端<br/>Unix PTY，最小环境"]
+        WS[("默认与已登记工作目录")]
+        ANY[("服务用户可触达的任意其他路径")]
+    end
+    M --> FA
+    M --> AG
+    M --> TM
+    FA -->|"路径边界"| WS
+    AG -->|"SDK 权限模式"| WS
+    AG -->|"SDK 权限模式"| ANY
+    TM --> WS
+    TM -->|"无路径边界"| ANY
+```
+
 若不需要真实终端，设置 `MUSELAB_TERMINAL_ENABLED=0`。生产或共享机器应使用专门的低权限系统用户运行 muselab，并依赖容器、虚拟机或操作系统权限建立真正隔离。
 
 ## Provider 凭据隔离
@@ -60,6 +117,19 @@ Claude OAuth 凭据。这样既避免第三方请求静默回退到 Anthropic，
 清理临时目录丢失第三方会话。只有 `~/.claude/skills/` 会映射进隔离目录，使用户
 Skills 保持可用；settings、hooks、plugins、凭据和其他 provider 的 key 仍然隔离，
 `MUSELAB_TOKEN` 也不会传入该子进程。
+
+```mermaid
+flowchart LR
+    subgraph BE["muselab 后端"]
+        ENV["进程环境<br/>含 MUSELAB_TOKEN 与所有 provider key"]
+        SEL["当前 provider<br/>endpoint 与凭据"]
+    end
+    ENV -->|"仅进程、代理与 TLS 变量"| RE["替换用环境"]
+    SEL --> RE
+    RE --> CLI["非 Anthropic provider 的<br/>claude CLI 子进程"]
+    CLI -->|"CLAUDE_CONFIG_DIR"| CFG[("持久、按用户隔离的 vendor-cli 目录<br/>已清除 Claude OAuth 凭据")]
+    US[("用户 Skills 目录")] -->|"唯一映射项"| CFG
+```
 
 ## 设置写入
 
