@@ -1330,6 +1330,12 @@ class TurnBroadcast:
         self.perf_attachment_ms = 0
         self.perf_intent_refresh_ms = 0
         self.perf_query_write_ms = 0
+        # Context-phase split: when the phase began, plus its formerly
+        # untimed transcript-boundary, delivery-evidence and attachment steps.
+        self.perf_context_at_ms = 0
+        self.perf_boundary_ms = 0
+        self.perf_delivery_ms = 0
+        self.perf_commit_ms = 0
         self.perf_startup_status = "pending"
         self.perf_startup_failure_phase = "none"
         self._startup_perf_emitted = False
@@ -1402,6 +1408,10 @@ class TurnBroadcast:
                 intent_refresh_ms=self.perf_intent_refresh_ms,
                 preflight_ms=self.perf_preflight_ms,
                 sdk_write_ms=self.perf_query_write_ms,
+                context_at_ms=self.perf_context_at_ms,
+                boundary_ms=self.perf_boundary_ms,
+                delivery_ms=self.perf_delivery_ms,
+                commit_ms=self.perf_commit_ms,
                 total_ms=obs.elapsed_ms(self.perf_started),
             )
         except Exception:
@@ -6821,6 +6831,27 @@ def _session_message_uuids(sid: str, model: str) -> frozenset[str]:
             f"[chat-stream] UUID boundary snapshot skipped sid={sid[:8]} "
             f"exc={type(exc).__name__}\n")
         return frozenset()
+
+
+def _turn_delivery_baseline(sid: str) -> tuple[Path, dict[str, Any]]:
+    """Resolve the owned workspace and its pre-turn git baseline.
+
+    Read-only, so it may run concurrently with the context preflight; the
+    turn record itself is written by ``_begin_turn_delivery`` only after the
+    preflight has decided the query will be sent.
+    """
+    from .api_delivery import owned_workspace
+    from .runtime_identity import inspect_workspace
+
+    _, workspace = owned_workspace(sid)
+    return workspace, inspect_workspace(workspace, refresh=True)
+
+
+def _begin_turn_delivery(
+    sid: str, turn_id: str, workspace: Path, baseline: dict[str, Any],
+) -> None:
+    task_delivery.begin(sid, turn_id, workspace, baseline=baseline)
+    file_checkpoints.begin(sid, turn_id, workspace)
 
 
 def _turn_transcript_boundary(
@@ -17550,6 +17581,7 @@ async def _start_turn(
         broadcast.runtime_client = client
 
     broadcast.publish_startup("context")
+    broadcast.perf_context_at_ms = obs.elapsed_ms(broadcast.perf_started)
 
     # New architecture: CLI's JSONL is the transcript source-of-truth. We no
     # longer accumulate `persisted` into a parallel local store. Instead, after
@@ -17619,7 +17651,47 @@ async def _start_turn(
                 f"sid={session_id[:8]} phase={phase} "
                 f"exc={type(e).__name__}\n")
 
-    async def _preflight_compact_if_needed(emit=None) -> None:
+    def _usable_cached_context() -> tuple[dict | None, str]:
+        """Return a reusable SDK context snapshot, or why one is unusable."""
+        if not isinstance(client, MuseLabSDKClient):
+            return None, "unsupported"
+        cached = client.cached_context_usage(max_age_s=300)
+        if cached is None:
+            return None, "absent"
+        # Reuse only an unchanged, freshly measured SDK generation with
+        # ample headroom. Background/scheduled writers always force a probe.
+        cached_limit = _positive_int(cached.get("maxTokens"))
+        cached_total = _positive_int(cached.get("totalTokens"))
+        next_estimate = (_rough_prompt_tokens(prompt)
+                         + len(img_blocks) * 2500 + len(pdf_blocks) * 12000)
+        if not (cached_limit > 0 and cached_total > 0
+                and cached_total + next_estimate < cached_limit * 0.5):
+            return None, "headroom"
+        if (_sessions_with_inflight_tasks.get(session_id)
+                or _session_has_live_watcher(session_id)
+                or _session_has_sdk_delivery(session_id)):
+            return None, "background"
+        return cached, "none"
+
+    def _start_context_probe() -> asyncio.Task | None:
+        """Begin the SDK context measurement while other startup I/O runs.
+
+        The probe is read-only; any compaction it implies still happens in
+        ``_preflight_compact_if_needed`` before the user query is written.
+        """
+        try:
+            if _usable_cached_context()[0] is not None:
+                return None
+            task = asyncio.ensure_future(client.get_context_usage())
+        except Exception:
+            # Advisory: the preflight repeats the call inside its own error
+            # handling, which classifies and reports the failure.
+            return None
+        task.add_done_callback(
+            lambda done: done.exception() if not done.cancelled() else None)
+        return task
+
+    async def _preflight_compact_if_needed(emit=None, probe=None) -> None:
         """Use Claude Code's native context accounting before sending a turn.
 
         The previous auto-compact path only ran after a successful `done` event,
@@ -17631,38 +17703,34 @@ async def _start_turn(
         nonlocal client
         probe_started = time.perf_counter()
         use_cached = False
+        cache_miss = "none"
         try:
             # This probe is advisory when no compact is needed. Never let a
             # wedged SDK control request delay the user's real prompt for the
             # full compact window.
-            cached = (client.cached_context_usage(max_age_s=300)
-                      if isinstance(client, MuseLabSDKClient) else None)
-            # Reuse only an unchanged, freshly measured SDK generation with
-            # ample headroom. Background/scheduled writers always force a probe.
-            cached_limit = _positive_int((cached or {}).get("maxTokens"))
-            cached_total = _positive_int((cached or {}).get("totalTokens"))
-            next_estimate = (_rough_prompt_tokens(prompt)
-                             + len(img_blocks) * 2500 + len(pdf_blocks) * 12000)
-            use_cached = (
-                cached is not None and cached_limit > 0 and cached_total > 0
-                and cached_total + next_estimate < cached_limit * 0.5
-                and not _sessions_with_inflight_tasks.get(session_id)
-                and not _session_has_live_watcher(session_id)
-                and not _session_has_sdk_delivery(session_id))
-            cu = cached if use_cached else await asyncio.wait_for(
-                client.get_context_usage(),
-                timeout=min(
-                    10,
-                    env_int("MUSELAB_COMPACT_TIMEOUT_S", 300, min_value=1),
-                ),
-            )
+            cached, cache_miss = _usable_cached_context()
+            use_cached = cached is not None
+            if use_cached:
+                cu = cached
+            else:
+                # Reuse the measurement started at context-phase entry; a
+                # snapshot that was usable then but not now gets a new probe.
+                cu = await asyncio.wait_for(
+                    probe if probe is not None else client.get_context_usage(),
+                    timeout=min(
+                        10,
+                        env_int("MUSELAB_COMPACT_TIMEOUT_S", 300, min_value=1),
+                    ),
+                )
             obs.perf_event("chat.context_preflight", session=obs.short_id(session_id),
-                           cached=use_cached, outcome="ok",
+                           cached=use_cached, cache_miss=cache_miss, outcome="ok",
+                           early=probe is not None,
                            duration_ms=round((time.perf_counter() - probe_started) * 1000))
         except Exception as e:
             obs.perf_event("chat.context_preflight", session=obs.short_id(session_id),
-                           cached=use_cached, outcome="timeout" if isinstance(e, TimeoutError) else "error",
-                           error_class=type(e).__name__,
+                           cached=use_cached, cache_miss=cache_miss,
+                           outcome="timeout" if isinstance(e, TimeoutError) else "error",
+                           error_class=type(e).__name__, early=probe is not None,
                            duration_ms=round((time.perf_counter() - probe_started) * 1000))
             safe_kind = _classify_stream_error(str(e)).get("kind", "unknown")
             obs.diagnostic_line(
@@ -18123,15 +18191,10 @@ async def _start_turn(
             but filter already-persisted response UUIDs and continue past their
             stale Result until the current query reaches its own terminal.
             """
-            async def _run_prepared_query(recall: asyncio.Task[bool]) -> None:
-                # `merge_q` lives in event_gen's scope, one level deeper than
-                # _preflight_compact_if_needed's — hence the injected emitter
-                # rather than a closure reference. Events ride the same "side"
-                # lane as ask_user_question / permission_request: already
-                # shaped as {"event", "data"} and passed straight through.
-                async def _emit_side(evt: dict) -> None:
-                    await merge_q.put(("side", evt))
-
+            async def _prepare_query_context(
+                emit_side, context_probe, delivery_baseline,
+            ) -> frozenset[str]:
+                """Persist the turn boundary, preflight, and begin evidence."""
                 # Capture a display-safe tail anchor before preflight. A
                 # failing /compact never reaches the ordinary pre-query
                 # snapshot below; leaving the default zero anchor would place
@@ -18139,8 +18202,10 @@ async def _start_turn(
                 # conversation after refresh. This is only a fallback — a
                 # successful compact may change the transcript root, so we
                 # refresh it again immediately before the real user query.
+                boundary_started = obs.monotonic()
                 existing_uuids, transcript_boundary = await asyncio.to_thread(
                     _turn_transcript_boundary, session_id, model_to_use)
+                broadcast.perf_boundary_ms += obs.elapsed_ms(boundary_started)
                 broadcast.transcript_boundary = transcript_boundary
                 persisted_boundary = await obs.to_thread_io(
                     "chat.active_turn_write",
@@ -18155,26 +18220,60 @@ async def _start_turn(
                     raise RuntimeError("turn intent boundary could not be persisted")
                 _preflight_started = obs.monotonic()
                 try:
-                    await _preflight_compact_if_needed(_emit_side)
+                    await _preflight_compact_if_needed(emit_side, context_probe)
                 finally:
                     broadcast.perf_preflight_ms = obs.elapsed_ms(
                         _preflight_started)
                 # Snapshot AFTER preflight compact (which may write a new compact
                 # boundary) and immediately BEFORE this user query. A cache hit is
                 # cheap; to_thread keeps a long-session parse off the event loop.
+                boundary_started = obs.monotonic()
                 existing_uuids, transcript_boundary = await asyncio.to_thread(
                     _turn_transcript_boundary, session_id, model_to_use)
+                broadcast.perf_boundary_ms += obs.elapsed_ms(boundary_started)
                 broadcast.transcript_boundary = transcript_boundary
-                boundary = _TurnResponseBoundary(existing_uuids)
+                delivery_started = obs.monotonic()
                 try:
-                    from .api_delivery import owned_workspace
-                    _, task_workspace = await asyncio.to_thread(owned_workspace, session_id)
-                    await asyncio.to_thread(task_delivery.begin, session_id, broadcast.turn_id, task_workspace)
-                    await asyncio.to_thread(file_checkpoints.begin, session_id, broadcast.turn_id, task_workspace)
+                    task_workspace, task_baseline = await delivery_baseline
+                    await asyncio.to_thread(
+                        _begin_turn_delivery, session_id, broadcast.turn_id,
+                        task_workspace, task_baseline)
                 except (OSError, ValueError, HTTPException):
                     # Missing evidence is shown as unknown and cannot authorize
                     # restore; ancillary storage must not prevent the task.
                     pass
+                finally:
+                    broadcast.perf_delivery_ms = obs.elapsed_ms(delivery_started)
+                return existing_uuids
+
+            async def _run_prepared_query(recall: asyncio.Task[bool]) -> None:
+                # `merge_q` lives in event_gen's scope, one level deeper than
+                # _preflight_compact_if_needed's — hence the injected emitter
+                # rather than a closure reference. Events ride the same "side"
+                # lane as ask_user_question / permission_request: already
+                # shaped as {"event", "data"} and passed straight through.
+                async def _emit_side(evt: dict) -> None:
+                    await merge_q.put(("side", evt))
+
+                # Read-only startup work overlaps the boundary/sidecar writes:
+                # the SDK context measurement and the workspace git baseline.
+                # Every write (compact, delivery record) keeps its original
+                # position before the user query.
+                context_probe = _start_context_probe()
+                delivery_baseline = asyncio.create_task(asyncio.to_thread(
+                    _turn_delivery_baseline, session_id))
+                delivery_baseline.add_done_callback(
+                    lambda done: done.exception() if not done.cancelled() else None)
+                try:
+                    existing_uuids = await _prepare_query_context(
+                        _emit_side, context_probe, delivery_baseline)
+                finally:
+                    if context_probe is not None and not context_probe.done():
+                        context_probe.cancel()
+                    # A thread cannot be interrupted; the callback above
+                    # retrieves a late result or error after an early exit.
+                    delivery_baseline.cancel()
+                boundary = _TurnResponseBoundary(existing_uuids)
                 # mem0 recall is supplied by the UserPromptSubmit hook configured
                 # on this client. The canonical query remains exactly `prompt` so
                 # recalled data is never persisted as a fake user message.
@@ -18246,8 +18345,10 @@ async def _start_turn(
                     # query() is the transport commit point. Until it returns,
                     # the lease is still retryable; after it succeeds, consume
                     # the exact staged objects before receiving any response.
+                    commit_started = obs.monotonic()
                     await _commit_broadcast_attachments_off_loop(
                         broadcast, session_id)
+                    broadcast.perf_commit_ms = obs.elapsed_ms(commit_started)
                     broadcast.query_committed = True
                     broadcast.steering_ready.set()
                     broadcast.emit_startup_perf("ready")

@@ -79,8 +79,10 @@ def delete_data(sid: str) -> None:
                 file_checkpoints._PREVIEWS.pop(token)["watch"].close()
 
 
-def begin(sid: str, turn_id: str, cwd: Path) -> None:
-    baseline = inspect_workspace(cwd, refresh=True)
+def begin(sid: str, turn_id: str, cwd: Path, baseline: dict | None = None) -> None:
+    """Record a turn's start; ``baseline`` may be inspected ahead of time."""
+    if baseline is None:
+        baseline = inspect_workspace(cwd, refresh=True)
     with lock(sid):
         data = load(sid)
         if any(t["id"] == turn_id for t in data["turns"]):
