@@ -279,20 +279,43 @@ def test_memory_read_timeout_is_retryable_and_queue_is_cancelled(
         started = time.perf_counter()
         # TEMP DIAGNOSTIC (macOS CI only failure): dump every thread's stack
         # if the request is still running after 0.7 s.
-        import faulthandler
-        import tempfile
-        with tempfile.TemporaryFile("w+") as dump:
-            faulthandler.dump_traceback_later(0.7, file=dump)
-            try:
-                response = client.get("/api/memory/items", headers=auth)
-            finally:
-                faulthandler.cancel_dump_traceback_later()
-            elapsed = time.perf_counter() - started
-            dump.seek(0)
-            stacks = dump.read()
+        import gc
+        import os
+        import subprocess
+        import sys
+        import types
+        gcs = []
+        gc_t = {}
+
+        def gc_cb(phase, info):
+            if phase == "start":
+                gc_t["s"] = time.perf_counter()
+            else:
+                gcs.append((info["generation"], info["collected"],
+                            round((time.perf_counter() - gc_t.get("s", 0)) * 1000, 1)))
+        gc.callbacks.append(gc_cb)
+        cpu0 = time.process_time()
+        try:
+            response = client.get("/api/memory/items", headers=auth)
+        finally:
+            gc.callbacks.remove(gc_cb)
+        elapsed = time.perf_counter() - started
+        cpu = time.process_time() - cpu0
         if response.status_code != 503:
-            print("DIAG elapsed=%.3f executions=%r blocker_done=%r\n%s"
-                  % (elapsed, executions, blocker.done(), stacks))
+            mains = sum(1 for o in gc.get_objects()
+                        if isinstance(o, types.ModuleType)
+                        and o.__name__ == "backend.main")
+            ps = subprocess.run(["ps", "-A", "-o", "pid,ppid,pcpu,rss,etime,comm"],
+                                capture_output=True, text=True).stdout
+            busy = [ln for ln in ps.splitlines()[1:]
+                    if float(ln.split()[2]) >= 5.0]
+            kids = [ln for ln in ps.splitlines()[1:]
+                    if ln.split()[1] == str(os.getpid())]
+            print("DIAG elapsed=%.3f cpu=%.3f load=%r objs=%d mains=%d gc=%r "
+                  "counts=%r executions=%r\nbusy=%s\nkids=%s"
+                  % (elapsed, cpu, os.getloadavg(), len(gc.get_objects()), mains,
+                     gcs, gc.get_count(), executions, "\n".join(busy),
+                     "\n".join(kids)), file=sys.stderr)
         assert response.status_code == 503
         assert response.headers["retry-after"] == "1"
         assert time.perf_counter() - started < 0.5
