@@ -9,6 +9,7 @@ import sqlite3
 import stat
 import threading
 import time
+import uuid
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,8 @@ from .files import INTERNAL_DIR_NAME, TRASH_DIR_NAME
 
 
 _DB_NAME = "workspace-state.sqlite3"
+# Keep bound-parameter lists well under SQLite's oldest 999-variable limit.
+_PATH_LOOKUP_CHUNK = 500
 _EXCLUDED_DIRS = frozenset({INTERNAL_DIR_NAME, TRASH_DIR_NAME})
 # Explicitly prune generated, dependency, VCS, cache, and bulk-data trees. The
 # directory node stays addressable through the lazy `/list` API, but recursive
@@ -311,15 +314,77 @@ def expand_scan_rows(
     return expanded
 
 
+# The worker keeps resumable scan state and the latest pass rows itself. Only
+# an opaque resume token and the pass id cross the pipe, so a multi-million
+# file root no longer pickles its whole seen-path set through the main process
+# on every bounded continuation.
+_WORKER_MAX_ROOTS = 32
+# A pass awaits its apply; unclaimed ones (stale or cancelled reconciles) are
+# evicted oldest-first. Matches the manager's concurrent-reconcile ceiling.
+_WORKER_MAX_PASSES = 4
+
+
+def _bounded_put(table: dict[str, Any], key: str, value: Any, limit: int) -> None:
+    table.pop(key, None)
+    table[key] = value
+    while len(table) > limit:
+        table.pop(next(iter(table)))
+
+
+def _public_report(report: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in report.items() if not key.startswith("_")}
+
+
 def workspace_scan_worker(connection: Any, cancel_event: Any) -> None:
-    """Serve compact scan requests in one reusable spawned worker process."""
+    """Serve scan and apply requests in one reusable spawned worker process.
+
+    ``("scan", root, max_files, max_seconds, resume)`` runs one bounded pass
+    and answers ``("ok", pass_id, report, resume)``. ``("apply", root,
+    pass_id, store_args, apply_args)`` diffs and commits that pass with this
+    process's own SQLite connection and answers ``("ok", payload, report,
+    {})``. Failures answer ``("error", type, detail, resume)``.
+    """
+    progress_by_root: dict[str, tuple[str, dict[str, Any]]] = {}
+    passes: dict[str, tuple[str, list[dict[str, Any]], dict[str, Any]]] = {}  # by pass id
+    stores: dict[tuple[str, int], WorkspaceStore] = {}
     try:
         while True:
             request = connection.recv()
             if request is None:
                 return
-            root, max_files, max_seconds, progress = request
-            report: dict[str, Any] = {}
+            if request[0] == "apply":
+                _, root, pass_id, store_args, apply_args = request
+                report: dict[str, Any] = {}
+                try:
+                    pending = passes.pop(pass_id, None)
+                    if pending is None or pending[0] != root:
+                        raise WorkspaceScanIncomplete("scan pass is no longer available")
+                    _, rows, report = pending
+                    key = (str(store_args["primary_root"]), int(store_args["event_limit"]))
+                    store = stores.get(key)
+                    if store is None:
+                        store = stores[key] = WorkspaceStore(
+                            Path(key[0]), event_limit=key[1])
+                    payload = store.apply_reconcile_snapshot(
+                        apply_args["workspace_id"],
+                        Path(root),
+                        apply_args["name"],
+                        rows,
+                        report,
+                        expected_cursor=apply_args["expected_cursor"],
+                        dirty_paths=apply_args["dirty_paths"],
+                        primary=apply_args["primary"],
+                        cancel_event=cancel_event,
+                    )
+                    connection.send(("ok", payload, _public_report(report), {}))
+                except BaseException as exc:
+                    connection.send(("error", type(exc).__name__, str(exc), {}))
+                continue
+            _, root, max_files, max_seconds, resume = request
+            token = resume.get("token") if isinstance(resume, dict) else None
+            stored = progress_by_root.pop(root, None)
+            progress = stored[1] if stored is not None and stored[0] == token else {}
+            report = {}
             try:
                 rows = scan_workspace(
                     Path(root),
@@ -329,13 +394,32 @@ def workspace_scan_worker(connection: Any, cancel_event: Any) -> None:
                     report=report,
                     progress=progress,
                 )
-                connection.send(("ok", compact_scan_rows(rows), report, progress))
+                pass_id = uuid.uuid4().hex
+                _bounded_put(passes, pass_id, (root, rows, report), _WORKER_MAX_PASSES)
+                connection.send(("ok", pass_id, _public_report(report),
+                                 _keep_progress(progress_by_root, root, progress)))
             except BaseException as exc:
-                connection.send(("error", type(exc).__name__, str(exc), progress))
+                connection.send(("error", type(exc).__name__, str(exc),
+                                 _keep_progress(progress_by_root, root, progress)))
     except (EOFError, BrokenPipeError, OSError):
         return
     finally:
+        for store in stores.values():
+            store.close()
         connection.close()
+
+
+def _keep_progress(
+    progress_by_root: dict[str, tuple[str, dict[str, Any]]],
+    root: str,
+    progress: dict[str, Any],
+) -> dict[str, str]:
+    """Retain non-empty resume state locally and hand out an opaque token."""
+    if not progress:
+        return {}
+    token = uuid.uuid4().hex
+    _bounded_put(progress_by_root, root, (token, progress), _WORKER_MAX_ROOTS)
+    return {"token": token}
 
 
 class _ClosingConnection(sqlite3.Connection):
@@ -800,13 +884,16 @@ class WorkspaceStore:
                 if stale:
                     db.rollback()
                     return {"_stale": True, "cursor": seq, "changes": [], "resync": True}
-                old = {
-                    row["path"]: row
-                    for row in self._file_rows(db, workspace_id)
-                }
                 new = {row["path"]: row for row in snapshot}
                 complete_paths = set(scan_report.pop("_snapshot_paths", set(new)))
+                # Load only the stored rows this pass can change. A bounded
+                # pass of a huge workspace used to materialize every stored
+                # row (2.5M dicts for a home-directory root) inside the write
+                # transaction on every continuation; absence is decided below
+                # by streaming bare paths, and only for a complete pass.
+                old = self._file_rows_for_paths(db, workspace_id, new)
                 if protected:
+                    old.update(self._protected_rows(db, workspace_id, protected))
                     subtrees = {path for path, recursive in protected.items() if recursive}
                     def touched(path):
                         if path in protected:
@@ -854,7 +941,14 @@ class WorkspaceStore:
                     deleted = (
                         []
                         if partial
-                        else sorted(old.keys() - complete_paths)
+                        else [
+                            row[0]
+                            for row in db.execute(
+                                "SELECT path FROM files WHERE workspace_id = ? ORDER BY path",
+                                (workspace_id,),
+                            )
+                            if row[0] not in complete_paths
+                        ]
                     )
                     added = sorted(new.keys() - old.keys())
                     modified = sorted(
@@ -1558,6 +1652,44 @@ class WorkspaceStore:
             }
             for row in rows
         ]
+
+    @staticmethod
+    def _file_rows_for_paths(
+        db: sqlite3.Connection,
+        workspace_id: str,
+        paths: Iterable[str],
+    ) -> dict[str, dict[str, Any]]:
+        """Return stored rows for exactly ``paths`` via primary-key lookups."""
+        wanted = list(paths)
+        found: dict[str, dict[str, Any]] = {}
+        for start in range(0, len(wanted), _PATH_LOOKUP_CHUNK):
+            chunk = wanted[start:start + _PATH_LOOKUP_CHUNK]
+            marks = ",".join("?" * len(chunk))
+            for row in db.execute(
+                "SELECT path, name, is_dir, size, mtime, mtime_ns, ctime_ns, inode "
+                f"FROM files WHERE workspace_id = ? AND path IN ({marks})",
+                (workspace_id, *chunk),
+            ):
+                found[row["path"]] = {**dict(row), "is_dir": bool(row["is_dir"])}
+        return found
+
+    @classmethod
+    def _protected_rows(
+        cls,
+        db: sqlite3.Connection,
+        workspace_id: str,
+        protected: Mapping[str, bool],
+    ) -> dict[str, dict[str, Any]]:
+        """Return stored rows a watcher mutation touched (exact or subtree)."""
+        rows = cls._file_rows_for_paths(
+            db, workspace_id,
+            (path for path, recursive in protected.items() if not recursive),
+        )
+        for path, recursive in protected.items():
+            if recursive:
+                for row in cls._subtree_rows(db, workspace_id, path):
+                    rows[row["path"]] = row
+        return rows
 
     @staticmethod
     def _expanded_parent_paths(parents: Iterable[str]) -> list[str]:

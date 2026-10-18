@@ -1722,13 +1722,15 @@ class MemoryEngine:
 
     async def recall(self, query: str, session_id: str, *,
                      limit: int | None = None, kind: str | None = None,
-                     origin: str = "hook") -> list[dict]:
+                     origin: str = "hook", report: dict | None = None) -> list[dict]:
         """Hybrid recall.
 
         ``origin="hook"`` is the per-turn pre-recall that owns the session's
         live receipt. ``origin="agent"`` is an explicit Agent search: it uses
         only the Agent's query, honours its limit/kind filter, is logged as a
         recall receipt, and never replaces the hook receipt of the turn.
+        ``report``, when given, receives the final ``status`` so a caller can
+        tell "nothing matched" from "a stage timed out or failed".
         """
         started = time.perf_counter()
         cfg = await self._config_async()
@@ -1805,6 +1807,8 @@ class MemoryEngine:
                       "timeout" if "timeout" in stages.values() else
                       "error" if degraded else "ok")
             latency = (time.perf_counter() - started) * 1000
+            if report is not None:
+                report["status"] = status
             self._schedule_recall_telemetry(
                 recall_id=recall_id, owner_id=cfg.owner_id, session_id=session_id,
                 query=query, results=[

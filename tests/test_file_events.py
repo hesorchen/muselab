@@ -879,11 +879,11 @@ async def test_reconcile_scans_share_one_worker_without_holding_workspace_lock(
     import backend.file_events as file_events
 
     class CappedStore:
+        primary_root = temp_root
+        event_limit = 1000
+
         def current_cursor(self, _workspace_id):
             return 0
-
-        def apply_reconcile_snapshot(self, *_args, **_kwargs):
-            return {"cursor": 0, "changes": [], "resync": False}
 
         def close(self):
             return None
@@ -896,8 +896,10 @@ async def test_reconcile_scans_share_one_worker_without_holding_workspace_lock(
     active = 0
     max_active = 0
 
-    def controlled_exchange(_request):
+    def controlled_exchange(request):
         nonlocal calls, active, max_active
+        if request[0] == "apply":
+            return ("ok", {"cursor": 0, "changes": [], "resync": False}, {}, {})
         with lock:
             calls += 1
             active += 1
@@ -906,7 +908,7 @@ async def test_reconcile_scans_share_one_worker_without_holding_workspace_lock(
         assert release.acquire(timeout=3)
         with lock:
             active -= 1
-        return ("ok", [], {}, {})
+        return ("ok", f"pass-{calls}", {}, {})
 
     monkeypatch.setattr(manager, "_ensure_scan_worker_locked", lambda: None)
     monkeypatch.setattr(manager, "_exchange_scan_request", controlled_exchange)
@@ -962,26 +964,30 @@ async def test_spawned_scanner_is_reused_and_recovers_after_exit(
         root=temp_root.resolve(),
         workspace_id="spawned-scanner",
     )
-    first_snapshot, _ = await manager._scan_workspace(state)
-    assert first_snapshot
-    assert all(isinstance(row, tuple) for row in first_snapshot)
+    first_pass, first_report = await manager._scan_workspace(state)
+    # Rows stay in the worker; only an opaque pass id crosses the pipe.
+    assert isinstance(first_pass, file_events._WorkerScanPass)
+    assert first_report["snapshot_files"] > 0
+    assert not any(key.startswith("_") for key in first_report)
     first_process = manager._scan_process
     assert first_process is not None
     assert first_process.is_alive()
     first_pid = first_process.pid
 
-    second_snapshot, _ = await manager._scan_workspace(state)
+    second_pass, second_report = await manager._scan_workspace(state)
     assert manager._scan_process is first_process
-    assert second_snapshot == first_snapshot
+    assert second_pass.pass_id != first_pass.pass_id
+    assert second_report["snapshot_files"] == first_report["snapshot_files"]
 
     first_process.terminate()
     await asyncio.to_thread(first_process.join, 1)
-    recovered_snapshot, _ = await manager._scan_workspace(state)
+    recovered_pass, recovered_report = await manager._scan_workspace(state)
     recovered_process = manager._scan_process
     assert recovered_process is not None
     assert recovered_process.is_alive()
     assert recovered_process.pid != first_pid
-    assert recovered_snapshot == first_snapshot
+    assert recovered_report["snapshot_files"] == first_report["snapshot_files"]
+    assert isinstance(recovered_pass, file_events._WorkerScanPass)
 
     await manager.shutdown()
     assert manager._scan_process is None
@@ -3401,8 +3407,9 @@ async def test_scan_exchange_deadline_releases_shared_worker(app_module, temp_ro
             await manager._scan_workspace(state)
         assert entered.is_set()
         assert not manager._scan_worker_lock.locked()
-        monkeypatch.setattr(manager, "_exchange_scan_request", lambda _request: ("ok", [], {}, {}))
-        assert await manager._scan_workspace(state) == ([], {})
+        monkeypatch.setattr(manager, "_exchange_scan_request", lambda _request: ("ok", "pass", {}, {}))
+        assert await manager._scan_workspace(state) == (
+            file_events._WorkerScanPass(str(temp_root), "pass"), {})
     finally:
         guard.cancel()
         manager._scan_cancel.set()
@@ -3505,3 +3512,51 @@ def test_expensive_failed_scan_has_cost_proportional_bounded_retry(temp_root, mo
     assert delay == events._RECONCILE_RETRY_MAX_S
     events.FileWatchManager._reset_reconcile_retry(state)
     assert state.reconcile_retry_at == 0
+
+
+@pytest.mark.asyncio
+async def test_worker_resident_reconcile_applies_changes_and_resumes(
+    app_module, temp_root, monkeypatch,
+):
+    """Scan rows and resume state never leave the scanner; apply still commits."""
+    from backend import file_events
+    from backend.workspace_store import WorkspaceStore
+    from backend.workspaces import registry
+
+    (temp_root / "sub").mkdir()
+    for index in range(6):
+        (temp_root / "sub" / f"f{index}.txt").write_text(str(index), encoding="utf-8")
+    store = WorkspaceStore(temp_root)
+    entry = registry.entry_for(temp_root)
+    store.reconcile(entry.id, temp_root, entry.name)
+    manager = file_events.FileWatchManager(store)
+    state = await manager.ensure_workspace(temp_root)
+    broadcasts = []
+    monkeypatch.setattr(manager, "_broadcast", lambda _state, payload: broadcasts.append(payload))
+    try:
+        (temp_root / "sub" / "added.txt").write_text("new", encoding="utf-8")
+        (temp_root / "sub" / "f0.txt").unlink()
+        # Force bounded continuations so the worker-held resume token is used.
+        monkeypatch.setattr(file_events, "_SCAN_MAX_FILES", 3)
+        partial = True
+        passes = 0
+        while partial:
+            partial = await manager._reconcile_and_broadcast(state)
+            passes += 1
+            assert passes < 20
+            if partial:
+                assert set(state.scan_progress) == {"token"}
+        assert passes > 1
+        assert state.scan_progress == {}
+        changes = [change for payload in broadcasts for change in payload.get("changes", ())]
+        assert {"added", "sub/added.txt"} <= {
+            value for change in changes for value in (change.get("type"), change.get("path"))}
+        assert ("deleted", "sub/f0.txt") in {
+            (change.get("type"), change.get("path")) for change in changes}
+        with store._connect() as db:
+            paths = {row[0] for row in db.execute(
+                "SELECT path FROM files WHERE workspace_id = ?", (entry.id,))}
+        assert "sub/added.txt" in paths
+        assert "sub/f0.txt" not in paths
+    finally:
+        await manager.shutdown()

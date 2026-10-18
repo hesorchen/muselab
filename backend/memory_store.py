@@ -491,6 +491,8 @@ class MemoryStore:
           ON memories(owner_id, updated_at DESC, id ASC);
         CREATE INDEX IF NOT EXISTS idx_memories_owner_status_id
           ON memories(owner_id, status, id);
+        CREATE INDEX IF NOT EXISTS idx_memories_owner_kind_content
+          ON memories(owner_id, kind, content);
                 CREATE INDEX IF NOT EXISTS idx_memories_owner_id ON memories(owner_id,id);
         CREATE TABLE IF NOT EXISTS memory_sources (
           memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
@@ -1430,16 +1432,21 @@ class MemoryStore:
 
     def find_active_duplicate(self, owner_id: str, content: str) -> dict | None:
         """Exact (whitespace-normalised) active duplicate, if one exists."""
+        from .memory_tool_specs import MEMORY_KINDS
+
         normalized = " ".join(str(content).split())
+        # Seek idx_memories_owner_kind_content once per (validated) kind. Left
+        # to itself the planner picks the owner/status index and reads every
+        # active row's content from the table: ~10 ms warm, but >20 s when
+        # those scattered pages were evicted, which timed out memory_write.
+        # ``+status`` keeps the status index out of the plan.
+        marks = ",".join("?" * len(MEMORY_KINDS))
+        sql = ("SELECT id,content FROM memories WHERE owner_id=? "
+               f"AND kind IN ({marks}) AND content=? AND +status='active'")
         with self._lock, self._connect() as conn:
-            rows = conn.execute(
-                "SELECT id,content FROM memories WHERE owner_id=? AND status='active' "
-                "AND content=?", (owner_id, normalized)).fetchall()
+            rows = conn.execute(sql, (owner_id, *MEMORY_KINDS, normalized)).fetchall()
             if not rows and normalized != content:
-                rows = conn.execute(
-                    "SELECT id,content FROM memories WHERE owner_id=? "
-                    "AND status='active' AND content=?",
-                    (owner_id, content)).fetchall()
+                rows = conn.execute(sql, (owner_id, *MEMORY_KINDS, content)).fetchall()
         return self.memory(str(rows[0]["id"])) if rows else None
 
     def open_episode_id(self, owner_id: str, session_id: str) -> str | None:

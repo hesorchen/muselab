@@ -1,5 +1,6 @@
 """Agent-autonomous memory: tools, evidence traceback, free editing, recall modes."""
 import asyncio
+import contextlib
 import json
 import uuid
 
@@ -118,6 +119,63 @@ def test_agent_search_does_not_replace_hook_trace(agent_case):
     assert found["recall_id"]
     assert found["results"][0]["sources"] == []
     assert "untrusted" in found["note"]
+
+
+def test_agent_search_reports_timeout_instead_of_no_match(agent_case, monkeypatch):
+    """A recall that ran out of time must not tell the Agent "no matching memory"."""
+    from backend import memory_agent
+    instance, cfg, vector = agent_case
+    cfg.retrieval.soft_timeout_ms = 50
+    instance.store.create_memory("default", "fact", "project uses sqlite")
+
+    async def slow_search(*args, **kwargs):
+        await asyncio.sleep(1)
+        return []
+
+    monkeypatch.setattr(vector, "search", slow_search)
+    found = _run(memory_agent.search("sid", "zzz-unrelated-query"))
+    assert found["count"] == 0
+    assert found["status"] == "timeout"
+    assert "No matching memory" not in found["note"]
+    assert "not a 'no match'" in found["note"]
+
+    async def no_hits(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr(vector, "search", no_hits)
+    cfg.retrieval.soft_timeout_ms = 2000
+    empty = _run(memory_agent.search("sid", "zzz-unrelated-query"))
+    assert empty["status"] == "ok"
+    assert empty["note"].startswith("No matching memory")
+
+
+def test_active_duplicate_lookup_seeks_content_index(tmp_path):
+    """The dedup check must not read every active row (cold-cache timeouts)."""
+    from backend.memory_store import MemoryStore
+    store = MemoryStore(tmp_path / "registry.sqlite3")
+    kept = store.create_memory("default", "state", "deploy  port is 8766")
+    gone = store.create_memory("default", "fact", "old fact")
+    store.update_memory(gone["id"], status="deleted")
+    assert store.find_active_duplicate("default", "deploy port is 8766") is None
+    assert store.find_active_duplicate("default", "deploy  port is 8766")["id"] == kept["id"]
+    assert store.find_active_duplicate("default", "old fact") is None
+    assert store.find_active_duplicate("other", "deploy  port is 8766") is None
+    statements: list[str] = []
+    original = store._connect
+
+    @contextlib.contextmanager
+    def tracing_connect(*args, **kwargs):
+        with original(*args, **kwargs) as conn:
+            conn.set_trace_callback(statements.append)
+            yield conn
+
+    store._connect = tracing_connect
+    store.find_active_duplicate("default", "x")
+    store._connect = original
+    lookups = [sql for sql in statements if sql.lstrip().upper().startswith("SELECT ID,CONTENT")]
+    with original() as conn:
+        plans = [row[3] for sql in lookups for row in conn.execute("EXPLAIN QUERY PLAN " + sql)]
+    assert plans and all("idx_memories_owner_kind_content" in plan for plan in plans)
 
 
 def test_agent_write_dedup_update_delete_and_audit(agent_case):

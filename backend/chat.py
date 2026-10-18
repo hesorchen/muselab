@@ -22070,15 +22070,24 @@ def _scan_sdk_scheduled_history(
 def _collect_sdk_scheduled_history_updates(
     cursors: dict[str, _ScheduledHistoryCursor],
 ) -> list[dict[str, str]]:
-    """Batch one privacy-safe transcript pass for a multiplex connection."""
+    """Batch one privacy-safe transcript pass for a multiplex connection.
+
+    Only jobs that can still fire are followed. Ended receipts (missing,
+    expired, finished, paused) and restart-interrupted ones stay on disk as
+    history; polling their transcripts every half second per mux connection
+    only burned the GIL, and a session whose transcript is gone paid an
+    uncached project-directory glob on every pass.
+    """
     with _sdk_cron_state_lock:
         scheduled = {
-            session_id: frozenset(
+            session_id: digests
+            for session_id, jobs in _sdk_cron_jobs.items()
+            if (digests := frozenset(
                 str(job.get("prompt_sha256") or "")
                 for job in jobs.values()
                 if job.get("prompt_sha256")
-            )
-            for session_id, jobs in _sdk_cron_jobs.items()
+                and job.get("runtime_state", "active") in _NATIVE_CRON_LIVE_STATES
+            ))
         }
     for stale_id in set(cursors) - set(scheduled):
         cursors.pop(stale_id, None)

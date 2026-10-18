@@ -256,6 +256,14 @@ def _next_watch_retry_delay(
 
 
 @dataclass(frozen=True)
+class _WorkerScanPass:
+    """A bounded scan pass whose rows stay in the scanner process."""
+
+    root: str
+    pass_id: str
+
+
+@dataclass(frozen=True)
 class _ReconcileApplicability:
     workspace_id: str
     root: Path
@@ -1444,11 +1452,70 @@ class FileWatchManager:
         except BaseException:
             await asyncio.gather(exchange, return_exceptions=True)
 
+    async def _worker_exchange(
+        self,
+        state: _WatchState,
+        request: tuple[Any, ...],
+        *,
+        timeout: float | None,
+    ) -> tuple[Any, ...]:
+        """Run one scanner-process exchange; caller holds the worker lock."""
+        exchange = asyncio.create_task(
+            asyncio.to_thread(self._exchange_scan_request, request),
+            name=f"muselab-files-scan-exchange:{state.workspace_id}",
+        )
+        cancelled = asyncio.create_task(state.reconcile_cancel.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {exchange, cancelled},
+                return_when=asyncio.FIRST_COMPLETED,
+                timeout=timeout,
+            )
+            if not done:
+                await self._cancel_scan_exchange(exchange)
+                # No response means no authoritative snapshot. Preserve the
+                # last-good index and let the existing backoff retry later.
+                raise WorkspaceScanIncomplete("workspace scan worker deadline exceeded")
+            if cancelled in done:
+                await self._cancel_scan_exchange(exchange)
+                raise WorkspaceScanCancelled("workspace scan cancelled")
+            cancelled.cancel()
+            await asyncio.gather(cancelled, return_exceptions=True)
+            return exchange.result()
+        except asyncio.CancelledError:
+            cancelled.cancel()
+            await self._cancel_scan_exchange(exchange)
+            await asyncio.gather(cancelled, return_exceptions=True)
+            raise
+        except WorkspaceScanCancelled:
+            raise
+        except BaseException:
+            cancelled.cancel()
+            await self._stop_scan_worker_locked()
+            await asyncio.gather(cancelled, return_exceptions=True)
+            raise
+
+    @staticmethod
+    def _raise_worker_error(kind: str, error_type: Any, detail: Any) -> None:
+        error_type = str(error_type or "")
+        detail = str(detail or f"workspace {kind} failed")
+        if error_type == "WorkspaceScanIncomplete":
+            raise WorkspaceScanIncomplete(detail)
+        if error_type == "WorkspaceScanCancelled":
+            raise WorkspaceScanCancelled(detail)
+        raise RuntimeError(
+            f"workspace {kind} worker failed ({error_type or 'unknown'})"
+        )
+
     async def _scan_workspace(
         self,
         state: _WatchState,
-    ) -> tuple[list[Any], dict[str, Any]]:
-        """Run one bounded scan in the reusable spawned worker."""
+    ) -> tuple[_WorkerScanPass, dict[str, Any]]:
+        """Run one bounded scan in the reusable spawned worker.
+
+        The rows and the resumable seen-path state stay in the worker; only an
+        opaque pass id, a small report and a resume token return here.
+        """
         if state.reconcile_cancel.is_set():
             raise WorkspaceScanCancelled("workspace scan cancelled")
         queued = monotonic()
@@ -1460,66 +1527,75 @@ class FileWatchManager:
                 "files.scan_worker_start", "", self._ensure_scan_worker_locked, owned=True)
             self._scan_cancel.clear()
             request = (
+                "scan",
                 str(state.root),
                 _SCAN_MAX_FILES,
                 _SCAN_MAX_SECONDS,
                 state.scan_progress,
             )
-            exchange = asyncio.create_task(
-                asyncio.to_thread(self._exchange_scan_request, request),
-                name=f"muselab-files-scan-exchange:{state.workspace_id}",
-            )
-            cancelled = asyncio.create_task(state.reconcile_cancel.wait())
             try:
-                done, _ = await asyncio.wait(
-                    {exchange, cancelled},
-                    return_when=asyncio.FIRST_COMPLETED,
-                    timeout=_SCAN_EXCHANGE_TIMEOUT_S,
-                )
-                if not done:
-                    await self._cancel_scan_exchange(exchange)
-                    # No response means no authoritative snapshot. Preserve the
-                    # last-good index and let the existing backoff retry later.
-                    raise WorkspaceScanIncomplete("workspace scan worker deadline exceeded")
-                if cancelled in done:
-                    await self._cancel_scan_exchange(exchange)
-                    raise WorkspaceScanCancelled("workspace scan cancelled")
-                cancelled.cancel()
-                await asyncio.gather(cancelled, return_exceptions=True)
-                response = exchange.result()
-            except asyncio.CancelledError:
-                cancelled.cancel()
-                await self._cancel_scan_exchange(exchange)
-                await asyncio.gather(cancelled, return_exceptions=True)
-                raise
-            except WorkspaceScanCancelled:
-                raise
-            except BaseException:
-                cancelled.cancel()
-                await self._stop_scan_worker_locked()
-                await asyncio.gather(cancelled, return_exceptions=True)
-                raise
+                response = await self._worker_exchange(
+                    state, request, timeout=_SCAN_EXCHANGE_TIMEOUT_S)
             finally:
                 _perf_event(
                     "files.scan", workspace=short_id(state.workspace_id),
                     queue_ms=elapsed_ms(queued, entered), duration_ms=elapsed_ms(entered),
                 )
 
-            status, rows, report, progress = response
+            status, pass_id, report, progress = response
             state.scan_progress = progress if isinstance(progress, dict) else {}
             if status == "error":
-                error_type = str(rows or "")
-                detail = str(report or "workspace scan failed")
-                if error_type == "WorkspaceScanIncomplete":
-                    raise WorkspaceScanIncomplete(detail)
-                if error_type == "WorkspaceScanCancelled":
-                    raise WorkspaceScanCancelled(detail)
-                raise RuntimeError(
-                    f"workspace scanner failed ({error_type or 'unknown'})"
-                )
-            if status != "ok" or not isinstance(rows, list) or not isinstance(report, dict):
+                self._raise_worker_error("scan", pass_id, report)
+            if status != "ok" or not isinstance(pass_id, str) or not isinstance(report, dict):
                 raise RuntimeError("workspace scanner returned invalid scan data")
-            return rows, report
+            return _WorkerScanPass(str(state.root), pass_id), report
+
+    async def _apply_worker_pass(
+        self,
+        state: _WatchState,
+        token: _ReconcileApplicability,
+        scan_pass: _WorkerScanPass,
+        scan_report: dict[str, Any],
+        dirty_paths: dict[str, bool],
+    ) -> dict[str, Any]:
+        """Diff and commit a worker-resident pass inside the scanner process.
+
+        The caller holds the workspace mutation lock, so native watcher writes
+        stay serialized exactly as with the former in-thread apply; SQLite
+        transactions serialize the cross-process writer.
+        """
+        async with self._scan_worker_lock:
+            await to_thread_io(
+                "files.scan_worker_start", "", self._ensure_scan_worker_locked, owned=True)
+            self._scan_cancel.clear()
+            request = (
+                "apply",
+                scan_pass.root,
+                scan_pass.pass_id,
+                {
+                    "primary_root": str(self.store.primary_root),
+                    "event_limit": int(self.store.event_limit),
+                },
+                {
+                    "workspace_id": token.workspace_id,
+                    "name": state.name,
+                    "expected_cursor": token.cursor,
+                    "dirty_paths": dirty_paths,
+                    "primary": state.primary,
+                },
+            )
+            # A first baseline of a large root may legitimately take minutes;
+            # like the former in-thread apply it is bounded by cancellation,
+            # not by a deadline that would discard a valid commit.
+            status, payload, report, _ = await self._worker_exchange(
+                state, request, timeout=None)
+        if isinstance(report, dict):
+            scan_report.update(report)
+        if status == "error":
+            self._raise_worker_error("apply", payload, report)
+        if status != "ok" or not isinstance(payload, dict):
+            raise RuntimeError("workspace scanner returned invalid apply data")
+        return payload
 
     async def _reconcile_after_watch(self, state: _WatchState) -> None:
         """Reconcile downtime after the watcher gets a chance to register."""
@@ -1835,18 +1911,23 @@ class FileWatchManager:
                     if not stale_snapshot:
                         store_started = monotonic()
                         try:
-                            result = await asyncio.to_thread(
-                                self.store.apply_reconcile_snapshot,
-                                token.workspace_id,
-                                token.root,
-                                state.name,
-                                snapshot,
-                                scan_report,
-                                expected_cursor=token.cursor,
-                                dirty_paths=dirty_paths,
-                                primary=state.primary,
-                                cancel_event=state.reconcile_cancel,
-                            )
+                            if isinstance(snapshot, _WorkerScanPass):
+                                result = await self._apply_worker_pass(
+                                    state, token, snapshot, scan_report, dirty_paths)
+                            else:
+                                # Directly supplied rows (tests, fakes) apply in-thread.
+                                result = await asyncio.to_thread(
+                                    self.store.apply_reconcile_snapshot,
+                                    token.workspace_id,
+                                    token.root,
+                                    state.name,
+                                    snapshot,
+                                    scan_report,
+                                    expected_cursor=token.cursor,
+                                    dirty_paths=dirty_paths,
+                                    primary=state.primary,
+                                    cancel_event=state.reconcile_cancel,
+                                )
                         finally:
                             for key in ("store_lock_wait_ms", "transaction_wait_ms",
                                         "transaction_apply_ms", "commit_ms", "rebased_paths", "read_compare_ms"):

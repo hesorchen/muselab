@@ -190,8 +190,10 @@ async def search(session_id: str, query: str, *, kind: str | None = None,
         raise MemoryToolError(f"unsupported kind: {kind}")
     await _active_config()
     limit = max(1, min(int(limit or 8), 20))
+    report: dict = {}
     rows = await _engine().recall(query, session_id, limit=limit, kind=kind,
-                                  origin="agent")
+                                  origin="agent", report=report)
+    status = report.get("status", "ok")
     details = {}
     if rows:
         ids = [row["id"] for row in rows]
@@ -210,13 +212,24 @@ async def search(session_id: str, query: str, *, kind: str | None = None,
         merged = {**detail, **{key: row[key] for key in row
                                if key not in {"tags", "created_at", "updated_at"}}}
         results.append(_memory_view(merged, score=row.get("score")))
+    if status in {"timeout", "error"}:
+        # A stage that did not finish proves nothing about absence.
+        note = ("Memory search did not complete (" + status + "); this is not a "
+                "'no match'. Retry the same query shortly.")
+    elif not results:
+        note = "No matching memory. Try other keywords, synonyms or a broader query."
+    elif status == "partial":
+        note = (UNTRUSTED_NOTE + " Some retrieval channels did not complete; "
+                "results may be incomplete.")
+    else:
+        note = UNTRUSTED_NOTE
     return {
         "query": query,
         "recall_id": rows[0].get("recall_id") if rows else None,
+        "status": status,
         "count": len(results),
         "results": results,
-        "note": UNTRUSTED_NOTE if results else
-        "No matching memory. Try other keywords, synonyms or a broader query.",
+        "note": note,
     }
 
 

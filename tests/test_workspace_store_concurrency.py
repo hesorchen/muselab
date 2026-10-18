@@ -324,15 +324,15 @@ def test_reconcile_write_phase_does_not_block_other_workspace_reads(
 
     transaction_started = threading.Event()
     finish_transaction = threading.Event()
-    original = store._file_rows
+    original = store._file_rows_for_paths
 
-    def paused_first_workspace(db, selected_workspace_id, **kwargs):
+    def paused_first_workspace(db, selected_workspace_id, paths):
         if selected_workspace_id == first_id:
             transaction_started.set()
             assert finish_transaction.wait(timeout=2)
-        return original(db, selected_workspace_id, **kwargs)
+        return original(db, selected_workspace_id, paths)
 
-    monkeypatch.setattr(store, "_file_rows", paused_first_workspace)
+    monkeypatch.setattr(store, "_file_rows_for_paths", paused_first_workspace)
     (temp_root / "new.txt").write_text("new", encoding="utf-8")
     with ThreadPoolExecutor(max_workers=1) as executor:
         pending = executor.submit(

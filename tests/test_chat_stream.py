@@ -7551,6 +7551,33 @@ def test_native_cron_jsonl_completion_notifies_mux_without_content(
         chat_mod._sdk_cron_jobs.pop(sid, None)
 
 
+def test_native_cron_jsonl_follower_skips_ended_jobs(stream_env, monkeypatch):
+    """Ended receipts are history: never look up or read their transcripts."""
+    chat_mod = stream_env
+    lookups = []
+    monkeypatch.setattr(
+        chat_mod, "_find_session_jsonl",
+        lambda candidate: lookups.append(candidate) or None)
+    ended = {
+        f"sid-native-cron-ended-{state}": {
+            "job": {"prompt_sha256": "a" * 64, "runtime_state": state},
+        }
+        for state in ("missing", "expired", "finished", "paused", "interrupted")
+    }
+    live = {"sid-native-cron-live": {
+        "job": {"prompt_sha256": "b" * 64, "runtime_state": "unconfirmed"},
+    }}
+    chat_mod._sdk_cron_jobs.update({**ended, **live})
+    cursors = {sid: chat_mod._ScheduledHistoryCursor() for sid in ended}
+    try:
+        assert chat_mod._collect_sdk_scheduled_history_updates(cursors) == []
+        assert lookups == ["sid-native-cron-live"]
+        assert set(cursors) == {"sid-native-cron-live"}
+    finally:
+        for sid in (*ended, *live):
+            chat_mod._sdk_cron_jobs.pop(sid, None)
+
+
 def test_native_cron_jsonl_follower_keeps_inflight_trigger_on_attach(
         stream_env, monkeypatch, tmp_path):
     chat_mod = stream_env
