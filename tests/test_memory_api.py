@@ -277,7 +277,22 @@ def test_memory_read_timeout_is_retryable_and_queue_is_cancelled(
     try:
         assert entered.wait(1)
         started = time.perf_counter()
-        response = client.get("/api/memory/items", headers=auth)
+        # TEMP DIAGNOSTIC (macOS CI only failure): dump every thread's stack
+        # if the request is still running after 0.7 s.
+        import faulthandler
+        import tempfile
+        with tempfile.TemporaryFile("w+") as dump:
+            faulthandler.dump_traceback_later(0.7, file=dump)
+            try:
+                response = client.get("/api/memory/items", headers=auth)
+            finally:
+                faulthandler.cancel_dump_traceback_later()
+            elapsed = time.perf_counter() - started
+            dump.seek(0)
+            stacks = dump.read()
+        if response.status_code != 503:
+            print("DIAG elapsed=%.3f executions=%r blocker_done=%r\n%s"
+                  % (elapsed, executions, blocker.done(), stacks))
         assert response.status_code == 503
         assert response.headers["retry-after"] == "1"
         assert time.perf_counter() - started < 0.5
