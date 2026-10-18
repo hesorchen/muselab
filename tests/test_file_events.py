@@ -3530,7 +3530,10 @@ async def test_worker_resident_reconcile_applies_changes_and_resumes(
     entry = registry.entry_for(temp_root)
     store.reconcile(entry.id, temp_root, entry.name)
     manager = file_events.FileWatchManager(store)
-    state = await manager.ensure_workspace(temp_root)
+    # An unregistered state has no watcher or background reconcile task, so no
+    # concurrent pass can rewrite scan_progress while this test drives passes.
+    state = file_events._WatchState(
+        root=temp_root.resolve(), workspace_id=entry.id, name=entry.name)
     broadcasts = []
     monkeypatch.setattr(manager, "_broadcast", lambda _state, payload: broadcasts.append(payload))
     try:
