@@ -253,6 +253,7 @@ def test_memory_reads_bypass_busy_writer_and_recall(client, auth, app_module):
 
 def test_memory_read_timeout_is_retryable_and_queue_is_cancelled(
         client, auth, app_module, monkeypatch):
+    import gc
     import threading
     import time
     from backend.memory_engine import engine
@@ -273,53 +274,23 @@ def test_memory_read_timeout_is_retryable_and_queue_is_cancelled(
         entered.set()
         release.wait(2)
 
+    # The assertions below are wall-clock: a 50 ms read budget against a 2 s
+    # blocker. A full collection over a large suite-wide heap stops every
+    # thread while holding the GIL (observed: 3.9 s on a loaded macOS
+    # runner), outlasting the blocker so the read completes with 200. Pay the
+    # collection up front and keep the collector out of the timed window.
+    gc.collect()
+    gc.disable()
     blocker = engine._ui_store_actor._submit(hold)
     try:
         assert entered.wait(1)
         started = time.perf_counter()
-        # TEMP DIAGNOSTIC (macOS CI only failure): dump every thread's stack
-        # if the request is still running after 0.7 s.
-        import gc
-        import os
-        import subprocess
-        import sys
-        import types
-        gcs = []
-        gc_t = {}
-
-        def gc_cb(phase, info):
-            if phase == "start":
-                gc_t["s"] = time.perf_counter()
-            else:
-                gcs.append((info["generation"], info["collected"],
-                            round((time.perf_counter() - gc_t.get("s", 0)) * 1000, 1)))
-        gc.callbacks.append(gc_cb)
-        cpu0 = time.process_time()
-        try:
-            response = client.get("/api/memory/items", headers=auth)
-        finally:
-            gc.callbacks.remove(gc_cb)
-        elapsed = time.perf_counter() - started
-        cpu = time.process_time() - cpu0
-        if response.status_code != 503:
-            mains = sum(1 for o in gc.get_objects()
-                        if isinstance(o, types.ModuleType)
-                        and o.__name__ == "backend.main")
-            ps = subprocess.run(["ps", "-A", "-o", "pid,ppid,pcpu,rss,etime,comm"],
-                                capture_output=True, text=True).stdout
-            busy = [ln for ln in ps.splitlines()[1:]
-                    if float(ln.split()[2]) >= 5.0]
-            kids = [ln for ln in ps.splitlines()[1:]
-                    if ln.split()[1] == str(os.getpid())]
-            print("DIAG elapsed=%.3f cpu=%.3f load=%r objs=%d mains=%d gc=%r "
-                  "counts=%r executions=%r\nbusy=%s\nkids=%s"
-                  % (elapsed, cpu, os.getloadavg(), len(gc.get_objects()), mains,
-                     gcs, gc.get_count(), executions, "\n".join(busy),
-                     "\n".join(kids)), file=sys.stderr)
+        response = client.get("/api/memory/items", headers=auth)
         assert response.status_code == 503
         assert response.headers["retry-after"] == "1"
         assert time.perf_counter() - started < 0.5
     finally:
+        gc.enable()
         release.set()
         blocker.result(timeout=2)
     engine._ui_store_actor._submit(lambda store: None).result(timeout=2)
