@@ -15340,7 +15340,7 @@ async def _on_task_settled_owned(
         return True
 
 
-def _render_continuation_message(msg, state: dict):
+def _render_continuation_message(msg, state: dict, broadcast=None):
     """Yield SSE event dicts for one buffered SDK message read during a
     cross-turn continuation (the CLI auto-continue after a bg task finishes).
 
@@ -15357,7 +15357,13 @@ def _render_continuation_message(msg, state: dict):
         AssistantMessage TextBlock only tail-emits the suffix the stream skipped
         (mirrors event_gen's streamed_in_bubble dedup).
       - "assistant_uuid": latest persisted AssistantMessage UUID, exposed in
-        the terminal done payload so the live footer can fork immediately."""
+        the terminal done payload so the live footer can fork immediately.
+
+    `broadcast` (the continuation's TurnBroadcast) mirrors that UUID into
+    `last_assistant_uuid`, exactly as event_gen does for ordinary turns. A
+    history reload while the continuation is still live (e.g. after a mid-run
+    auto-compaction) keys its "running" footer on that UUID; leaving it empty
+    made the server stamp the live tail "completed"."""
     if isinstance(msg, StreamEvent):
         ev = getattr(msg, "event", None) or {}
         if ev.get("type") != "content_block_delta":
@@ -15377,6 +15383,8 @@ def _render_continuation_message(msg, state: dict):
         assistant_uuid = getattr(msg, "uuid", None)
         if assistant_uuid:
             state["assistant_uuid"] = str(assistant_uuid)
+            if broadcast is not None:
+                broadcast.last_assistant_uuid = str(assistant_uuid)
         for block in msg.content:
             if isinstance(block, TextBlock):
                 full = getattr(block, "text", "") or ""
@@ -16032,7 +16040,8 @@ async def _watch_inflight_tasks_owned(
                 progress = cont.native_compaction_progress(msg)
                 if progress is not None:
                     cont.publish(progress)
-                for event in _render_continuation_message(msg, cont_state):
+                for event in _render_continuation_message(
+                        msg, cont_state, broadcast=cont):
                     cont.publish(event)
 
         if not pending:
@@ -16276,7 +16285,8 @@ async def _watch_inflight_tasks_owned(
                                     for block in msg.content)
                         ):
                             cont_state["started"] = True
-                        for ev in _render_continuation_message(msg, cont_state):
+                        for ev in _render_continuation_message(
+                                msg, cont_state, broadcast=cont):
                             cont.publish(ev)
     except asyncio.CancelledError:
         # Shutdown or explicit watcher replacement. Keep pins so a replacement
@@ -22754,7 +22764,8 @@ async def _dispatch_sdk_delivery(delivery: _SDKDelivery, message: Any) -> bool:
                 "data": json.dumps(record["data"]),
             })
         return True
-    for event in _render_continuation_message(message, delivery.render_state):
+    for event in _render_continuation_message(
+            message, delivery.render_state, broadcast=delivery.broadcast):
         delivery.broadcast.publish(event)
     return True
 

@@ -308,6 +308,60 @@ def test_completed_partial_viewport_adopts_final_without_refresh(
     _assert_no_browser_errors(page, errors)
 
 
+@pytest.mark.parametrize("width", [1440, 390])
+@pytest.mark.parametrize("known_uuid", [True, False])
+def test_adopted_live_reply_loads_deferred_canonical_body(
+    page, backend_url, auth_token, width, known_uuid,
+):
+    """A large final body arrives as a preview; the adopted live row must not
+    downgrade to it, and must fetch the full body without a browser refresh."""
+    page.set_viewport_size({"width": width, "height": 900})
+    errors, history, _ = _prepare(page, backend_url, auth_token)
+    full = "LIVE_HEAD " + "x" * 3000 + " DEFERRED_TAIL_MARKER"
+    preview = full[:2000]
+    body_ref = "fixture-final:0:assistant"
+    history["messages"][1] = {
+        "role": "assistant", "text": preview, "preview": preview,
+        "uuid": "fixture-final", "body_state": "unloaded",
+        "body_available": True, "body_length": len(full), "body_ref": body_ref,
+    }
+    blocks = []
+
+    def body(route):
+        blocks.append(route.request.url)
+        route.fulfill(json={"role": "assistant", "text": full, "uuid": "fixture-final",
+                            "body_ref": body_ref, "body_available": True,
+                            "body_length": len(full)})
+
+    page.route(f"**/api/chat/sessions/{SID}/blocks/**", body)
+    result = _app_eval(page, """
+        const st = app.tabState[arg.sid];
+        const live = st.messages.at(-1);
+        live.text = arg.full;
+        const loaded = await app._runCompletedTurnSync(arg.sid, st, {
+          expectedText: arg.full,
+          expectedAssistantUuid: arg.known ? 'fixture-final' : '',
+          completedTurnId: 'fixture-turn', followTail: true,
+        });
+        const installedText = st.messages.at(-1).text;
+        const deadline = Date.now() + 5000;
+        while (st.messages.at(-1).body_state !== 'loaded' && Date.now() < deadline) {
+          await new Promise(resolve => setTimeout(resolve, 20));
+        }
+        const m = st.messages.at(-1);
+        return {loaded, sameNodeOwner: m === live, key: m._k,
+          installedFull: installedText === arg.full,
+          state: m.body_state, full: m.text === arg.full};
+    """, {"sid": SID, "full": full, "known": known_uuid})
+    assert result == {
+        "loaded": True, "sameNodeOwner": True, "key": f"{SID}:live:partial",
+        "installedFull": True, "state": "loaded", "full": True,
+    }
+    assert len(blocks) == 1
+    expect(page.locator(f'.msg-pane[data-tid="{SID}"]')).to_contain_text("DEFERRED_TAIL_MARKER")
+    _assert_no_browser_errors(page, errors)
+
+
 @pytest.mark.parametrize("same_turn", [True, False])
 def test_lost_done_viewport_uses_only_retired_turn_commit(
     page, backend_url, auth_token, same_turn,

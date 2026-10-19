@@ -1185,6 +1185,44 @@ def test_reload_footer_exposes_four_fields_for_active_canonical_tail(
         active.close()
 
 
+def test_reload_footer_keeps_live_continuation_tail_running(
+    client, auth, app_module, tmp_path,
+):
+    """Native-cron / SDK continuation turns render through the watcher's
+    standalone renderer.  A history reload while that turn is still live (the
+    frontend does one after a mid-run auto-compaction) must keep its tail
+    Running instead of stamping it Completed (V7训练, 2026-10-19)."""
+    from claude_agent_sdk import AssistantMessage, TextBlock
+    from backend import chat as chat_mod
+
+    entries = [
+        _entry("u-summary", "user", "This session is being continued",
+               timestamp="2026-10-19T07:35:15Z"),
+        _entry("a-live", "assistant", "still working", "u-summary",
+               timestamp="2026-10-19T07:35:50Z"),
+    ]
+    sid, _ = _make_endpoint_session(client, auth, chat_mod, tmp_path, entries)
+    active = chat_mod.TurnBroadcast(sid, model="ducc:deepseek-v4-1-flash")
+    active.is_continuation = True
+    state = {"tool_use_names": {}, "streamed": [], "assistant_uuid": ""}
+    list(chat_mod._render_continuation_message(
+        AssistantMessage(content=[TextBlock(text="still working")],
+                         model="deepseek", uuid="a-live"),
+        state, broadcast=active))
+    assert active.last_assistant_uuid == "a-live"
+    chat_mod._active_turns[sid] = active
+    try:
+        response = client.get(
+            f"/api/chat/sessions/{sid}", headers=auth, params={"tail": 50})
+        assert response.status_code == 200, response.text
+        tail = response.json()["messages"][-1]
+        assert tail["uuid"] == "a-live"
+        assert tail["turn_status"] == "running"
+    finally:
+        chat_mod._active_turns.pop(sid, None)
+        active.close()
+
+
 def test_around_uuid_limit_is_in_bubbles_and_keeps_target(
     client, auth, app_module, tmp_path,
 ):

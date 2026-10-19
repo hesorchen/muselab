@@ -15497,8 +15497,17 @@ function portal() {
           if (!r.ok) throw new Error("HTTP " + r.status);
           const loaded = await r.json();
           const localKey = m._k;
+          // An adopted live row already has rendered HTML/stream text from
+          // its own snapshot; rebuild it from the canonical body when they
+          // differ instead of leaving the older presentation mounted.
+          const hadPresentation = m.role === "assistant"
+            && (!!m.html || m._streamPlain === true);
+          const loadedText = String((loaded && loaded.text) || "");
+          const stalePresentation = hadPresentation
+            && this._assistantPresentationDiffers(m, loadedText);
           Object.assign(m, loaded, { _k: localKey, body_state: "loaded" });
-          if (m.role === "assistant") this._queueHistoryRichRender(m, sid);
+          if (stalePresentation) this._invalidateAssistantPresentation(m, loadedText, sid);
+          else if (m.role === "assistant") this._queueHistoryRichRender(m, sid);
           if (m._is_compact_summary) delete m._compactHtml;
           return true;
         } catch (_) {
@@ -20284,14 +20293,18 @@ function portal() {
         // A quiet reload returns transport previews again. Never replace a body
         // the user already loaded from the canonical block endpoint with that
         // unloaded preview; block_id identifies immutable transcript content.
-        const loadedBody = existing.body_state === "loaded"
-          && m.body_state === "unloaded"
+        // A body still being fetched is equally authoritative: keep its
+        // current text and in-flight state instead of flashing the preview.
+        const retainedBodyState = m.body_state === "unloaded"
+          && (existing.body_state === "loaded" || existing.body_state === "loading")
+          ? existing.body_state : "";
+        const loadedBody = retainedBodyState
           ? {
               text: existing.text,
               preview: existing.preview,
               html: existing.html,
               bash: existing.bash,
-              body_state: "loaded",
+              body_state: retainedBodyState,
               body_available: existing.body_available,
               body_length: existing.body_length,
               body_ref: existing.body_ref,
@@ -20446,7 +20459,21 @@ function portal() {
         if (!matched || !matched._k || used.has(matched)
             || adopted.has(index)) return false;
         const canonical = result[index];
-        const canonicalText = String(canonical && canonical.text || "");
+        // A large canonical body arrives as a bounded preview (body_state
+        // "unloaded"). Body loading is normally started by the row's x-init
+        // observer, which never re-runs for an adopted, already-mounted live
+        // row — so the reply stayed cut at the preview until a hard refresh.
+        // Keep the complete live text on screen while the canonical body is
+        // fetched explicitly below; the body load then replaces it.
+        const deferredBody = matched.role === "assistant"
+          && canonical.body_state === "unloaded"
+          && !!canonical.body_available && !!canonical.body_ref;
+        const previewText = String(canonical && canonical.text || "");
+        const liveText = String(matched.text || "");
+        const keepLiveText = deferredBody
+          && liveText.length > previewText.length
+          && liveText.startsWith(previewText);
+        const canonicalText = keepLiveText ? liveText : previewText;
         const staleAssistantPresentation =
           this._assistantPresentationDiffers(matched, canonicalText);
         used.add(matched);
@@ -20470,6 +20497,7 @@ function portal() {
         } : null;
         const canonicalFields = { ...canonical };
         delete canonicalFields._k;
+        if (keepLiveText) delete canonicalFields.text;
         for (const [key, value] of Object.entries(canonicalFields)) {
           if (!this._sameCanonicalValue(matched[key], value)) matched[key] = value;
         }
@@ -20504,6 +20532,7 @@ function portal() {
           this._invalidateAssistantPresentation(
             matched, canonicalText, st._sid);
         }
+        if (deferredBody) this._loadMessageBody(matched, st._sid);
         result[index] = matched;
         return true;
       };
