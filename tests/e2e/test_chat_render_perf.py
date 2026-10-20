@@ -2534,14 +2534,18 @@ def test_chat_bubble_selection_quotes_as_attachment_and_asks_in_side_session(
           input: st.draft.input,
           quotes: st.draft.pendingQuotes.map(item => ({
             text: item.text, role: item.role, messageId: item.messageId,
+            label: item.label,
           })),
           images: st.draft.pendingImages.map(item => item.id),
           docs: st.draft.pendingDocs.map(item => item.id),
         };
         """,
     )
-    assert quoted["input"] == "EXISTING_DRAFT"
+    # The quote lands as an inline marker at the caret (end of the draft);
+    # the existing draft text is kept around it.
     assert len(quoted["quotes"]) == 1
+    assert quoted["quotes"][0]["label"]
+    assert quoted["input"] == "EXISTING_DRAFT" + quoted["quotes"][0]["label"]
     assert quoted["quotes"][0]["role"] == "assistant"
     assert quoted["quotes"][0]["messageId"] == "selection-assistant"
     assert "ASSISTANT_SELECTION_MARKER" in quoted["quotes"][0]["text"]

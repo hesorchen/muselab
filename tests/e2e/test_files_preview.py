@@ -1309,7 +1309,9 @@ def test_inline_quote_markers_compose_prompt_in_place_and_render_pills(
               app.pendingQuotes.splice(0, app.pendingQuotes.length,
                 quote('k1', '[引用1]', 'K'));
               ta.setSelectionRange(caret, caret);
-              app.onQuoteMarkerKeydown(new KeyboardEvent('keydown', {key}));
+              // Dispatch on the textarea so the handler sees a real target.
+              ta.dispatchEvent(new KeyboardEvent('keydown', {
+                key, bubbles: true, cancelable: true}));
               const range = [ta.selectionStart, ta.selectionEnd];
               ta.setRangeText('', range[0], range[1], 'end');
               return {range, value: ta.value};
@@ -1508,8 +1510,8 @@ def test_preview_selection_quote_fits_mobile_and_reveals_chat(
         """([expected, path]) => {
           const app = document.querySelector('#app')._x_dataStack[0];
           return app.mobileTab === 'chat'
-            && app.input === ''
             && app.pendingQuotes.length === 1
+            && app.input === app.pendingQuotes[0].label
             && app.pendingQuotes[0].path === path
             && app.pendingQuotes[0].text.includes(expected);
         }""",
@@ -1523,19 +1525,24 @@ def test_preview_selection_quote_fits_mobile_and_reveals_chat(
             input: app.input,
             quoteCount: app.pendingQuotes.length,
             quoteText: app.pendingQuotes[0]?.text || '',
+            quoteLabel: app.pendingQuotes[0]?.label || '',
             popover: app.previewQuote.show,
             chatDisplay: getComputedStyle(document.querySelector('.pane.chat')).display,
-            chipDisplay: getComputedStyle(document.querySelector('.selection-quote-chip')).display,
+            chipCount: document.querySelectorAll('.selection-quote-chip').length,
+            markText: document.querySelector('.chat-input-quote-mark')?.textContent || '',
           };
         }"""
     )
     assert result["mobileTab"] == "chat"
     assert result["popover"] is False
     assert result["chatDisplay"] == "flex"
-    assert result["input"] == ""
+    # The quote is placed inline as a highlighted marker, not a chip.
     assert result["quoteCount"] == 1
+    assert result["quoteLabel"]
+    assert result["input"] == result["quoteLabel"]
     assert selected in result["quoteText"]
-    assert result["chipDisplay"] in {"flex", "inline-flex"}
+    assert result["chipCount"] == 0
+    assert result["markText"] == result["quoteLabel"]
 
 
 def test_file_metadata_stays_inside_mobile_header(
