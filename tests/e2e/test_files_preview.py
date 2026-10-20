@@ -1339,6 +1339,8 @@ def test_inline_quote_markers_compose_prompt_in_place_and_render_pills(
             ta.setSelectionRange(caretAt, caretAt);
             ta.dispatchEvent(new KeyboardEvent('keyup', {key: 'ArrowRight', bubbles: true}));
             await new Promise(resolve => app.$nextTick(resolve));
+            // Alpine's x-show reveals on the next animation frame.
+            await new Promise(resolve => requestAnimationFrame(() => setTimeout(resolve, 0)));
             const mirror = app.$refs.chatInputMirror;
             const mark = mirror.querySelector('.chat-input-quote-mark');
             const mcs = getComputedStyle(mirror);
