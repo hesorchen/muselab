@@ -4716,6 +4716,97 @@ def test_outline_around_conflict_retries_and_returns_to_real_tail(
     _assert_no_browser_errors(page, errors)
 
 
+def test_outline_jump_scrolls_down_into_later_history_and_defers_while_live(
+    page: Page, backend_url, auth_token,
+):
+    """An outline jump window keeps loading forward; a live jump is deferred."""
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    sid = "perf-around-later"
+    target_uuid = "jump-target"
+    total = 200
+    calls: list[dict] = []
+    full = _make_mixed_messages(total, "JUMP_MSG")
+    full[105] = {"role": "user", "text": "JUMP_TARGET_VISIBLE",
+                 "uuid": target_uuid, "ts": 1_700_040_105}
+    full[-1] = {"role": "assistant", "text": "JUMP_LAST_VISIBLE",
+                "html": "<p>JUMP_LAST_VISIBLE</p>", "uuid": "jump-last",
+                "ts": 1_700_040_199}
+
+    def handle(route):
+        qs = {key: values[0] for key, values in
+              parse_qs(urlparse(route.request.url).query).items()}
+        calls.append(qs)
+        if "around_uuid" in qs:
+            offset, page_rows = 100, full[100:140]
+        else:
+            offset = int(qs.get("offset", "0"))
+            page_rows = full[offset:offset + int(qs.get("limit", "100"))]
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "id": sid, "messages": page_rows, "offset": offset,
+                "total": total, "history_generation": "gen",
+                "history_order": "full",
+            }),
+        )
+
+    page.route(f"**/api/chat/sessions/{sid}?*", handle)
+    _login(page, backend_url, auth_token)
+    _bootstrap_session_for_real_load(page, sid, "Jump later history")
+    _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        st.messageRange.generation = "gen";
+        st._loaded = true;
+        st.messagesReady = true;
+        st.streaming = true;
+        app._scrollToUserMsg({ uuid: "jump-target" }, arg);
+        return true;
+        """,
+        sid,
+    )
+    page.wait_for_timeout(700)
+    # A live repository cannot be replaced; the click is acknowledged and held.
+    assert not [call for call in calls if "around_uuid" in call]
+    assert _app_eval(page, "return app.toasts.length;") >= 1
+    _app_eval(page, "app.tabState[arg].streaming = false; return true;", sid)
+    page.wait_for_function(
+        """uuid => document.querySelector(`.msg[data-uuid="${CSS.escape(uuid)}"]`)""",
+        arg=target_uuid,
+        timeout=10000,
+    )
+    assert len([call for call in calls if "around_uuid" in call]) == 1
+    assert _app_eval(page, "return app.hasLaterMessages(arg);", sid) is True
+
+    body = page.locator(".chat-body")
+    for _ in range(40):
+        if page.locator(".msg", has_text="JUMP_LAST_VISIBLE").count():
+            break
+        body.hover()
+        page.mouse.wheel(0, 2400)
+        page.wait_for_timeout(150)
+    expect(page.locator(".msg", has_text="JUMP_LAST_VISIBLE")).to_be_visible()
+    later_calls = [call for call in calls if "offset" in call]
+    assert later_calls and later_calls[0]["offset"] == "140"
+    assert all(call.get("full") == "1" for call in later_calls)
+    state = _app_eval(
+        page,
+        """
+        const st = app.tabState[arg];
+        return {resident: st.messages.length, offset: st.messageRange.offset,
+          end: st.messageRange.visibleEnd, later: app.hasLaterMessages(arg),
+          error: st._historyLaterError};
+        """,
+        sid,
+    )
+    assert state == {"resident": 100, "offset": 100, "end": 100,
+                     "later": False, "error": False}
+    _assert_no_browser_errors(page, errors)
+
+
 def test_resident_history_uses_exact_layout_and_native_scroll_anchor(
     page: Page, backend_url, auth_token,
 ):

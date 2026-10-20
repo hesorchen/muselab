@@ -3239,6 +3239,11 @@
           </template>
           </div>
           </template>
+          <div x-show="activeSession._historyLaterError"
+               class="load-earlier-wrap load-earlier-status"
+               role="status"
+               aria-live="polite"
+               x-text="lang==='zh' ? '后续消息加载失败，继续下滑可重试' : 'Later messages failed to load; scroll down to retry'"></div>
           <!-- /P1 per-tab message panes. Siblings below (pre-response status,
                pending queue, banners) stay single-instance with active-tab
                semantics through the activeSession façade above. -->

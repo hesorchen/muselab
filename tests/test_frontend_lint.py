@@ -1782,6 +1782,17 @@ def test_history_jump_keeps_the_session_that_owned_the_click():
     assert "document.querySelector(" not in jump
     assert "await this._loadAroundMessage(sid, uuid)" in jump
     assert "this.tabState[sid] !== st || sid !== this.currentId" in jump
+    # A live repository cannot be replaced: defer visibly instead of no-op.
+    assert "if (st.streaming || st.es) {" in jump
+    assert "this._deferHistoryJump(sid, st, m, jumpSeq)" in jump
+    assert "st._historyJumpSeq !== jumpSeq" in jump
+    assert '"error");' in jump
+    # A distant resident target mounts one bounded window, not the whole span.
+    assert "if (nextEnd - nextStart > windowSize) {" in jump
+    defer_start = app.index("    _deferHistoryJump(sid, st, m, jumpSeq) {")
+    defer = app[defer_start:app.index("\n    // Short preview text", defer_start)]
+    assert "if (!superseded && (st.streaming || st.es)) return;" in defer
+    assert "this._scrollToUserMsg(m, sid)" in defer
     assert "if (this.currentId !== sid) return" in palette_jump
     assert "body && body.querySelector" in palette_jump
     assert "await this._loadAroundMessage(sid, uuid)" in palette_jump
@@ -4009,6 +4020,19 @@ def test_history_paging_uses_smaller_mobile_pages_only_on_user_request():
     scroll = app[scroll_start:scroll_end]
     assert "loadEarlierMessages(" not in scroll
     assert "_scheduleTransparentHistory(" not in scroll
+    # Jumped windows continue forward on a downward user gesture only.
+    assert "st._scrollTowardLatestAt === st._userScrollAt" in scroll
+    assert "void this._revealLaterHistory(this.currentId)" in scroll
+    intent_start = app.index("    _applyChatScrollIntent(direction) {")
+    intent = app[intent_start:app.index("    _userScrollIntent(ev) {", intent_start)]
+    assert "void this._revealLaterHistory(this.currentId)" in intent
+    reveal_start = app.index("    async _revealLaterHistory(sid) {")
+    reveal = app[reveal_start:app.index("    _chatNearLaterEdge(el) {", reveal_start)]
+    assert "st._loadingLater || st.streaming || st.es" in reveal
+    assert "await this._fetchLaterWindow(sid)" in reveal
+    assert "this._historyMountWindowSize()" in reveal
+    assert "st.messages.indexOf(batch[0]) !== range.visibleEnd" in reveal
+    assert "activeSession._historyLaterError" in html
 
     assert '@click="loadEarlierMessages()"' in html
     assert ':disabled="activeSession._loadingEarlier"' in html

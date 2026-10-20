@@ -330,6 +330,7 @@ const _EMPTY_ACTIVE_SESSION_PANE = Object.freeze({
   _draining: false,
   _loadingEarlier: false,
   _historyHydrationError: false,
+  _historyLaterError: false,
   atBottom: true,
 });
 
@@ -4723,6 +4724,12 @@ function portal() {
       if (!uuid || !sid) return;
       if (this._isMobileLayout()) this.setMobileTab("chat");
       const activeState = this.tabState && this.tabState[sid];
+      const wasAtBottom = activeState ? activeState.atBottom : true;
+      // Each click owns the jump; a newer click supersedes deferred or
+      // in-flight ones so only the latest target may report or scroll.
+      const jumpSeq = activeState
+        ? (activeState._historyJumpSeq = (Number(activeState._historyJumpSeq) || 0) + 1)
+        : 0;
       if (activeState) activeState.atBottom = false;
       const tryScroll = () => {
         if (sid !== this.currentId) return false;
@@ -4744,9 +4751,30 @@ function portal() {
         if (!st) return;
         const idx = st.messages.findIndex(em => em && em.uuid === uuid);
         if (idx < 0) {
+          if (st.streaming || st.es) {
+            // A live repository must stay contiguous with its streaming tail,
+            // so it cannot be replaced by an around window. Keep following the
+            // reply and perform the jump as soon as the turn settles.
+            st.atBottom = wasAtBottom;
+            this._deferHistoryJump(sid, st, m, jumpSeq);
+            return;
+          }
           (async () => {
-            const loaded = await this._loadAroundMessage(sid, uuid);
-            if (!loaded || this.tabState[sid] !== st || sid !== this.currentId) return;
+            let loaded = false;
+            try {
+              loaded = await this._loadAroundMessage(sid, uuid);
+            } catch (_) {
+              loaded = false;
+            }
+            if (this.tabState[sid] !== st || sid !== this.currentId
+                || st._historyJumpSeq !== jumpSeq) return;
+            if (!loaded) {
+              this.toast(this.lang === "zh"
+                ? "无法加载该消息所在的历史，请重试"
+                : "Could not load the history around that message; please retry",
+              "error");
+              return;
+            }
             this.$nextTick(() => {
               const pane = this._paneElement(sid);
               this.highlightCode(".chat-body", pane ? [pane] : null);
@@ -4755,14 +4783,26 @@ function portal() {
           })();
           return;
         }
-        for (let i = idx; i < st.messageRange.visibleStart; i++) {
+        const range = st.messageRange;
+        let nextStart = Math.min(idx, range.visibleStart);
+        let nextEnd = Math.max(idx + 1, range.visibleEnd);
+        const windowSize = this._historyWindowSize();
+        if (nextEnd - nextStart > windowSize) {
+          // Spanning from the current window to a distant resident target would
+          // mount (and synchronously render) every row in between. Mount one
+          // window around the target; scrolling reveals either side.
+          nextStart = Math.max(0, idx - Math.floor(windowSize / 2));
+          nextEnd = Math.min(st.messages.length, nextStart + windowSize);
+        }
+        for (let i = nextStart; i < nextEnd; i++) {
           const em = st.messages[i];
           if (em.role === "assistant" && em.text && !em.html) {
             em.html = this._renderHistoryMessage(em);
           }
         }
-        st.messageRange.visibleStart = Math.min(idx, st.messageRange.visibleStart);
-        st.messageRange.visibleEnd = Math.max(idx + 1, st.messageRange.visibleEnd);
+        range.visibleStart = nextStart;
+        range.visibleEnd = nextEnd;
+        this._enforceMessageRangeInvariant(st);
         this._scheduleHistoryViewport(st, "around", uuid);
         st._hasMoreHistory = st.messageRange.visibleStart > 0
           || st.messageRange.offset > 0;
@@ -4775,6 +4815,23 @@ function portal() {
           }, 50);
         });
       });
+    },
+    _deferHistoryJump(sid, st, m, jumpSeq) {
+      if (st._historyJumpTimer) clearInterval(st._historyJumpTimer);
+      this.toast(this.lang === "zh"
+        ? "回复进行中，该消息需要从更早的历史加载；本轮结束后自动跳转"
+        : "A reply is running; the jump will happen once this turn ends");
+      st._historyJumpTimer = setInterval(() => {
+        const superseded = this.tabState[sid] !== st
+          || st._historyJumpSeq !== jumpSeq;
+        if (!superseded && (st.streaming || st.es)) return;
+        clearInterval(st._historyJumpTimer);
+        st._historyJumpTimer = null;
+        // Leaving the session abandons the request rather than yanking the
+        // viewport when the reader comes back later.
+        if (superseded || sid !== this.currentId) return;
+        this._scrollToUserMsg(m, sid);
+      }, 500);
     },
     // Short preview text for an outline row — first line, trimmed.
     outlineText(m) {
@@ -9152,6 +9209,10 @@ function portal() {
         // Single-flight guards for older/newer server windows.
         _fetchingOlder: false,
         _fetchingLater: false,
+        // Downward reveal of a historical (around/jumped) window. The error
+        // flag keeps a visible status until the next downward gesture retries.
+        _loadingLater: false,
+        _historyLaterError: false,
         // History responses may complete out of order on the same tab. Replacing
         // requests advance the epoch so older/later page responses cannot write
         // stale coordinates into a newer canonical repository.
@@ -9202,6 +9263,8 @@ function portal() {
       }
       if (st.runtimeUiRevision === undefined) st.runtimeUiRevision = "";
       if (st._fetchingLater === undefined) st._fetchingLater = false;
+      if (st._loadingLater === undefined) st._loadingLater = false;
+      if (st._historyLaterError === undefined) st._historyLaterError = false;
       if (!Number.isInteger(st._historyRequestSeq)) st._historyRequestSeq = 0;
       if (!Number.isInteger(st._historyReplaceOwner)) st._historyReplaceOwner = 0;
       if (!Number.isInteger(st._historyEpoch)) st._historyEpoch = 0;
@@ -21140,6 +21203,67 @@ function portal() {
         st._fetchingLater = false;
       }
     },
+    // A jumped/around window ends before the latest message. When the reader
+    // scrolls toward that end, mount the next resident batch, fetching the next
+    // canonical page first when the resident repository is exhausted. Rows are
+    // appended below the viewport, so the reading position does not move.
+    // Live panes keep their own frozen-range / paused-tail semantics.
+    async _revealLaterHistory(sid) {
+      const st = sid && this.tabState && this.tabState[sid];
+      if (!st || st._loadingLater || st.streaming || st.es
+          || !this._messageRangeHasLater(st)) return false;
+      st._loadingLater = true;
+      st._historyLaterError = false;
+      try {
+        const range = st.messageRange;
+        if (range.visibleEnd >= st.messages.length) {
+          const loaded = await this._fetchLaterWindow(sid);
+          if (this.tabState[sid] !== st) return false;
+          if (loaded <= 0) {
+            st._historyLaterError = range.visibleEnd >= st.messages.length
+              && this._messageRangeHasLater(st);
+            return false;
+          }
+        }
+        const batch = st.messages.slice(
+          range.visibleEnd, range.visibleEnd + this._historyMountWindowSize());
+        for (const m of batch) {
+          if (m.role === "assistant" && m.text && !m.html) {
+            const html = await this._renderHistoryMessageAsync(m, () =>
+              this.tabState[sid] === st && st.messages.includes(m));
+            if (html !== null) m.html = html;
+          }
+          m._noAnim = true;
+        }
+        // Rendering yields; a replacement or live turn may own the range now.
+        if (this.tabState[sid] !== st || st.streaming || st.es || !batch.length
+            || st.messages.indexOf(batch[0]) !== range.visibleEnd) return false;
+        range.visibleEnd = Math.min(st.messages.length, range.visibleEnd + batch.length);
+        this._enforceMessageRangeInvariant(st);
+        this._scheduleHistoryViewport(st, "newer");
+        if (sid === this.currentId) {
+          this.$nextTick(() => {
+            const pane = this.tabState[sid] === st ? this._paneElement(sid) : null;
+            if (!pane) return;
+            const els = batch.map(m => m._k && pane.querySelector(
+              `.msg[data-message-key="${CSS.escape(m._k)}"]`)).filter(Boolean);
+            if (els.length) this.highlightCode(".chat-body", els);
+          });
+        }
+        return true;
+      } catch (_) {
+        st._historyLaterError = true;
+        return false;
+      } finally {
+        st._loadingLater = false;
+      }
+    },
+    _chatNearLaterEdge(el) {
+      // One viewport of lookahead keeps the next batch mounted before the
+      // reader reaches the physical end of the current window.
+      return !!el && el.scrollHeight - el.scrollTop - el.clientHeight
+        < Math.max(el.clientHeight, 200);
+    },
     // Per-message placeholder height (px) for content-visibility's
     // contain-intrinsic-size. A flat `auto 200px` (styles.css) made the
     // scrollbar jump every time a tall bubble (long text / code block) first
@@ -21294,6 +21418,8 @@ function portal() {
       sid = sid || this.currentId;
       const st = sid && this.tabState[sid];
       if (!st) return false;
+      // Explicitly returning to the latest message abandons a deferred jump.
+      if (trigger === "jump") st._historyJumpSeq = (Number(st._historyJumpSeq) || 0) + 1;
       const report = trigger !== "programmatic" || this._messageRangeHasLater(st)
         || st._pendingExternalUpdate;
       const started = performance.now();
@@ -33573,6 +33699,14 @@ function portal() {
       // profiling). The settle sets `atBottom` itself, so this recompute is
       // redundant during that window — skip it.
       if (this._autoScrolling || (st && st._autoScrolling)) return;
+      // A reader scrolling down a jumped history window continues into the
+      // following records. Only a downward user gesture owns this; layout
+      // scrolls and programmatic jumps never extend the window by themselves.
+      if (st && movedTowardLatest && st._scrollTowardLatestAt
+          && st._scrollTowardLatestAt === st._userScrollAt
+          && this._messageRangeHasLater(st) && this._chatNearLaterEdge(el)) {
+        void this._revealLaterHistory(this.currentId);
+      }
       // Strict "at bottom": 2px tolerance only — just enough to absorb
       // sub-pixel geometry (browser zoom / high-DPI displays can report
       // distance as 0.4–1.x even when visually at bottom; pure ==0 would
@@ -33624,7 +33758,13 @@ function portal() {
         st._scrollTowardLatestAt = st._userScrollAt;
         // At the physical bottom another wheel/touch gesture need not produce
         // a scroll event. It must still be able to reveal pending local messages.
-        this._resumePausedChatTail(st, this._chatBodyElement());
+        const body = this._chatBodyElement();
+        if (this._resumePausedChatTail(st, body)) return;
+        // The same holds for a jumped window shorter than, or already
+        // scrolled to the end of, the viewport.
+        if (this._messageRangeHasLater(st) && this._chatNearLaterEdge(body)) {
+          void this._revealLaterHistory(this.currentId);
+        }
         return;
       }
       st._scrollTowardLatestAt = 0;
