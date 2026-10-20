@@ -1338,9 +1338,12 @@ def test_inline_quote_markers_compose_prompt_in_place_and_render_pills(
             const caretAt = ta.value.indexOf('[引用1]') + 2;
             ta.setSelectionRange(caretAt, caretAt);
             ta.dispatchEvent(new KeyboardEvent('keyup', {key: 'ArrowRight', bubbles: true}));
-            await new Promise(resolve => app.$nextTick(resolve));
-            // Alpine's x-show reveals on the next animation frame.
-            await new Promise(resolve => requestAnimationFrame(() => setTimeout(resolve, 0)));
+            // Alpine's x-show both reveals and hides on the next animation frame.
+            const shown = async () => {
+              await new Promise(resolve => app.$nextTick(resolve));
+              await new Promise(resolve => requestAnimationFrame(() => setTimeout(resolve, 0)));
+            };
+            await shown();
             const mirror = app.$refs.chatInputMirror;
             const mark = mirror.querySelector('.chat-input-quote-mark');
             const mcs = getComputedStyle(mirror);
@@ -1360,7 +1363,7 @@ def test_inline_quote_markers_compose_prompt_in_place_and_render_pills(
               hintText: hint ? hint.textContent.replace(/\\s+/g, ' ').trim() : '',
             };
             ta.blur();
-            await new Promise(resolve => app.$nextTick(resolve));
+            await shown();
             highlight.hintAfterBlur = !!(hint && hint.getClientRects().length);
 
             // Quote 2's content mentions quote 1's marker; it must not be
