@@ -675,8 +675,10 @@ def test_preview_selection_quotes_as_attachment_and_asks_in_side_session(
           return {
             input: app.input,
             draft: app.tabState[app.currentId].draft.input,
+            caret: app.$refs.chatInput.selectionStart,
             quoteCount: app.pendingQuotes.length,
             quoteText: quote && quote.text,
+            quoteLabel: quote && quote.label,
             quotePath: quote && quote.path,
             session: app.currentId,
             sessionCount: app.sessions.length,
@@ -686,7 +688,10 @@ def test_preview_selection_quotes_as_attachment_and_asks_in_side_session(
         }"""
     )
     assert quoted["input"] == quoted["draft"]
-    assert quoted["input"] == "alphaomega"
+    # The quote marker lands at the composer caret (after "alpha").
+    assert quoted["input"] == "alpha[引用1]omega"
+    assert quoted["quoteLabel"] == "[引用1]"
+    assert quoted["caret"] == len("alpha[引用1]")
     assert quoted["quoteCount"] == 1
     assert quoted["quoteText"] == selected
     expected_path = before["workspace"].rstrip("/") + "/README.md"
@@ -1263,6 +1268,186 @@ def test_composer_quote_sends_context_without_rewriting_visible_text(
     assert result["promptText"] == prompt
     assert result["displayText"] == "VISIBLE QUESTION"
     assert result["quoteText"] == "SELECTED CONTEXT"
+
+
+def test_inline_quote_markers_compose_prompt_in_place_and_render_pills(
+        page: Page, backend_url, auth_token):
+    turn_bodies: list[dict] = []
+    _install_fake_mux_chat_transport(page, turn_bodies)
+    _login(page, backend_url, auth_token)
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app.availableModels = [{model: 'e2e-model', label: 'E2E', group: 'e2e'}];
+          app.model = 'e2e-model';
+          const originalBusy = app._confirmSessionBusy;
+          const originalRuntimeWait = app._awaitRuntimeSettingPatches;
+          app._confirmSessionBusy = async () => false;
+          app._awaitRuntimeSettingPatches = async () => true;
+          try {
+            const sid = app.currentId;
+            app.lang = 'zh';
+            const quote = (id, label, text, extra = {}) => ({
+              id, source: 'chat', role: 'assistant', sessionId: sid,
+              messageId: '', path: '', text, truncated: false, label, ...extra,
+            });
+            // Removing a chip also removes its marker from the draft.
+            app._setChatInput('X[引用3]Y');
+            app.pendingQuotes.splice(0, app.pendingQuotes.length,
+              quote('q3', '[引用3]', 'DROPPED'));
+            app._captureComposerState(sid);
+            app.removePendingQuote(0);
+            const afterRemove = app.input;
+            const nextLabel = app._nextQuoteLabel([
+              quote('a', '[引用1]', 'A'), quote('c', '[引用3]', 'C')]);
+
+            // Backspace/Delete remove a marker as one unit (native deletion
+            // of the expanded selection; the test emulates that default).
+            const ta = app.$refs.chatInput;
+            const pressed = (key, caret) => {
+              app._setChatInput('a[引用1]b');
+              app.pendingQuotes.splice(0, app.pendingQuotes.length,
+                quote('k1', '[引用1]', 'K'));
+              ta.setSelectionRange(caret, caret);
+              app.onQuoteMarkerKeydown(new KeyboardEvent('keydown', {key}));
+              const range = [ta.selectionStart, ta.selectionEnd];
+              ta.setRangeText('', range[0], range[1], 'end');
+              return {range, value: ta.value};
+            };
+            const keys = {
+              backspaceAfter: pressed('Backspace', 6),
+              backspaceInside: pressed('Backspace', 3),
+              deleteBefore: pressed('Delete', 1),
+              plainBackspace: pressed('Backspace', 7),
+            };
+            ta.value = '';
+
+            // Highlight mirror: same metrics as the textarea, marks sit under
+            // their markers even after wrapping, and the caret hint names the
+            // quote it touches.
+            app._setChatInput('前缀文字 '.repeat(30) + '[引用1] 后缀');
+            app.pendingQuotes.splice(0, app.pendingQuotes.length,
+              quote('h1', '[引用1]', 'HINT EXCERPT'));
+            app._captureComposerState(sid);
+            ta.focus();
+            app.autoGrow(ta);
+            await new Promise(resolve => app.$nextTick(resolve));
+            await new Promise(resolve => requestAnimationFrame(resolve));
+            const caretAt = ta.value.indexOf('[引用1]') + 2;
+            ta.setSelectionRange(caretAt, caretAt);
+            ta.dispatchEvent(new KeyboardEvent('keyup', {key: 'ArrowRight', bubbles: true}));
+            await new Promise(resolve => app.$nextTick(resolve));
+            const mirror = app.$refs.chatInputMirror;
+            const mark = mirror.querySelector('.chat-input-quote-mark');
+            const mcs = getComputedStyle(mirror);
+            const tcs = getComputedStyle(ta);
+            const hint = document.querySelector('.composer-quote-hint');
+            const highlight = {
+              visible: !!mirror.getClientRects().length,
+              mark: mark && mark.textContent,
+              sameFont: mcs.fontSize === tcs.fontSize && mcs.lineHeight === tcs.lineHeight
+                && mcs.fontFamily === tcs.fontFamily,
+              sameBox: Math.abs(mirror.offsetWidth - ta.offsetWidth) < 1
+                && Math.abs(mirror.offsetHeight - ta.offsetHeight) < 1,
+              sameScrollHeight: Math.abs(mirror.scrollHeight - ta.scrollHeight) <= 2,
+              markWrappedBelowFirstLine: mark
+                ? mark.offsetTop > parseFloat(tcs.lineHeight) : false,
+              hintVisible: !!(hint && hint.getClientRects().length),
+              hintText: hint ? hint.textContent.replace(/\\s+/g, ' ').trim() : '',
+            };
+            ta.blur();
+            await new Promise(resolve => app.$nextTick(resolve));
+            highlight.hintAfterBlur = !!(hint && hint.getClientRects().length);
+
+            // Quote 2's content mentions quote 1's marker; it must not be
+            // rescanned. Quote 4 is a legacy chip quote (sent first); quote 5's
+            // marker was deleted, so it is dropped like deleted text.
+            app._setChatInput('对比[引用2]和[引用1]，以[引用1]为准');
+            app.pendingQuotes.splice(0, app.pendingQuotes.length,
+              quote('q1', '[引用1]', 'FIRST </quote> BODY'),
+              quote('q2', '[引用2]', 'SECOND mentions [引用1]'),
+              quote('q4', '', 'DETACHED', {source: 'preview', role: '',
+                                          path: '/ws/doc.md'}),
+              quote('q5', '[引用5]', 'GONE'));
+            app._captureComposerState(sid);
+            const chips = app.composerQuoteChips().map(q => q.id);
+            const before = app._ensureTabState(sid).messages.length;
+            await app.send();
+            await new Promise(resolve => setTimeout(resolve, 20));
+            const user = app.tabState[sid].messages.slice(before)
+              .find(m => m.role === 'user');
+            await new Promise(resolve => app.$nextTick(resolve));
+            const bubble = Array.from(document.querySelectorAll('.user-msg-text'))
+              .find(el => el.textContent.includes('以[引用1]为准'));
+            const pills = bubble
+              ? Array.from(bubble.querySelectorAll('.user-msg-inline-quote'))
+                .map(el => el.textContent) : [];
+            // Reloaded history keeps only the composed prompt: parse its tags.
+            const reloaded = document.createElement('div');
+            reloaded.innerHTML = app.userMessageHtml({role: 'user', text: user.text});
+            return {
+              afterRemove, nextLabel, keys, chips, highlight,
+              sentQuotes: user.selectionQuotes.map(q => q.id),
+              promptText: user && user.text,
+              displayText: user && user.displayText,
+              cards: app.userQuoteCards(user).map(q => q.id),
+              bubbleText: bubble ? bubble.textContent : '',
+              pills,
+              reloadedPills: Array.from(reloaded.querySelectorAll('.user-msg-inline-quote'))
+                .map(el => el.textContent),
+              reloadedText: reloaded.textContent,
+            };
+          } finally {
+            app.tabState[app.currentId]?.es?.close();
+            app._confirmSessionBusy = originalBusy;
+            app._awaitRuntimeSettingPatches = originalRuntimeWait;
+          }
+        }"""
+    )
+
+    assert result["keys"] == {
+        "backspaceAfter": {"range": [1, 6], "value": "ab"},
+        "backspaceInside": {"range": [1, 6], "value": "ab"},
+        "deleteBefore": {"range": [1, 6], "value": "ab"},
+        "plainBackspace": {"range": [7, 7], "value": "a[引用1]b"},
+    }
+    assert result["highlight"] == {
+        "visible": True,
+        "mark": "[引用1]",
+        "sameFont": True,
+        "sameBox": True,
+        "sameScrollHeight": True,
+        "markWrappedBelowFirstLine": True,
+        "hintVisible": True,
+        "hintText": "引用1 · Muse 回复 HINT EXCERPT",
+        "hintAfterBlur": False,
+    }
+    assert result["chips"] == ["q4"]
+    assert result["sentQuotes"] == ["q1", "q2", "q4"]
+    assert result["afterRemove"] == "XY"
+    assert result["nextLabel"] == "[引用2]"
+    assert len(turn_bodies) == 1
+    prompt = turn_bodies[0]["prompt"]
+    assert prompt == (
+        '引用自 `/ws/doc.md`：\n\n> DETACHED\n\n'
+        '对比<quote id="2" source="Muse 回复">\nSECOND mentions [引用1]\n</quote>'
+        '和<quote id="1" source="Muse 回复">\nFIRST <\\/quote> BODY\n</quote>'
+        '，以[引用1]为准'
+    )
+    assert result["promptText"] == prompt
+    assert result["displayText"] == "对比[引用2]和[引用1]，以[引用1]为准"
+    # Placed quotes render inline; only the marker-less quote stays a card.
+    assert result["cards"] == ["q4"]
+    assert result["pills"] == [
+        "引用2 · Muse 回复SECOND mentions [引用1]",
+        "引用1 · Muse 回复FIRST </quote> BODY",
+    ]
+    assert result["bubbleText"].startswith("对比引用2")
+    assert result["reloadedPills"] == [
+        "引用2 · Muse 回复SECOND mentions [引用1]",
+        "引用1 · Muse 回复FIRST </quote> BODY",
+    ]
+    assert result["reloadedText"].endswith("，以[引用1]为准")
 
 
 def test_preview_selection_quote_fits_mobile_and_reveals_chat(

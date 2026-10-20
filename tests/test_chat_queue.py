@@ -888,6 +888,7 @@ def test_queue_endpoint_preserves_bounded_selection_quote_presentation(
         "path": "README.md",
         "text": "selected context",
         "truncated": False,
+        "label": "[引用1]",
     }
     response = client.post(
         f"/api/chat/sessions/{sid}/queue",

@@ -2190,15 +2190,15 @@
                         <button class="btn-ghost sm" @click.stop="cancelOutgoing(tid, m._clientMessageId)"
                                 x-text="lang==='zh'?'取消':'Cancel'"></button>
                       </div>
-                      <template x-if="userSelectionQuotes(m).length">
+                      <template x-if="userQuoteCards(m).length">
                         <div class="user-msg-quotes">
-                          <template x-for="(quote, qidx) in userSelectionQuotes(m)"
+                          <template x-for="(quote, qidx) in userQuoteCards(m)"
                                     :key="quote.id || ('quote-'+qidx)">
                             <div class="user-msg-quote"
                                  :title="previewQuoteExcerpt(quote)">
                               <svg aria-hidden="true"><use :href="previewQuoteSourceIcon(quote)"/></svg>
                               <div>
-                                <strong x-text="previewQuoteSourceName(quote)"></strong>
+                                <strong x-text="quoteChipName(quote)"></strong>
                                 <span x-text="previewQuoteExcerpt(quote)"></span>
                               </div>
                             </div>
@@ -2261,7 +2261,7 @@
                       </template>
                       <template x-if="!m._editing">
                         <span class="user-msg-text" x-show="userVisibleText(m)"
-                              x-html="userTextHtml(userVisibleText(m))"></span>
+                              x-html="userMessageHtml(m)"></span>
                       </template>
                       <div x-show="m._admissionPending && !outgoingForMessage(pane, m)"
                            class="optimistic-queue-status"
@@ -3388,7 +3388,7 @@
                               :key="quote.id || ('queued-quote-'+qidx)">
                       <div class="queued-quote-chip" :title="previewQuoteExcerpt(quote)">
                         <svg aria-hidden="true"><use :href="previewQuoteSourceIcon(quote)"/></svg>
-                        <span x-text="previewQuoteSourceName(quote) + ' · ' + previewQuoteExcerpt(quote)"></span>
+                        <span x-text="quoteChipName(quote) + ' · ' + previewQuoteExcerpt(quote)"></span>
                       </div>
                     </template>
                   </div>
@@ -3554,8 +3554,10 @@
              transferred-byte progress. The compact percentage + bottom bar
              keep slow mobile uploads visible without blocking the composer. -->
         <div class="img-attachments"
-             x-show="pendingQuotes.length || pendingImages.length || pendingDocs.length">
-          <template x-for="(quote, i) in pendingQuotes"
+             x-show="composerQuoteChips().length || pendingImages.length || pendingDocs.length">
+          <!-- Inline quotes live as markers in the textarea; only legacy
+               (marker-less) quotes keep a chip here. -->
+          <template x-for="(quote, i) in composerQuoteChips()"
                     :key="quote.id || ('q'+i)">
             <div class="selection-quote-chip" :title="previewQuoteExcerpt(quote)">
               <span class="selection-quote-icon">
@@ -3566,7 +3568,7 @@
                 <div class="selection-quote-text" x-text="previewQuoteExcerpt(quote)"></div>
               </div>
               <button type="button" class="selection-quote-x icon-btn sm"
-                      @click="removePendingQuote(i)"
+                      @click="removePendingQuote(pendingQuotes.indexOf(quote))"
                       :title="lang==='zh' ? '移除引用' : 'Remove quote'">
                 <svg><use href="#i-x"/></svg>
               </button>
@@ -3622,6 +3624,14 @@
             </div>
           </template>
         </div>
+        <!-- Caret on/next to an inline quote marker: show what it refers to
+             (the textarea itself cannot host hover previews). -->
+        <div class="composer-quote-hint" role="status"
+             x-show="composerQuoteFocus" x-cloak>
+          <svg aria-hidden="true"><use :href="previewQuoteSourceIcon(composerQuoteFocus || {})"/></svg>
+          <strong x-text="composerQuoteFocus ? quoteChipName(composerQuoteFocus) : ''"></strong>
+          <span x-text="composerQuoteFocus ? previewQuoteExcerpt(composerQuoteFocus) : ''"></span>
+        </div>
         <!-- VSCode-Claude–style layout:
              row 1: textarea (full width, no neighbors)
              row 2: bottom toolbar with all controls — attach / model /
@@ -3671,6 +3681,15 @@
                type=password input，iOS 就会把它当成账户字段。display:contents
                让这个 form 不参与布局，只提供 DOM 语义。 -->
           <form autocomplete="off" onsubmit="return false" style="display:contents">
+          <!-- Inline quote highlight: a non-interactive mirror behind the
+               transparent textarea renders the same text with the same
+               metrics, tinting only "[引用N]" markers. The textarea stays
+               the sole editor (IME, caret, undo untouched). -->
+          <div class="chat-input-field">
+          <div class="chat-input-mirror" x-ref="chatInputMirror" aria-hidden="true"
+               x-show="composerQuoteMirrorHtml()"
+               x-html="composerQuoteMirrorHtml()"
+               x-effect="composerQuoteMirrorHtml(); $nextTick(() => syncComposerQuoteMirror())"></div>
           <textarea x-ref="chatInput"
                     x-effect="_syncChatInputDom(input, { target: $el })"
                     rows="1"
@@ -3684,7 +3703,7 @@
                     data-1p-ignore="" data-lpignore="true" data-form-type="other"
                     @keydown.enter="onEnter($event)"
                     @keydown.tab="onSlashTab($event)"
-                    @keydown="onImeKeydown($event)"
+                    @keydown="onImeKeydown($event); onQuoteMarkerKeydown($event)"
                     @keyup.enter="onImeEnterKeyup($event)"
                     @keydown.escape="mentionShow=false; slashShow=false"
                     @keydown.ctrl.x="onCutLine($event)"
@@ -3698,8 +3717,11 @@
                     @paste="onImagePaste($event)"
                     @focus="onChatInputFocus($event)"
                     @blur="onChatInputBlur($event)"
-                    @click="onChatInputClick($event)"
+                    @click="onChatInputClick($event); updateComposerQuoteFocus($event)"
+                    @keyup="updateComposerQuoteFocus($event)"
+                    @scroll="syncComposerQuoteMirror()"
                     :placeholder="t('chat.placeholder')"></textarea>
+          </div>
           </form>
           <div class="chat-toolbar"
                :class="{ 'has-stop': isTabStreaming(currentId) }">

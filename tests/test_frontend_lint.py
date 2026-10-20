@@ -381,7 +381,18 @@ def test_preview_selection_quote_attachment_and_side_question_are_safely_wired()
     assert 'x-ref="previewQuoteInput"' in html
     assert ':href="previewQuoteSourceIcon()"' in html
     assert 'class="selection-quote-chip"' in html
-    assert '@click="removePendingQuote(i)"' in html
+    assert '@click="removePendingQuote(pendingQuotes.indexOf(quote))"' in html
+    assert 'x-for="(quote, i) in composerQuoteChips()"' in html
+    assert '@keydown="onImeKeydown($event); onQuoteMarkerKeydown($event)"' in html
+    # Highlight is a passive mirror behind the textarea, never an editor.
+    assert 'class="chat-input-mirror" x-ref="chatInputMirror" aria-hidden="true"' in html
+    assert '@scroll="syncComposerQuoteMirror()"' in html
+    assert '@keyup="updateComposerQuoteFocus($event)"' in html
+    assert 'class="composer-quote-hint"' in html
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+    mirror_css = css[css.index(".chat-input-mirror {"):css.index(".composer-quote-hint {")]
+    assert "pointer-events: none" in mirror_css
+    assert "padding" not in mirror_css.split(".chat-input-quote-mark {")[1]
     assert "将展开为独立侧问" in html
     assert "独立多轮 · 可网页搜索" in html
     assert '@click="openPreviewSelectionAskSession()"' in html
@@ -433,8 +444,22 @@ def test_preview_selection_quote_attachment_and_side_question_are_safely_wired()
     quote_end = app.index("\n\n    removePendingQuote", quote_start)
     quote = app[quote_start:quote_end]
     assert "draft.pendingQuotes.push" in quote
-    assert "draft.input" not in quote
+    # Quoting inserts an inline marker at the composer caret; the prompt
+    # composer later replaces it with the quote content in place.
+    assert "quote.label = this._nextQuoteLabel(draft.pendingQuotes)" in quote
+    assert "ta.selectionStart" in quote
+    assert "this._setChatInput(next)" in quote
     assert "_insertComposerTextAtCaret" not in app
+    remove_start = app.index("\n    removePendingQuote(index) {")
+    remove = app[remove_start:app.index("\n    },", remove_start)]
+    assert "split(quote.label)" in remove
+    compose_start = app.index("\n    _composerPromptText(input, quotes) {")
+    compose = app[compose_start:app.index("\n    },", compose_start)]
+    assert "this._inlineQuotePlacements(body, valid)" in compose
+    assert ".filter(q => !q.label)" in compose
+    assert "if (!hasDetachedText) this._pruneUnplacedQuotes(sendDraft);" in app
+    assert 'x-html="userMessageHtml(m)"' in html
+    assert 'x-for="(quote, qidx) in userQuoteCards(m)"' in html
 
     send_start = app.index("async send(opts = {})")
     send_end = app.index("\n    async stop(", send_start)

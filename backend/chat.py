@@ -8374,7 +8374,7 @@ def _normalize_queue_selection_quotes(raw: list[dict] | None) -> list[dict]:
             continue
         source = str(item.get("source") or "preview")
         role = str(item.get("role") or "")
-        normalized.append({
+        entry = {
             "id": str(item.get("id") or "")[:80],
             "source": source if source in {"preview", "chat"} else "preview",
             "role": role if role in {"", "user", "assistant"} else "",
@@ -8383,7 +8383,13 @@ def _normalize_queue_selection_quotes(raw: list[dict] | None) -> list[dict]:
             "path": str(item.get("path") or "")[:1024],
             "text": text,
             "truncated": bool(item.get("truncated")),
-        })
+        }
+        # Inline marker (e.g. "[引用1]") whose first occurrence in
+        # display_text marks where this quote sits in the composed text.
+        label = str(item.get("label") or "")[:32]
+        if label:
+            entry["label"] = label
+        normalized.append(entry)
     return normalized
 
 

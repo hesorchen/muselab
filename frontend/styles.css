@@ -6509,6 +6509,29 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 .user-msg-quote strong { font-size: var(--fs-xs); font-weight: var(--fw-semibold); }
 .user-msg-quote span { margin-top: 1px; opacity: 0.78; font-size: var(--fs-xs); }
+/* Inline quote pill inside the user bubble text, at the marker's position. */
+.user-msg-inline-quote {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  max-width: 100%;
+  margin: 0 2px;
+  padding: 0 6px;
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  border-radius: var(--r-sm);
+  background: rgba(255, 255, 255, 0.12);
+  font-size: var(--fs-xs);
+  line-height: 1.6;
+  vertical-align: baseline;
+}
+.user-msg-inline-quote-label { flex: 0 0 auto; font-weight: var(--fw-semibold); }
+.user-msg-inline-quote-text {
+  min-width: 0;
+  overflow: hidden;
+  opacity: 0.78;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .user-msg-imgs {
   display: flex; flex-wrap: wrap; gap: 6px;
   margin-bottom: 6px;
@@ -7758,6 +7781,51 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   line-height: 1.5;
 }
 .chat-input-textarea::placeholder { color: var(--c-fg-3); }
+/* Inline quote highlight mirror (see index.html). Only box-shadow and
+   background are styled on marks: anything that changes glyph advance
+   (padding, border, weight) would desynchronise the wrap from the textarea. */
+.chat-input-field { position: relative; }
+.chat-input-field > .chat-input-textarea { position: relative; z-index: 1; }
+.chat-input-mirror {
+  position: absolute;
+  top: 0; left: 0;
+  box-sizing: border-box;
+  margin: 0; border: 0;
+  overflow: hidden;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  word-break: normal;
+  color: transparent;
+  pointer-events: none;
+  user-select: none;
+}
+.chat-input-quote-mark {
+  color: transparent;
+  background: var(--c-accent-soft);
+  border-radius: 4px;
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--c-accent) 45%, transparent);
+}
+.composer-quote-hint {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  margin-bottom: 6px;
+  padding: 4px 10px;
+  border-radius: var(--r-md);
+  background: var(--c-accent-soft);
+  color: var(--c-fg-1);
+  font-size: var(--fs-xs);
+}
+.composer-quote-hint svg { width: 13px; height: 13px; flex: 0 0 auto; color: var(--c-accent); }
+.composer-quote-hint strong { flex: 0 0 auto; font-weight: var(--fw-semibold); }
+.composer-quote-hint span {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--c-fg-2);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .chat-input-textarea:focus::placeholder { opacity: 0.35; transition: opacity var(--t-fast); }
 
 /* Toolbar — hairline separator above, very tight spacing, ALL controls

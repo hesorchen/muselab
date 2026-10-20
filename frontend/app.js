@@ -1108,7 +1108,8 @@ function portal() {
     // old quote action, these never rewrite `input`; they render as removable
     // context chips above the composer and are folded into the actual prompt
     // only when Send snapshots this exact tab's draft.
-    pendingQuotes: [],    // [{id, source, role, sessionId, messageId, path, text, truncated}]
+    pendingQuotes: [],    // [{id, source, role, sessionId, messageId, path, text, truncated, label}]
+    composerQuoteFocus: null, // pending quote whose marker the composer caret touches
     // Image annotation editor (L1: pen / rect / arrow / eraser + 5 colors + 3 sizes).
     // Opened via the ✎ button on an .img-chip. State is module-scoped on `this`
     // so the modal template can read it via x-show / :class. _baseBitmap is the
@@ -2200,6 +2201,7 @@ function portal() {
     // inputs (.kb-open class + --kb-inset) in lockstep, exactly like update().
     onChatInputBlur(ev) {
       this._resetImeCompositionState(ev);
+      this.composerQuoteFocus = null;
       const target = ev && (ev.target || ev.currentTarget);
       const settledOwner = target && target._museImeSettledOwnerSid;
       // The composer bridge intentionally ignores model writes while focused.
@@ -9614,7 +9616,7 @@ function portal() {
       const st = this.tabState[sid];
       const draft = st.draft || {};
       const hasContent = !!(String(draft.input || "").trim()
-        || (draft.pendingQuotes || []).length
+        || this._sendableQuotes(draft.pendingQuotes, draft.input).length
         || (draft.pendingImages || []).length
         || (draft.pendingDocs || []).length);
       if (!hasContent) {
@@ -12016,6 +12018,7 @@ function portal() {
       this.pendingImages = draft.pendingImages;
       this.pendingDocs = draft.pendingDocs;
       this.pendingQuotes = draft.pendingQuotes;
+      this.composerQuoteFocus = null;
       this._sendWaitingForUpload = !!draft._sendWaitingForUpload;
       this.$nextTick(() => {
         if (this.currentId === id && this.$refs.chatInput) {
@@ -29894,18 +29897,255 @@ function portal() {
       };
     },
 
+    // Inline quotes: the composer carries a plain-text marker such as
+    // "[引用1]" at the caret where the quote was taken. On send, the first
+    // occurrence of each marker is replaced by the quote content, so the
+    // agent receives every quote at the exact position the user placed it.
+    // Later occurrences stay as plain references to the same id.
+    _quoteLabelNumber(quote) {
+      const match = /(\d+)/.exec(String((quote && quote.label) || ""));
+      return match ? Number(match[1]) : 0;
+    },
+
+    _nextQuoteLabel(quotes) {
+      const used = new Set((quotes || []).map(q => this._quoteLabelNumber(q)));
+      let n = 1;
+      while (used.has(n)) n += 1;
+      return this.lang === "zh" ? `[引用${n}]` : `[Quote ${n}]`;
+    },
+
+    _inlineQuoteSourceAttr(quote) {
+      const source = quote.source === "chat"
+        ? this.previewQuoteSourceName(quote)
+        : String(quote.path || this.selected || "");
+      return source.replace(/["\n\r]/g, "'");
+    },
+
+    _inlineQuoteBlock(quote) {
+      const id = this._quoteLabelNumber(quote);
+      const truncated = quote.truncated ? ' truncated="true"' : "";
+      const text = String(quote.text || "").replace(/<\/quote>/gi, "<\\/quote>");
+      return `<quote id="${id}" source="${this._inlineQuoteSourceAttr(quote)}"${truncated}>\n`
+        + `${text}\n</quote>`;
+    },
+
+    // First occurrence offset of every labelled quote's marker in `body`.
+    _inlineQuotePlacements(body, quotes) {
+      const text = String(body || "");
+      const placements = [];
+      for (const quote of quotes || []) {
+        if (!quote || !quote.label || !String(quote.text || "").trim()) continue;
+        const at = text.indexOf(quote.label);
+        if (at >= 0) placements.push({ quote, at, end: at + quote.label.length });
+      }
+      return placements.sort((a, b) => a.at - b.at);
+    },
+
+    quoteIsPlaced(quote, input = this.input) {
+      return !!(quote && quote.label && String(input || "").includes(quote.label));
+    },
+
+    // An inline quote lives only as its marker in the text: once the marker
+    // is deleted the quote is gone, exactly like deleted text. Legacy quotes
+    // (no label) keep their chip and are still sent.
+    _sendableQuotes(quotes, input) {
+      return (quotes || []).filter(q => q && (!q.label || this.quoteIsPlaced(q, input)));
+    },
+
+    _pruneUnplacedQuotes(draft) {
+      if (!draft || !Array.isArray(draft.pendingQuotes)) return;
+      const keep = this._sendableQuotes(draft.pendingQuotes, draft.input);
+      if (keep.length !== draft.pendingQuotes.length) {
+        draft.pendingQuotes.splice(0, draft.pendingQuotes.length, ...keep);
+      }
+    },
+
+    composerQuoteChips() {
+      return (this.pendingQuotes || []).filter(q => q && !q.label);
+    },
+
+    // Every occurrence of a pending quote marker in `value`, as [at, end).
+    _quoteMarkerSpans(value) {
+      const spans = [];
+      for (const quote of this.pendingQuotes || []) {
+        const label = quote && quote.label;
+        if (!label) continue;
+        for (let at = value.indexOf(label); at >= 0; at = value.indexOf(label, at + 1)) {
+          spans.push({ at, end: at + label.length });
+        }
+      }
+      return spans;
+    },
+
+    composerQuoteMirrorHtml() {
+      const value = String(this.input || "");
+      const spans = this._quoteMarkerSpans(value).sort((a, b) => a.at - b.at);
+      if (!spans.length) return "";
+      let html = "";
+      let cursor = 0;
+      for (const { at, end } of spans) {
+        if (at < cursor) continue;
+        html += this.escape(value.slice(cursor, at))
+          + `<mark class="chat-input-quote-mark">${this.escape(value.slice(at, end))}</mark>`;
+        cursor = end;
+      }
+      // Trailing newline needs a glyph so the mirror's last line has height.
+      return html + this.escape(value.slice(cursor)) + "\u200b";
+    },
+
+    // Keep the mirror's box, text metrics and scroll identical to the
+    // textarea so every highlight sits exactly under its marker.
+    syncComposerQuoteMirror() {
+      const ta = this.$refs && this.$refs.chatInput;
+      const mirror = this.$refs && this.$refs.chatInputMirror;
+      if (!ta || !mirror || !mirror.firstChild) return;
+      const cs = getComputedStyle(ta);
+      for (const prop of ["fontFamily", "fontSize", "fontWeight", "fontStyle",
+        "fontVariant", "letterSpacing", "wordSpacing", "lineHeight", "textIndent",
+        "tabSize", "textTransform", "paddingTop", "paddingLeft", "paddingBottom"]) {
+        mirror.style[prop] = cs[prop];
+      }
+      // The textarea's scrollbar narrows its text area; mirror that width.
+      const scrollbar = Math.max(0, ta.offsetWidth - ta.clientWidth);
+      mirror.style.paddingRight = `calc(${cs.paddingRight} + ${scrollbar}px)`;
+      mirror.style.width = ta.offsetWidth + "px";
+      mirror.style.height = ta.offsetHeight + "px";
+      mirror.scrollTop = ta.scrollTop;
+    },
+
+    updateComposerQuoteFocus(ev) {
+      const ta = ev && ev.target;
+      if (!ta || typeof ta.value !== "string" || !Number.isInteger(ta.selectionEnd)) {
+        this.composerQuoteFocus = null;
+        return;
+      }
+      const caret = ta.selectionEnd;
+      let found = null;
+      for (const quote of this.pendingQuotes || []) {
+        const label = quote && quote.label;
+        if (!label) continue;
+        for (let at = ta.value.indexOf(label); at >= 0; at = ta.value.indexOf(label, at + 1)) {
+          if (caret >= at && caret <= at + label.length) { found = quote; break; }
+        }
+        if (found) break;
+      }
+      if (this.composerQuoteFocus !== found) this.composerQuoteFocus = found;
+    },
+
+    // Backspace/Delete treat a quote marker as one unit. Only the selection is
+    // adjusted; the native deletion still runs, so undo and input events stay
+    // intact.
+    onQuoteMarkerKeydown(ev) {
+      if (!ev || (ev.key !== "Backspace" && ev.key !== "Delete")) return;
+      if (ev.isComposing || ev.keyCode === 229) return;
+      const ta = ev.target;
+      if (!ta || typeof ta.value !== "string") return;
+      const spans = this._quoteMarkerSpans(ta.value);
+      if (!spans.length) return;
+      let start = ta.selectionStart;
+      let end = ta.selectionEnd;
+      if (!Number.isInteger(start) || !Number.isInteger(end)) return;
+      if (start === end) {
+        const back = ev.key === "Backspace";
+        const hit = spans.find(sp => (back
+          ? start > sp.at && start <= sp.end
+          : start >= sp.at && start < sp.end));
+        if (!hit) return;
+        start = hit.at;
+        end = hit.end;
+      } else {
+        for (const sp of spans) {
+          if (sp.at < end && sp.end > start) {
+            start = Math.min(start, sp.at);
+            end = Math.max(end, sp.end);
+          }
+        }
+        if (start === ta.selectionStart && end === ta.selectionEnd) return;
+      }
+      ta.setSelectionRange(start, end);
+    },
+
     _composerPromptText(input, quotes) {
-      const blocks = (quotes || [])
-        .filter(q => q && String(q.text || "").trim())
-        .map(q => this._previewQuoteBlock(q));
       const body = String(input || "").trim();
-      if (body) blocks.push(body);
+      const valid = (quotes || []).filter(q => q && String(q.text || "").trim());
+      // Single pass over the user's own text: quote content inserted for one
+      // marker is never rescanned for another marker.
+      const placements = this._inlineQuotePlacements(body, valid);
+      const placed = new Set(placements.map(p => p.quote));
+      let composed = "";
+      let cursor = 0;
+      for (const { quote, at, end } of placements) {
+        composed += body.slice(cursor, at) + this._inlineQuoteBlock(quote);
+        cursor = end;
+      }
+      composed += body.slice(cursor);
+      // Legacy quotes without a marker are still sent ahead of the message;
+      // an inline quote whose marker was deleted is not sent at all.
+      const blocks = valid
+        .filter(q => !q.label)
+        .map(q => this._previewQuoteBlock(q));
+      if (composed) blocks.push(composed);
       return blocks.join("\n\n").trim();
     },
 
     userSelectionQuotes(message) {
       return Array.isArray(message && message.selectionQuotes)
         ? message.selectionQuotes : [];
+    },
+
+    // Quote cards above a user bubble: inline quotes render inside the text.
+    userQuoteCards(message) {
+      return this.userSelectionQuotes(message).filter(q => q && !q.label);
+    },
+
+    quoteChipName(quote) {
+      const n = this._quoteLabelNumber(quote);
+      const name = this.previewQuoteSourceName(quote);
+      if (!n) return name;
+      return (this.lang === "zh" ? `引用${n}` : `Quote ${n}`) + " · " + name;
+    },
+
+    _inlineQuotePillHtml(n, sourceName, text, truncated) {
+      const excerpt = String(text || "").replace(/\s+/g, " ").trim();
+      const short = excerpt.length > 40 ? excerpt.slice(0, 40).trimEnd() + "…" : excerpt;
+      const full = excerpt.length > 600 ? excerpt.slice(0, 600) + "…" : excerpt;
+      const label = (this.lang === "zh" ? `引用${n}` : `Quote ${n}`)
+        + (sourceName ? " · " + sourceName : "");
+      return `<span class="user-msg-inline-quote" title="${this.escape(full + (truncated ? " …" : ""))}">`
+        + `<span class="user-msg-inline-quote-label">${this.escape(label)}</span>`
+        + `<span class="user-msg-inline-quote-text">${this.escape(short)}</span></span>`;
+    },
+
+    // User bubble HTML with inline quotes rendered as pills. Live/queued
+    // messages carry displayText + selectionQuotes (markers); reloaded
+    // history only has the composed prompt, so its <quote> tags are parsed.
+    userMessageHtml(message) {
+      const text = this.userVisibleText(message);
+      const nl = s => this.escape(s).replace(/\n/g, "<br>");
+      const placements = this._inlineQuotePlacements(text, this.userSelectionQuotes(message));
+      if (placements.length) {
+        let html = "";
+        let cursor = 0;
+        for (const { quote, at, end } of placements) {
+          html += nl(text.slice(cursor, at)) + this._inlineQuotePillHtml(
+            this._quoteLabelNumber(quote), this.previewQuoteSourceName(quote),
+            quote.text, quote.truncated);
+          cursor = end;
+        }
+        return html + nl(text.slice(cursor));
+      }
+      const tag = /<quote id="(\d{1,3})" source="([^"\n]*)"( truncated="true")?>\n([\s\S]*?)\n<\/quote>/g;
+      let html = "";
+      let cursor = 0;
+      let match;
+      while ((match = tag.exec(text)) !== null) {
+        const source = match[2];
+        const name = source.includes("/") ? (source.split("/").pop() || source) : source;
+        html += nl(text.slice(cursor, match.index)) + this._inlineQuotePillHtml(
+          match[1], name, match[4].replace(/<\\\/quote>/gi, "</quote>"), !!match[3]);
+        cursor = match.index + match[0].length;
+      }
+      return cursor ? html + nl(text.slice(cursor)) : nl(text);
     },
 
     userVisibleText(message) {
@@ -29942,6 +30182,7 @@ function portal() {
       }
       this._captureComposerState(this.currentId);
       const draft = this._ensureTabState(this.currentId).draft;
+      this._pruneUnplacedQuotes(draft);
       if (draft.pendingQuotes.length >= 4) {
         this.toast(
           this.lang === "zh" ? "一次最多引用 4 段内容" : "Up to 4 quotes per message",
@@ -29949,26 +30190,53 @@ function portal() {
         );
         return false;
       }
-      draft.pendingQuotes.push(this._selectionQuoteSnapshot());
+      const quote = this._selectionQuoteSnapshot();
+      quote.label = this._nextQuoteLabel(draft.pendingQuotes);
+      draft.pendingQuotes.push(quote);
       this.pendingQuotes = draft.pendingQuotes;
+      // Insert the marker where the composer caret was (textareas keep their
+      // selection range after blur); fall back to the end of the draft.
+      const ta = this.$refs.chatInput;
+      const current = this.input || "";
+      const domOwned = ta && ta.value === current;
+      const start = domOwned && Number.isInteger(ta.selectionStart)
+        ? ta.selectionStart : current.length;
+      const end = domOwned && Number.isInteger(ta.selectionEnd)
+        ? Math.max(start, ta.selectionEnd) : start;
+      const next = current.slice(0, start) + quote.label + current.slice(end);
+      const caret = start + quote.label.length;
+      this._setChatInput(next);
+      draft.input = next;
+      this._persistChatDraft(this.currentId, next);
       this.dismissPreviewQuote(true);
       if (this._isMobileLayout()) this.setMobileTab("chat");
       this.$nextTick(() => {
+        const input = this.$refs.chatInput;
+        if (input) {
+          this.autoGrow(input);
+          try { input.setSelectionRange(caret, caret); } catch (_) {}
+          this.updateComposerQuoteFocus({ target: input });
+        }
         // Do not let this delayed convenience-focus steal a newer selection.
         // A fast user (or a busy renderer) can begin selecting another bubble
         // before Alpine reaches this tick; focusing the textarea would then
         // collapse that fresh range and the selection actions never appear.
         const selection = window.getSelection && window.getSelection();
         if (selection && selection.rangeCount && !selection.isCollapsed) return;
-        const ta = this.$refs.chatInput;
-        if (ta) ta.focus();
+        if (input) input.focus();
       });
       return true;
     },
 
     removePendingQuote(index) {
       if (!Number.isInteger(index) || index < 0) return;
-      this.pendingQuotes.splice(index, 1);
+      const [quote] = this.pendingQuotes.splice(index, 1);
+      // Drop the quote's marker(s) too, so no dangling "[引用N]" reaches the agent.
+      if (quote && quote.label && (this.input || "").includes(quote.label)) {
+        const next = this.input.split(quote.label).join("");
+        this._setChatInput(next);
+        this._captureComposerState(this.currentId);
+      }
     },
 
     openPreviewSelectionAsk() {
@@ -32396,6 +32664,7 @@ function portal() {
       } else {
         ta.style.height = Math.min(sh, max) + "px";
       }
+      this.syncComposerQuoteMirror();
     },
 
     // Ctrl/Cmd+X with NO active selection = cut the whole current line
@@ -32615,7 +32884,7 @@ function portal() {
       if (!draft) return false;
       return !!((draft.pendingImages && draft.pendingImages.length)
         || (draft.pendingDocs && draft.pendingDocs.length)
-        || (draft.pendingQuotes && draft.pendingQuotes.length));
+        || this._sendableQuotes(draft.pendingQuotes, draft.input).length);
     },
 
     async _dispatchSlash(rawCommand, rawArg, opts = {}) {
@@ -33365,6 +33634,7 @@ function portal() {
       this._resetChatInputHistory();
       this._captureComposerState(this.currentId, { persist: false });
       this._schedulePersistChatDraft(this.currentId, this.input || "");
+      this.updateComposerQuoteFocus(ev);
       const pos = ta.selectionStart;
       const text = this.input.slice(0, pos);
 
@@ -34063,6 +34333,7 @@ function portal() {
       const composerInput = hasDetachedText ? opts.detachedText : (sendDraft.input || "");
       const composerImages = hasDetachedText ? [] : sendDraft.pendingImages.slice();
       const composerDocs = hasDetachedText ? [] : sendDraft.pendingDocs.slice();
+      if (!hasDetachedText) this._pruneUnplacedQuotes(sendDraft);
       const composerQuotes = hasDetachedText ? [] : sendDraft.pendingQuotes.slice();
       const composerText = hasDetachedText
         ? composerInput : this._composerPromptText(composerInput, composerQuotes);
@@ -37211,6 +37482,14 @@ function portal() {
       const st = this.tabState[this.currentId];
       if (!this._truncatePaneMessagesFrom(st, m)) return;
       this._setChatInput(newText);
+      // Inline quote markers in the edited text must still resolve to their
+      // quote content when the edit is resent.
+      const quotes = this.userSelectionQuotes(m).filter(q => this.quoteIsPlaced(q, newText));
+      if (quotes.length) {
+        this.pendingQuotes.splice(
+          0, this.pendingQuotes.length, ...quotes.map(q => ({ ...q, id: this._uuid() })),
+        );
+      }
       this.$nextTick(() => {
         const ta = this.$refs.chatInput;
         if (ta) this.autoGrow(ta);
