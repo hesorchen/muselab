@@ -2659,6 +2659,22 @@ def _positive_int(v: Any) -> int:
     return n if n > 0 else 0
 
 
+_CONTEXT_INPUT_USAGE_KEYS = (
+    "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+
+
+def _merge_call_usage(start: dict, delta: dict) -> dict:
+    """Final usage of one API call, merged the way the CLI writes its transcript:
+    a positive message_delta input count replaces the message_start one."""
+    merged = dict(start or {})
+    for key in _CONTEXT_INPUT_USAGE_KEYS:
+        if _positive_int((delta or {}).get(key)):
+            merged[key] = delta[key]
+    if (delta or {}).get("output_tokens") is not None:
+        merged["output_tokens"] = delta["output_tokens"]
+    return merged
+
+
 def _canonical_context_model(model: str) -> str:
     """Restore muselab's routing prefix for raw Codex transcript model ids."""
     value = (model or "").strip()
@@ -17611,6 +17627,10 @@ async def _start_turn(
     # event can identify the reply immediately, without waiting for the slower
     # post-turn transcript scan below.
     last_assistant_uuid = ""
+    # Usage of the API call in flight (message_start snapshot) and whether this
+    # turn has seen a final message_delta usage; see _handle_stream_event.
+    call_start_usage: dict = {}
+    final_usage_seen = False
     # Set only after a Memory write has been accepted by the tracked scheduler.
     # The detached pump uses this to retain failure/cancel evidence if a forced
     # interrupt prevents the SDK from emitting its terminal ResultMessage.
@@ -18611,12 +18631,68 @@ async def _start_turn(
         # other locals read-only). Keeps the main loop a ~15-line dispatch
         # instead of a 200-line elif chain.
 
+        async def _record_context_usage(usage):
+            """Write one API call's input-side usage into the context meter."""
+            in_t = int(usage.get("input_tokens", 0) or 0)
+            cr_t = int(usage.get("cache_read_input_tokens", 0) or 0)
+            cc_t = int(usage.get("cache_creation_input_tokens", 0) or 0)
+            out_t = int(usage.get("output_tokens", 0) or 0)
+            ctx_used = in_t + cr_t + cc_t
+            sess_u = _session_usage.setdefault(session_id, {
+                "input_tokens": 0, "output_tokens": 0,
+                "cache_read_tokens": 0, "cache_creation_tokens": 0,
+                "total_cost_usd": 0.0, "last_turn_at": 0.0,
+                "context_used": 0, "context_used_pct": 0.0,
+                "context_limit": 0,
+            })
+            _session_usage_turns[session_id] = broadcast.turn_id
+            capability = await _detect_gateway_context_capability(
+                model_to_use)
+            details = _context_limit_details(
+                model_to_use,
+                stored=_positive_int(sess_u.get("context_limit")),
+                stored_source=sess_u.get("context_limit_source", ""),
+                capability=capability,
+            )
+            limit = _positive_int(details.get("context_limit"))
+            sess_u["input_tokens"] = in_t
+            sess_u["cache_read_tokens"] = cr_t
+            sess_u["cache_creation_tokens"] = cc_t
+            sess_u["output_tokens"] = out_t
+            sess_u["context_used"] = ctx_used
+            sess_u["context_used_pct"] = (
+                round(ctx_used / limit * 100, 1) if limit else 0.0)
+            _apply_context_limit_details(sess_u, details)
+            # Provider response usage is the exact billed/request usage;
+            # unlike SDK category accounting it is not a tokenizer guess.
+            _mark_context_used(
+                sess_u, "provider_usage", estimate=False)
+
         async def _handle_stream_event(msg):
             """Token-by-token deltas → tiny text / thinking events. Fast
-            feedback path; the AssistantMessage handler suppresses re-emit."""
+            feedback path; the AssistantMessage handler suppresses re-emit.
+
+            Also tracks per-call usage: AssistantMessage only carries the
+            message_start snapshot, and some gateways (DUCC: 41,200 at start vs
+            52,301 final for one request) report the real input count only in
+            message_delta. Merge them like the CLI does for its transcript."""
             nonlocal assistant_acc, streamed_in_bubble
+            nonlocal call_start_usage, final_usage_seen
             ev = msg.event or {}
-            if ev.get("type") != "content_block_delta":
+            ev_type = ev.get("type")
+            if ev_type == "message_start":
+                call_start_usage = dict(
+                    (ev.get("message") or {}).get("usage") or {})
+                return
+            if ev_type == "message_delta":
+                delta_usage = ev.get("usage") or {}
+                if any(_positive_int(delta_usage.get(k))
+                       for k in _CONTEXT_INPUT_USAGE_KEYS):
+                    final_usage_seen = True
+                    await _record_context_usage(
+                        _merge_call_usage(call_start_usage, delta_usage))
+                return
+            if ev_type != "content_block_delta":
                 return
             delta = ev.get("delta") or {}
             dt = delta.get("type")
@@ -18661,7 +18737,6 @@ async def _start_turn(
                 cr_t = int(a_usage.get("cache_read_input_tokens", 0) or 0)
                 cc_t = int(a_usage.get("cache_creation_input_tokens", 0) or 0)
                 out_t = int(a_usage.get("output_tokens", 0) or 0)
-                ctx_used = in_t + cr_t + cc_t
                 # Per-turn accumulation into the global stats. We do this
                 # here (not in ResultMessage) because ResultMessage.usage
                 # is the cumulative-per-session value and would inflate
@@ -18670,35 +18745,12 @@ async def _start_turn(
                 _stats["total_output_tokens"]          += out_t
                 _stats["total_cache_read_tokens"]      += cr_t
                 _stats["total_cache_creation_tokens"]  += cc_t
-                sess_u = _session_usage.setdefault(session_id, {
-                    "input_tokens": 0, "output_tokens": 0,
-                    "cache_read_tokens": 0, "cache_creation_tokens": 0,
-                    "total_cost_usd": 0.0, "last_turn_at": 0.0,
-                    "context_used": 0, "context_used_pct": 0.0,
-                    "context_limit": 0,
-                })
-                _session_usage_turns[session_id] = broadcast.turn_id
-                capability = await _detect_gateway_context_capability(
-                    model_to_use)
-                details = _context_limit_details(
-                    model_to_use,
-                    stored=_positive_int(sess_u.get("context_limit")),
-                    stored_source=sess_u.get("context_limit_source", ""),
-                    capability=capability,
-                )
-                limit = _positive_int(details.get("context_limit"))
-                sess_u["input_tokens"] = in_t
-                sess_u["cache_read_tokens"] = cr_t
-                sess_u["cache_creation_tokens"] = cc_t
-                sess_u["output_tokens"] = out_t
-                sess_u["context_used"] = ctx_used
-                sess_u["context_used_pct"] = (
-                    round(ctx_used / limit * 100, 1) if limit else 0.0)
-                _apply_context_limit_details(sess_u, details)
-                # Provider response usage is the exact billed/request usage;
-                # unlike SDK category accounting it is not a tokenizer guess.
-                _mark_context_used(
-                    sess_u, "provider_usage", estimate=False)
+                # AssistantMessage.usage is the message_start snapshot. Once
+                # this turn has seen a final message_delta usage, the meter
+                # follows those instead so it does not dip back to a
+                # provider's provisional start count on every API call.
+                if not final_usage_seen:
+                    await _record_context_usage(a_usage)
             for block in msg.content:
                 if isinstance(block, TextBlock):
                     # Defensive tail-emit (see message_parser.py:279-290 — SDK

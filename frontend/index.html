@@ -1654,6 +1654,11 @@
                      :style="`width: ${ctxCategoryPct(cat)}%; background: ${ctxCategoryColor(cat)}`"
                      :title="cat.name + ' · ' + ctxFormatTokens(cat.tokens)"></div>
               </template>
+              <template x-for="cat in ctxBreakdown.view.reserved" :key="cat.name">
+                <div class="ctx-breakdown-stack-seg reserved"
+                     :style="`width: ${ctxCategoryPct(cat)}%`"
+                     :title="cat.name + ' · ' + ctxFormatTokens(cat.tokens) + (lang==='zh' ? '（预留，不计入已用）' : ' (reserved, not used)')"></div>
+              </template>
             </div>
             <template x-for="cat in ctxBreakdown.view.used" :key="cat.name">
               <div>
@@ -1682,6 +1687,19 @@
                     </template>
                   </div>
                 </template>
+              </div>
+            </template>
+            <!-- Autocompact buffer: reserved headroom, outside totalTokens.
+                 Hatched like its bar segment so it can't read as occupancy. -->
+            <template x-for="cat in ctxBreakdown.view.reserved" :key="cat.name">
+              <div class="ctx-breakdown-row reserved">
+                <span class="ctx-breakdown-swatch reserved"></span>
+                <span class="ctx-breakdown-name" :title="cat.name"
+                      x-text="cat.name + (lang==='zh' ? '（预留）' : ' (reserved)')"></span>
+                <span class="ctx-breakdown-tokens"
+                      x-text="ctxFormatTokens(cat.tokens)"></span>
+                <span class="ctx-breakdown-pct" x-text="ctxPctLabel(cat)"></span>
+                <span class="ctx-breakdown-caret"></span>
               </div>
             </template>
             <!-- Remainder, stated once as a plain figure. No swatch —

@@ -125,7 +125,9 @@ def summarize_tool_input(name: str | None, inp: dict) -> str:
     if name in ("Read", "Edit", "Write"):
         return inp.get("file_path", "")
     if name == "Bash":
-        return (inp.get("command") or "")[:200]
+        # Same cap as render_tool_use: a reloaded card must show the full
+        # command exactly like the live one did.
+        return (inp.get("command") or "")[:MAX_INPUT_FIELD_LEN]
     if name in ("Glob", "Grep"):
         return ((inp.get("pattern") or "")
                 + (f"  in {inp.get('path', '')}" if inp.get("path") else ""))

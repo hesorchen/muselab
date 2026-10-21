@@ -17358,14 +17358,19 @@ function portal() {
     //     `skillFrontmatter`. The template read `item.name` for all of them,
     //     so expanding Memory files — the 2nd largest real row — produced 14
     //     rows of blank labels. Normalised to {label, title, meta, tokens}.
+    //  4. "Autocompact buffer" (33K) is headroom the CLI RESERVES, not tokens
+    //     in the context: totalTokens/percentage exclude it, yet as a peer of
+    //     `used` it filled the bar to ~65% under a "48%" header. It is drawn
+    //     as a separate hatched "reserved" segment and row instead.
     _ctxBuildView(data) {
       const cats = Array.isArray(data && data.categories) ? data.categories : [];
-      const used = [], deferred = [];
+      const used = [], deferred = [], reserved = [];
       let freeTokens = 0;
       for (const c of cats) {
         const name = String((c && c.name) || "");
         if (/free\s*space/i.test(name)) { freeTokens += Number(c.tokens) || 0; continue; }
         if (/\(\s*deferred\s*\)/i.test(name)) { deferred.push(c); continue; }
+        if (/auto\s*-?\s*compact/i.test(name)) { reserved.push(c); continue; }
         used.push(c);
       }
       const sum = list => list.reduce((a, c) => a + (Number(c.tokens) || 0), 0);
@@ -17375,7 +17380,7 @@ function portal() {
         if (kids.length) children[c.name] = kids;
       }
       return {
-        used, deferred, freeTokens,
+        used, deferred, reserved, freeTokens,
         usedTotal: sum(used),
         deferredTotal: sum(deferred),
         children,

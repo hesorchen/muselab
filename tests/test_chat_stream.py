@@ -3385,6 +3385,74 @@ async def test_watcher_shutdown_partial_never_projects_completed_bubble(
         chat_mod._delete_cancelled_turn_snapshots(child_sid)
 
 
+def test_context_meter_uses_final_message_delta_usage(stream_env, client, monkeypatch):
+    """AssistantMessage.usage is the message_start snapshot. Gateways such as
+    DUCC report the real input count only in message_delta (measured: 41,200
+    at start vs 52,301 final), so the meter must follow the merged final usage
+    and must not fall back to a later call's provisional start count."""
+    chat_mod = stream_env
+    sid = _make_session(client)
+
+    def start(n):
+        return StreamEvent(uuid=f"s{n}", session_id=sid, event={
+            "type": "message_start",
+            "message": {"usage": {"input_tokens": n, "output_tokens": 1,
+                                  "cache_read_input_tokens": 7}}})
+
+    def delta(n, out):
+        return StreamEvent(uuid=f"d{n}", session_id=sid, event={
+            "type": "message_delta",
+            "usage": {"input_tokens": n, "output_tokens": out}})
+
+    def assistant(n, block, uuid):
+        return AssistantMessage(
+            content=[block], model="claude-sonnet-4-6",
+            usage={"input_tokens": n, "output_tokens": 1,
+                   "cache_read_input_tokens": 7},
+            uuid=uuid)
+
+    messages = [
+        start(100),
+        assistant(100, ToolUseBlock(id="tu_1", name="Read",
+                                    input={"file_path": "/tmp/x.py"}), "a1"),
+        delta(130, 20),
+        start(140),
+        assistant(140, TextBlock(text="done"), "a2"),
+        delta(170, 9),
+        ResultMessage(
+            subtype="success", duration_ms=10, duration_api_ms=9,
+            is_error=False, num_turns=2, session_id=sid,
+            total_cost_usd=0.0, usage={"input_tokens": 170, "output_tokens": 9},
+            result="done", terminal_reason="completed"),
+    ]
+
+    async def fake_get_client(session_id, model, permission="bypassPermissions", effort="", service_tier=""):
+        return _FakeStreamClient(messages)
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(
+        chat_mod, "_recent_turn_uuids", lambda _sid, _want: ("a2", "u-final"))
+    r = client.get(f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+                   f"&prompt=hi&model=claude-sonnet-4-6")
+    assert r.status_code == 200, r.text
+    done = next(json.loads(d) for e, d in _parse_sse(r.text) if e == "done")
+    usage = done["session_usage"]
+    assert usage["input_tokens"] == 170
+    assert usage["cache_read_tokens"] == 7
+    assert usage["output_tokens"] == 9
+    assert usage["context_used"] == 177
+
+
+def test_merge_call_usage_keeps_start_fields_missing_from_delta():
+    from backend.chat import _merge_call_usage
+
+    merged = _merge_call_usage(
+        {"input_tokens": 10, "cache_read_input_tokens": 500, "output_tokens": 1},
+        {"input_tokens": 0, "output_tokens": 42})
+    assert merged == {"input_tokens": 10, "cache_read_input_tokens": 500,
+                      "output_tokens": 42}
+
+
 def test_usage_reads_valid_sidecar_summary_without_scanning_transcript(
         stream_env, monkeypatch):
     sid = "12345678-usage-summary"

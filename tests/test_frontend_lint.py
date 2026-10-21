@@ -5045,6 +5045,23 @@ def test_ctx_breakdown_excludes_free_space_and_deferred_from_the_stack():
     assert "usedTotal: sum(used)" in body
 
 
+def test_ctx_breakdown_draws_autocompact_buffer_as_reserved():
+    """The Autocompact buffer is reserved headroom, outside totalTokens.
+
+    Real bug, 2026-10-21: drawn as a `used` peer, the 33K buffer filled the
+    stack to ~65% under a "95.4K / 200K (48%)" header.
+    """
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("    _ctxBuildView(data) {")
+    body = app[start:app.index("\n    },", start)]
+    assert "/auto\\s*-?\\s*compact/i.test(name)) { reserved.push(c); continue; }" in body
+    assert "used, deferred, reserved, freeTokens," in body
+    assert html.count('x-for="cat in ctxBreakdown.view.reserved"') == 2
+    assert 'class="ctx-breakdown-stack-seg reserved"' in html
+    assert ".ctx-breakdown-stack-seg.reserved" in css
+
 def test_ctx_breakdown_drilldown_uses_normalised_labels():
     """memoryFiles keys its name as `path`, skills wraps skillFrontmatter.
 

@@ -6601,6 +6601,14 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   margin-bottom: 10px;
 }
 .ctx-breakdown-stack-seg { height: 100%; transition: width var(--t-fast); }
+/* Autocompact buffer: reserved headroom, not occupancy — hatched, not filled. */
+.ctx-breakdown-stack-seg.reserved,
+.ctx-breakdown-swatch.reserved {
+  background: repeating-linear-gradient(
+    45deg, var(--c-fg-4) 0 2px, transparent 2px 5px);
+}
+.ctx-breakdown-row.reserved .ctx-breakdown-name,
+.ctx-breakdown-row.reserved .ctx-breakdown-tokens { color: var(--c-fg-3); }
 /* Rows carry no rule of their own. The dashed border used to run under every
    row, which at 6 rows read as a table grid and fought the stacked bar for
    attention. Proportion is the stacked bar's job; these rows are a figure

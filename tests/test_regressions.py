@@ -817,6 +817,24 @@ def test_render_tool_use_caps_oversized_string_input():
     assert "[truncated" in c, f"expected truncation marker, got tail: {c[-80:]!r}"
 
 
+def test_reloaded_bash_summary_matches_live_full_command():
+    # History reload must not re-truncate what the live stream showed in full
+    # (8c51aeb removed the 200-char cut; the 2a86eda extraction restored it
+    # only on the reload path).
+    from backend.chat import _render_tool_use, _summarize_tool_input
+
+    command = "python3 - <<'EOF'\n" + "x = 1\n" * 120 + "EOF"
+    assert len(command) > 200
+
+    class _Block:
+        id = "tu_test_003"
+        name = "Bash"
+        input = {"command": command}
+
+    assert _render_tool_use(_Block())["summary"] == command
+    assert _summarize_tool_input("Bash", {"command": command}) == command
+
+
 # ============================================================================
 # tool_result Bash parsing — when the result body carries CLI's pseudo-XML
 # wrapped output, _render_tool_result populates a `bash` field with
