@@ -14429,6 +14429,12 @@ function portal() {
           showHidden: !!this.showHidden,
           openFilesCollapsed: !!this.openFilesCollapsed,
           openFilesHeight: this.openFilesHeight,
+          // Pane layout belongs to the workspace too: a docs project may want
+          // a wide preview while a code project keeps the file tree open.
+          leftOpen: !!this.leftOpen,
+          previewOpen: !!this.previewOpen,
+          leftWidth: this.leftWidth,
+          previewWidth: this.previewWidth,
         },
       };
       this._workspaceRuntimeCaches.delete(cwd);
@@ -14454,6 +14460,13 @@ function portal() {
         childCache: (capturedTree && capturedTree.childCache) || {},
         expanded: Array.from(this.expanded || []),
       });
+    },
+    _applyWorkspaceLayout(surface = {}) {
+      if (typeof surface.leftOpen === "boolean") this.leftOpen = surface.leftOpen;
+      if (typeof surface.previewOpen === "boolean") this.previewOpen = surface.previewOpen;
+      const width = v => (typeof v === "number" && Number.isFinite(v) && v > 0 ? v : 0);
+      if (width(surface.leftWidth)) this.leftWidth = surface.leftWidth;
+      if (width(surface.previewWidth)) this.previewWidth = surface.previewWidth;
     },
     async _changeWorkspaceSurface(path) {
       if (!path || path === this.activeWorkspace) return true;
@@ -14517,6 +14530,9 @@ function portal() {
         ? surface.openFilesHeight : null;
       this.expanded = new Set(Array.isArray(surface.expanded) ? surface.expanded : []);
       this._pendingExpanded = Array.from(this.expanded);
+      // A workspace never captured before inherits the current layout instead
+      // of snapping to factory widths.
+      this._applyWorkspaceLayout(surface);
 
       const selected = typeof surface.previewSelected === "string"
         ? surface.previewSelected : "";

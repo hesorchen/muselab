@@ -6486,3 +6486,26 @@ def test_latest_edit_tool_idx_cache_key_tracks_window_slide():
     assert "msgs.length" in body
     assert "msgs[0]?._k" in body
     assert "msgs[msgs.length - 1]?._k" in body
+
+
+def test_workspace_surface_keeps_its_own_pane_layout():
+    """Each workspace restores its own file-tree / preview open state and widths.
+
+    2026-10-21 request: resizing the chat/preview split in one workspace used
+    to carry over to every other workspace because the widths were global.
+    """
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    capture_start = app.index("_captureWorkspaceSurface(path")
+    change_start = app.index("async _changeWorkspaceSurface(path)")
+    capture = app[capture_start:change_start]
+    for field in ("leftOpen: !!this.leftOpen", "previewOpen: !!this.previewOpen",
+                  "leftWidth: this.leftWidth", "previewWidth: this.previewWidth"):
+        assert field in capture
+    apply_start = app.index("    _applyWorkspaceLayout(surface = {}) {")
+    apply = app[apply_start:app.index("\n    },", apply_start)]
+    # Missing fields (a workspace never captured) must inherit, not reset.
+    assert 'typeof surface.leftOpen === "boolean"' in apply
+    assert 'typeof surface.previewOpen === "boolean"' in apply
+    assert "Number.isFinite(v) && v > 0" in apply
+    change_end = app.index("\n    async switchWorkspace(path)", change_start)
+    assert "this._applyWorkspaceLayout(surface);" in app[change_start:change_end]
