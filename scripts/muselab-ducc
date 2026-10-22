@@ -59,6 +59,11 @@ for name in \
     append_if_set "$name"
 done
 
+# Settings → Subagent model: a DUCC catalog name, not a credential.
+if [[ -n "${CLAUDE_CODE_SUBAGENT_MODEL:-}" ]]; then
+    safe_env+=("CLAUDE_CODE_SUBAGENT_MODEL=$CLAUDE_CODE_SUBAGENT_MODEL")
+fi
+
 # This host signal is intentionally data-minimal.  Do not let an operator's
 # arbitrary ambient value cross the env -i boundary under an allowlisted name;
 # MuseLab emits a canonical ISO timestamp and direct invocations must match the

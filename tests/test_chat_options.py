@@ -894,3 +894,53 @@ def test_ducc_workspace_diagnostic_is_private_and_deduplicated(
     assert "sid=12345678" in logged
     assert "private-id" not in logged
     assert line not in logged
+
+
+@pytest.mark.parametrize(("main", "sub", "expected"), [
+    ("ducc:claude-opus-5", "ducc:deepseek-v4-flash", "DeepSeek-V4-Flash"),
+    ("ducc:claude-opus-5", "claude-sonnet-4-6", ""),
+    ("claude-opus-4-8", "claude-sonnet-4-6", "claude-sonnet-4-6"),
+    ("claude-opus-4-8", "ducc:deepseek-v4-flash", ""),
+    ("claude-opus-4-8", "deepseek-v4-flash", ""),
+    ("deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4-flash"),
+    ("deepseek-v4-pro", "claude-sonnet-4-6", ""),
+    ("ducc:claude-opus-5", "ducc:claude-opus-5", ""),
+])
+def test_subagent_model_applies_only_within_the_session_route(
+    app_module, monkeypatch, main, sub, expected,
+):
+    from backend import chat as chat_mod
+
+    monkeypatch.setenv("MUSELAB_SUBAGENT_MODEL", sub)
+    assert chat_mod._subagent_cli_model(main) == expected
+    monkeypatch.delenv("MUSELAB_SUBAGENT_MODEL")
+    assert chat_mod._subagent_cli_model(main) == ""
+
+
+def test_subagent_model_reaches_ducc_env_and_refreshes_runtime_signature(
+    app_module, monkeypatch, tmp_path,
+):
+    from backend import chat as chat_mod
+
+    wrapper = tmp_path / "muselab-ducc"
+    wrapper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    wrapper.chmod(0o755)
+    monkeypatch.setattr(
+        chat_mod, "locate_ducc_executable", lambda: "/opt/ducc/bin/ducc")
+    monkeypatch.setattr(chat_mod, "ducc_cli_wrapper", lambda: str(wrapper))
+    monkeypatch.setenv("CLAUDE_CODE_SUBAGENT_MODEL", "stale-ambient-model")
+    monkeypatch.delenv("MUSELAB_SUBAGENT_MODEL", raising=False)
+    inherit_signature = chat_mod._runtime_provider_signature("ducc:claude-opus-5")
+
+    captured = _capture_build_options(chat_mod, monkeypatch)
+    asyncio.run(chat_mod._build_and_connect_client(
+        "sid-subagent-inherit", "ducc:claude-opus-5", "bypassPermissions", ""))
+    assert captured["env"]["CLAUDE_CODE_SUBAGENT_MODEL"] == ""
+
+    monkeypatch.setenv("MUSELAB_SUBAGENT_MODEL", "ducc:deepseek-v4-flash")
+    captured = _capture_build_options(chat_mod, monkeypatch)
+    asyncio.run(chat_mod._build_and_connect_client(
+        "sid-subagent-set", "ducc:claude-opus-5", "bypassPermissions", ""))
+    assert captured["env"]["CLAUDE_CODE_SUBAGENT_MODEL"] == "DeepSeek-V4-Flash"
+    assert chat_mod._runtime_provider_signature(
+        "ducc:claude-opus-5") != inherit_signature

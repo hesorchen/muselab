@@ -112,6 +112,8 @@ class SettingsIn(BaseModel):
     default_model: str | None = None
     default_permission: PermissionMode | None = None
     busy_send_mode: Literal["adjust", "queue"] | None = None
+    # Model for Agent-tool subagents; "" inherits the session's model.
+    subagent_model: str | None = Field(default=None, max_length=256)
     # (Removed 2026-05-28) notify_scheduled / notify_normal —
     # The 4-toggle notification panel collapsed to a single client-side
     # "notify me" switch. Subscription state IS the on/off; no per-class
@@ -251,6 +253,7 @@ _SETTING_DEFAULTS: dict[str, str] = {
     "MUSELAB_DEFAULT_MODEL":        "claude-sonnet-4-6",
     "MUSELAB_DEFAULT_PERMISSION":   "bypassPermissions",
     "MUSELAB_BUSY_SEND_MODE":       "adjust",
+    "MUSELAB_SUBAGENT_MODEL":       "",
 }
 
 
@@ -328,6 +331,7 @@ def get_settings() -> dict:
                 os.environ.get("MUSELAB_MODEL", _SETTING_DEFAULTS["MUSELAB_MODEL"])),
             "permission": _current("MUSELAB_DEFAULT_PERMISSION"),
             "busy_send_mode": _current("MUSELAB_BUSY_SEND_MODE"),
+            "subagent_model": _current("MUSELAB_SUBAGENT_MODEL"),
         },
         # `params` retained as an empty dict for FE backwards-compat — old
         # builds spread `d.params` into draftParams and would TypeError on
@@ -429,6 +433,15 @@ def put_settings(req: SettingsIn) -> dict:
         if req.busy_send_mode is not None and _changed(
                 "MUSELAB_BUSY_SEND_MODE", req.busy_send_mode):
             updates["MUSELAB_BUSY_SEND_MODE"] = req.busy_send_mode
+        if req.subagent_model is not None:
+            subagent_model = req.subagent_model.strip()
+            if subagent_model and subagent_model not in {
+                model for group in context_limits.provider_groups()
+                for model in group["models"]
+            }:
+                raise HTTPException(422, "unknown subagent model")
+            if _changed("MUSELAB_SUBAGENT_MODEL", subagent_model):
+                updates["MUSELAB_SUBAGENT_MODEL"] = subagent_model or None  # type: ignore[assignment]
         # Visibility is a partial set edit, so its read and write must share
         # the same lock as other environment updates.
         if req.provider_disabled is not None:

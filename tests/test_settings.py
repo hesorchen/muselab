@@ -384,3 +384,35 @@ def test_legacy_key_fields_preserve_credentials_when_echoing_display_mask(
     assert saved.json()["updated_count"] == 0
     assert os.environ[env_key] == original
     assert path.read_text(encoding="utf-8") == content
+
+
+def test_subagent_model_validates_persists_and_clears(
+        client, auth, monkeypatch, tmp_path):
+    from backend import api_settings as api_s
+
+    monkeypatch.delenv("MUSELAB_SUBAGENT_MODEL", raising=False)
+    current = client.get("/api/settings", headers=auth)
+    assert current.status_code == 200
+    assert current.json()["defaults"]["subagent_model"] == ""
+
+    fake_env = tmp_path / ".env"
+    fake_env.write_text("MUSELAB_TOKEN=existing-test-token-1234567890\n")
+    monkeypatch.setattr(api_s, "ENV_PATH", fake_env)
+    saved = client.put("/api/settings", headers=auth,
+                       json={"subagent_model": "ducc:deepseek-v4-flash"})
+    assert saved.status_code == 200
+    assert saved.json()["updated"] == ["MUSELAB_SUBAGENT_MODEL"]
+    assert "MUSELAB_SUBAGENT_MODEL=ducc:deepseek-v4-flash" in fake_env.read_text()
+    assert os.environ["MUSELAB_SUBAGENT_MODEL"] == "ducc:deepseek-v4-flash"
+    assert client.get("/api/settings", headers=auth).json()[
+        "defaults"]["subagent_model"] == "ducc:deepseek-v4-flash"
+
+    unknown = client.put("/api/settings", headers=auth,
+                         json={"subagent_model": "not-a-catalog-model"})
+    assert unknown.status_code == 422
+    assert os.environ["MUSELAB_SUBAGENT_MODEL"] == "ducc:deepseek-v4-flash"
+
+    cleared = client.put("/api/settings", headers=auth, json={"subagent_model": ""})
+    assert cleared.status_code == 200
+    assert "MUSELAB_SUBAGENT_MODEL" not in os.environ
+    assert "MUSELAB_SUBAGENT_MODEL" not in fake_env.read_text()

@@ -1363,7 +1363,7 @@ function portal() {
       contextSaving: false,
       contextError: "",
       draftKeys: {},
-      draftDefaults: { model: "", permission: "", busy_send_mode: "adjust" },
+      draftDefaults: { model: "", permission: "", busy_send_mode: "adjust", subagent_model: "" },
       // (Removed 2026-05-28) draftParams — used to carry notify_scheduled /
       // notify_normal server-side toggles. Subscription state is now the
       // sole on/off; see `notifyEnabled` at the top of this object.
@@ -21790,6 +21790,7 @@ function portal() {
         busy_send_mode: this._normalizeBusySendMode(
           d.defaults && d.defaults.busy_send_mode,
         ),
+        subagent_model: (d.defaults && d.defaults.subagent_model) || "",
       };
       if (d.defaults && d.defaults.permission) {
         this.defaultPermission = d.defaults.permission;
@@ -23689,6 +23690,7 @@ function portal() {
         busy_send_mode: this._normalizeBusySendMode(
           submittedDefaults.busy_send_mode,
         ),
+        subagent_model: submittedDefaults.subagent_model || "",
       };
       // Send every typed provider key through the generic provider_keys
       // map. Backend whitelists against PROVIDER_KEYS (derived from

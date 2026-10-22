@@ -19,7 +19,7 @@ def test_ducc_wrapper_removes_muselab_provider_identity(tmp_path):
         "    'UNRELATED_PRIVATE_VALUE', 'MUSELAB_DUCC_CLI',\n"
         "    'HTTPS_PROXY', 'DUCC_AUTH_SOURCE', 'HOME',\n"
         "    'CLAUDE_CODE_RESUME_SOURCE_ALIVE',\n"
-        "    'LC_ALL', 'LC_PRIVATE_SENTINEL',\n"
+        "    'LC_ALL', 'LC_PRIVATE_SENTINEL', 'CLAUDE_CODE_SUBAGENT_MODEL',\n"
         "]\n"
         "print(json.dumps({\n"
         "    'present': {name: name in os.environ for name in names},\n"
@@ -49,6 +49,7 @@ def test_ducc_wrapper_removes_muselab_provider_identity(tmp_path):
         "CLAUDE_CODE_RESUME_SOURCE_ALIVE": "2026-08-14T09:21:38.123Z",
         "LC_ALL": "C.UTF-8",
         "LC_PRIVATE_SENTINEL": "private-locale-shaped-value",
+        "CLAUDE_CODE_SUBAGENT_MODEL": "DeepSeek-V4-Flash",
     })
 
     completed = subprocess.run(
@@ -79,6 +80,7 @@ def test_ducc_wrapper_removes_muselab_provider_identity(tmp_path):
         "CLAUDE_CODE_RESUME_SOURCE_ALIVE": True,
         "LC_ALL": True,
         "LC_PRIVATE_SENTINEL": False,
+        "CLAUDE_CODE_SUBAGENT_MODEL": True,
     }
     assert output["resume_source_alive"] == "2026-08-14T09:21:38.123Z"
 

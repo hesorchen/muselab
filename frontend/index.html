@@ -5641,6 +5641,20 @@
             </select>
           </div>
           <div class="settings-row">
+            <label for="setting-settings-draftdefaults-subagent-model"
+                   x-text="lang==='zh' ? 'Subagent 模型' : 'Subagent model'"></label>
+            <select id="setting-settings-draftdefaults-subagent-model" x-model="settings.draftDefaults.subagent_model" class="settings-input">
+              <option value="" x-text="lang==='zh' ? '跟随主会话模型' : 'Same as the session model'"></option>
+              <template x-for="m in availableModels" :key="'subagent-' + m.model">
+                <option :value="m.model" x-text="m.group + ' · ' + m.label"></option>
+              </template>
+            </select>
+          </div>
+          <div class="settings-hint"
+               x-text="lang==='zh'
+                 ? 'Agent 工具派出的 subagent 用这个模型。它与主会话共用同一个运行时，只在同一来源时生效（DUCC 对 DUCC、Claude 对 Claude、同一个第三方服务商）；否则跟随主会话。下一轮生效。'
+                 : 'Agent-tool subagents use this model. They share the session runtime, so it applies only within the same source (DUCC with DUCC, Claude with Claude, the same third-party provider); otherwise they follow the session. Takes effect on the next turn.'"></div>
+          <div class="settings-row">
             <label for="setting-settings-draftdefaults-permission" x-text="t('set.label.default_permission')"></label>
             <select id="setting-settings-draftdefaults-permission" x-model="settings.draftDefaults.permission" class="settings-input">
               <option value="bypassPermissions" x-text="lang==='zh' ? 'bypass（无提示）' : 'bypass (no prompts)'"></option>

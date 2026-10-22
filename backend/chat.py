@@ -3634,16 +3634,47 @@ def _build_plan_exit_hooks(
     return _post_tool_use, _post_tool_use_failure
 
 
+_SUBAGENT_MODEL_ENV = "CLAUDE_CODE_SUBAGENT_MODEL"
+
+
+def _subagent_cli_model(model: str) -> str:
+    """CLI value for CLAUDE_CODE_SUBAGENT_MODEL, or "" to inherit the main model.
+
+    A subagent runs inside the parent CLI process and inherits its endpoint and
+    credentials, so the configured model applies only when it shares the
+    session's route: DUCC with DUCC, native Claude with native Claude, or the
+    same third-party provider. Anything else would reach the wrong endpoint.
+    """
+    sub = os.environ.get("MUSELAB_SUBAGENT_MODEL", "").strip()
+    if not sub or sub == model:
+        return ""
+    if endpoints.is_ducc_model(model) or endpoints.is_ducc_model(sub):
+        if endpoints.is_ducc_model(model) and endpoints.is_ducc_model(sub):
+            return endpoints.ducc_cli_model(sub)
+        return ""
+    main_provider, sub_provider = endpoints.lookup(model), endpoints.lookup(sub)
+    if main_provider is None and sub_provider is None:
+        return sub
+    if (main_provider is None or sub_provider is None
+            or main_provider.id != sub_provider.id):
+        return ""
+    return endpoints.normalize_model_id(sub)
+
+
 def _runtime_provider_signature(model: str) -> str:
     """Fingerprint routing without preparing vendor files or retaining keys."""
+    # Part of the signature so a Settings change refreshes idle runtimes.
+    subagent = _subagent_cli_model(model)
     if endpoints.is_ducc_model(model):
-        return "ducc"
+        return "ducc" + (f"|subagent={subagent}" if subagent else "")
     routing = endpoints.routing_env(model)
     if routing is None:
         routing = {key: os.environ.get(key, "") for key in (
             "ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
         )}
     payload = [endpoints.normalize_model_id(model), routing]
+    if subagent:
+        payload.append({"subagent": subagent})
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
@@ -4123,6 +4154,10 @@ async def _build_and_connect_client(
     )
     runtime_env = dict(opts_kwargs.get("env") or {})
     runtime_env[_RUNTIME_RESUME_SOURCE_ALIVE_ENV] = runtime_boundary
+    # Settings → Subagent model. Always set (empty = inherit the main model)
+    # so a stale ambient value cannot leak into an unrelated runtime.
+    runtime_env[_SUBAGENT_MODEL_ENV] = (
+        "" if side_question_runtime else _subagent_cli_model(model))
     opts_kwargs["env"] = runtime_env
 
     # MCP servers come from:
