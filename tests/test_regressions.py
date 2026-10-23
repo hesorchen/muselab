@@ -1068,3 +1068,37 @@ def test_usage_endpoint_promotes_a_measured_window_for_cold_rebuilds(
     assert body["context_limit"] == 1_000_000
     assert sess_mod.get_session_ctx_window(sid) == 1_000_000
     chat_mod._session_usage.pop(sid, None)
+
+
+def test_fallback_window_never_round_trips_as_measured(client, auth):
+    """A cached estimate must not come back as an SDK-measured window.
+
+    /usage hands `context_limit` back as `stored` with its provenance; before
+    this guard a 200K DUCC fallback returned as `session_sdk`, so the ring
+    treated a guessed 147% as real and turned red.
+    """
+    from backend import chat as chat_mod
+
+    details = chat_mod._context_limit_details(
+        "ducc:deepseek-v4-1-flash", stored=200_000,
+        stored_source="model_fallback")
+    assert details["context_limit_source"] == "model_fallback"
+    assert details["context_limit_is_estimate"] is True
+    assert details["context_limit"] == chat_mod.DUCC_DEFAULT_CONTEXT_LIMIT
+
+    sid = client.post(
+        "/api/chat/sessions", headers={**auth, "Content-Type": "application/json"},
+        json={"name": "ctx estimate", "model": "claude-opus-4-8"},
+    ).json()["id"]
+    chat_mod._session_usage[sid] = {
+        "input_tokens": 1, "output_tokens": 1, "cache_read_tokens": 0,
+        "cache_creation_tokens": 0, "total_cost_usd": 0.0, "last_turn_at": 0.0,
+        "context_used": 295_517, "context_used_pct": 147.8,
+        "context_limit": 200_000, "context_limit_source": "model_fallback",
+        "context_limit_is_estimate": True,
+    }
+    body = client.get(
+        f"/api/chat/usage/{sid}?model=claude-opus-4-8", headers=auth).json()
+    assert body["context_limit_source"] == "model_fallback"
+    assert body["context_limit_is_estimate"] is True
+    chat_mod._session_usage.pop(sid, None)

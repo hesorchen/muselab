@@ -3166,9 +3166,13 @@ def _context_limit_details(
     fallback = MODEL_CONTEXT_LIMITS.get(
         model, DUCC_DEFAULT_CONTEXT_LIMIT
         if endpoints.is_ducc_model(model) else DEFAULT_CONTEXT_LIMIT)
-    # A configured budget cached in usage is not a measured SDK capacity.
-    # Removing an override must restore automatic resolution immediately.
-    if stored_source in ("settings_model", "settings_provider", "env_override"):
+    # A configured budget or an earlier estimate cached in usage is not a
+    # measured SDK capacity. Without the estimate case, a fallback value
+    # round-tripped through /usage came back labelled "session_sdk" and the
+    # ring drew a red arc at 147% of a 200K guess for a 1M session.
+    if stored_source in (
+            "settings_model", "settings_provider", "env_override",
+            "model_fallback"):
         stored = 0
     if not endpoints.is_third_party(model):
         limit = (_positive_int(sdk_max) or _positive_int(stored)
