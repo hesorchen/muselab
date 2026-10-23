@@ -30283,7 +30283,7 @@ function portal() {
         }
         return html + nl(text.slice(cursor));
       }
-      const tag = /<quote id="(\d{1,3})" source="([^"\n]*)"( truncated="true")?>\n([\s\S]*?)\n<\/quote>/g;
+      const tag = /<quote id="(\d+)" source="([^"\n]*)"( truncated="true")?>\n([\s\S]*?)\n<\/quote>/g;
       let html = "";
       let cursor = 0;
       let match;
@@ -30332,13 +30332,6 @@ function portal() {
       this._captureComposerState(this.currentId);
       const draft = this._ensureTabState(this.currentId).draft;
       this._pruneUnplacedQuotes(draft);
-      if (draft.pendingQuotes.length >= 4) {
-        this.toast(
-          this.lang === "zh" ? "一次最多引用 4 段内容" : "Up to 4 quotes per message",
-          "warn", 2200,
-        );
-        return false;
-      }
       const quote = this._selectionQuoteSnapshot();
       quote.label = this._nextQuoteLabel(draft.pendingQuotes);
       draft.pendingQuotes.push(quote);

@@ -8413,11 +8413,13 @@ def _normalize_queue_selection_quotes(raw: list[dict] | None) -> list[dict]:
     """Bound and shape browser-supplied quote-chip metadata.
 
     This metadata is presentation-only; `_maybe_drain_queue` sends the already
-    composed `text` field. Keeping it plain and bounded prevents a malformed
-    client from turning the small queue sidecar into an unbounded data store.
+    composed `text` field. Every field is truncated and the entry set is
+    capped, which keeps a malformed client from turning the small queue sidecar
+    into an unbounded data store. The number of quotes itself is unlimited: the
+    composer allows as many as the user places.
     """
     normalized: list[dict] = []
-    for item in (raw or [])[:4]:
+    for item in (raw or []):
         if not isinstance(item, dict):
             continue
         text = str(item.get("text") or "")[:6000].strip()

@@ -2419,3 +2419,23 @@ async def test_busy_adjust_with_missing_attachment_falls_back_to_fifo(
         assert writes == []
     finally:
         chat._active_turns.pop(sid, None)
+
+
+def test_queue_keeps_every_selection_quote(app_module):
+    """Quotes are unlimited; only each item's fields stay bounded."""
+    from backend import chat
+
+    quotes = [{
+        "id": f"quote-{n}", "source": "preview", "role": "",
+        "sessionId": "sid", "messageId": "", "path": f"/f{n}.md",
+        "text": f"selected text {n}", "truncated": False, "label": f"[引用{n}]",
+        "unexpected": "dropped",
+    } for n in range(1, 9)]
+    quotes.append({"id": "empty", "text": "   "})
+    quotes.append("not-a-dict")
+
+    normalized = chat._normalize_queue_selection_quotes(quotes)
+
+    assert [item["id"] for item in normalized] == [f"quote-{n}" for n in range(1, 9)]
+    assert all("unexpected" not in item for item in normalized)
+    assert normalized[-1]["label"] == "[引用8]"

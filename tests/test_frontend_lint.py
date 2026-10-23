@@ -6575,3 +6575,16 @@ def test_workspace_surface_keeps_its_own_pane_layout():
     assert "Number.isFinite(v) && v > 0" in apply
     change_end = app.index("\n    async switchWorkspace(path)", change_start)
     assert "this._applyWorkspaceLayout(surface);" in app[change_start:change_end]
+
+
+def test_quotes_are_not_capped_per_message():
+    """Users may place as many inline quotes as they like.
+
+    The composer used to refuse the fifth quote with a toast, and history
+    rendering only re-parsed ids below 1000.
+    """
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    assert "pendingQuotes.length >= 4" not in app
+    assert "最多引用 4 段内容" not in app
+    assert 'Up to 4 quotes per message' not in app
+    assert '<quote id="(\\d+)" source=' in app
