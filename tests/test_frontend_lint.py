@@ -6588,3 +6588,19 @@ def test_quotes_are_not_capped_per_message():
     assert "最多引用 4 段内容" not in app
     assert 'Up to 4 quotes per message' not in app
     assert '<quote id="(\\d+)" source=' in app
+
+
+def test_ctx_ring_tone_ignores_an_estimated_window():
+    """A fallback denominator must not turn the ring red.
+
+    DUCC's transcript model name missed the catalog, the meter fell back to
+    128K, and a 1M session showed a full red ring at 182% (2026-10-23).
+    """
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    assert 'class="chat-toolbar-ring" :class="ctxRingTone()"' in html
+    assert "sessionUsage.context_used_pct >= 90" not in html
+    start = app.index("    ctxRingTone() {")
+    body = app[start:app.index("\n    },", start)]
+    assert "u.context_limit_is_estimate || u.context_is_estimate" in body
+    assert 'return "danger"' in body and 'return "warn"' in body

@@ -17545,6 +17545,18 @@ function portal() {
       this.ctxExpanded[name] = !this.ctxExpanded[name];
     },
 
+    // Ring severity. A guessed denominator must not raise an alarm: pct is
+    // computed against it, so a DUCC 1M session once showed a full red ring
+    // (182%) while the popup's measured window said 23%. Estimated usage
+    // (tokenizer-based totals) is equally unfit for a threshold.
+    ctxRingTone() {
+      const u = this.activeSessionPane().sessionUsage || {};
+      if (u.context_limit_is_estimate || u.context_is_estimate) return "";
+      const pct = u.context_used_pct || 0;
+      if (pct >= 90) return "danger";
+      if (pct >= 70) return "warn";
+      return "";
+    },
     ctxRingTitle() {
       const u = this.activeSessionPane().sessionUsage || {};
       const used = u.context_used || 0;

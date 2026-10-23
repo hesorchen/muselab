@@ -1001,3 +1001,44 @@ def test_cost_dashboard_includes_vendor_rollup_and_label(client, auth):
         assert "vendor" in row
         assert "cost_reported" in row
         assert isinstance(row["cost_reported"], bool)
+
+
+def test_rebuilt_meter_uses_the_session_model_not_the_cli_transcript_name(
+        client, auth, monkeypatch, tmp_path):
+    """A cold cache rebuilt the denominator from the transcript's CLI model.
+
+    The transcript says `deepseek-v4-1-flash-261017` / `Opus 5.5`, which is not
+    a MuseLab route id: DUCC detection failed, the generic 128K fallback won,
+    and a 234K/1M session painted a full red ring at 182% (2026-10-23).
+    """
+    import json
+
+    from backend import chat as chat_mod
+    from backend import sessions as sess_mod
+
+    sid = client.post(
+        "/api/chat/sessions", headers={**auth, "Content-Type": "application/json"},
+        json={"name": "ctx rebuild", "model": "ducc:deepseek-v4-1-flash"},
+    ).json()["id"]
+    transcript = tmp_path / f"{sid}.jsonl"
+    transcript.write_text(json.dumps({
+        "type": "assistant", "timestamp": "2026-10-23T12:00:00Z",
+        "message": {"model": "deepseek-v4-1-flash-261017",
+                    "usage": {"input_tokens": 10, "output_tokens": 5,
+                              "cache_read_input_tokens": 234_000}},
+    }) + "\n", encoding="utf-8")
+    monkeypatch.setattr(chat_mod, "_find_session_jsonl", lambda _sid: transcript)
+    monkeypatch.setattr(chat_mod, "_session_usage", {})
+
+    # The API cannot resolve a DUCC model in a sandbox without the CLI, so lock
+    # the model the way a real first turn does.
+    sess_mod.update_model(sid, "ducc:deepseek-v4-1-flash")
+    rebuilt = chat_mod._session_usage_from_jsonl(sid)
+    assert rebuilt["context_limit"] == chat_mod.DUCC_DEFAULT_CONTEXT_LIMIT
+    assert rebuilt["context_used_pct"] == round(234_010 / 200_000 * 100, 1)
+
+    # A measured window still wins over any table value.
+    sess_mod.set_session_ctx_window(sid, 1_000_000)
+    rebuilt = chat_mod._session_usage_from_jsonl(sid)
+    assert rebuilt["context_limit"] == 1_000_000
+    assert rebuilt["context_used_pct"] == round(234_010 / 1_000_000 * 100, 1)

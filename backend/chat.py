@@ -10296,8 +10296,20 @@ def _session_usage_from_jsonl(sid: str) -> dict | None:
         sdk_window = sess.get_session_ctx_window(sid)
     except Exception:
         sdk_window = None
+    # The transcript records the CLI's own model name ("Opus 5.5",
+    # "deepseek-v4-1-flash-261017"), not a MuseLab route id: it misses both
+    # DUCC detection and the provider catalog, so a DUCC session fell back to
+    # the generic 128K and its meter read >100% (a red ring at 23% of a 1M
+    # window). The register knows the model the user actually chose.
+    model_for_limit = last_model
+    try:
+        registered = (sess.get_session_meta(sid) or {}).get("model") or ""
+    except Exception:
+        registered = ""
+    if registered.strip():
+        model_for_limit = registered.strip()
     details = _context_limit_details(
-        last_model, stored=_positive_int(sdk_window))
+        model_for_limit, stored=_positive_int(sdk_window))
     limit = _positive_int(details.get("context_limit"))
     pct = round(ctx_used / limit * 100, 1) if limit else 0.0
     rebuilt = {
@@ -17886,6 +17898,18 @@ async def _start_turn(
             _apply_context_limit_details(sess_u, details)
             sess_u["sdk_context_max_tokens"] = sdk_max
             sess_u["sdk_context_raw_max_tokens"] = sdk_raw
+            # Persist the measured window right here: this probe runs before a
+            # turn, while the post-turn probe may be skipped (DUCC timeouts).
+            # Without it a restart or a cold tab rebuilt the meter from the
+            # hardcoded fallback and painted a false "over the limit" ring.
+            if sdk_max:
+                try:
+                    await obs.to_thread_io(
+                        "chat.context_window_write", session_id,
+                        sess.set_session_ctx_window, session_id, sdk_max,
+                        owned=True)
+                except Exception:
+                    pass
             if total:
                 _mark_context_used(
                     sess_u,

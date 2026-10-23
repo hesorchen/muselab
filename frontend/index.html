@@ -3876,11 +3876,7 @@
                  compaction is the decision you make after reading. `.stop` is
                  required or the same click bubbles to the popup's
                  @click.outside and closes it immediately. -->
-            <button class="chat-toolbar-ring"
-                    :class="{
-                      warn: activeSessionPane().sessionUsage.context_used_pct >= 70 && activeSessionPane().sessionUsage.context_used_pct < 90,
-                      danger: activeSessionPane().sessionUsage.context_used_pct >= 90,
-                    }"
+            <button class="chat-toolbar-ring" :class="ctxRingTone()"
                     @click.stop="showCtxBreakdown()"
                     @contextmenu.prevent.stop="showCtxBreakdown()"
                     :title="ctxRingTitle()">
