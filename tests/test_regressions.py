@@ -1042,3 +1042,29 @@ def test_rebuilt_meter_uses_the_session_model_not_the_cli_transcript_name(
     rebuilt = chat_mod._session_usage_from_jsonl(sid)
     assert rebuilt["context_limit"] == 1_000_000
     assert rebuilt["context_used_pct"] == round(234_010 / 1_000_000 * 100, 1)
+
+
+def test_usage_endpoint_promotes_a_measured_window_for_cold_rebuilds(
+        client, auth, monkeypatch):
+    """The live snapshot knows the window even when the post-turn probe skipped
+    persisting it; /usage must promote it so a cold rebuild is not guessing."""
+    from backend import chat as chat_mod
+    from backend import sessions as sess_mod
+
+    sid = client.post(
+        "/api/chat/sessions", headers={**auth, "Content-Type": "application/json"},
+        json={"name": "ctx promote", "model": "claude-opus-4-8"},
+    ).json()["id"]
+    assert sess_mod.get_session_ctx_window(sid) is None
+    chat_mod._session_usage[sid] = {
+        "input_tokens": 1_000, "output_tokens": 5,
+        "cache_read_tokens": 20_000, "cache_creation_tokens": 0,
+        "total_cost_usd": 0.0, "last_turn_at": 0.0,
+        "context_used": 21_000, "context_used_pct": 10.5,
+        "context_limit": 200_000, "sdk_context_max_tokens": 1_000_000,
+    }
+    body = client.get(
+        f"/api/chat/usage/{sid}?model=claude-opus-4-8", headers=auth).json()
+    assert body["context_limit"] == 1_000_000
+    assert sess_mod.get_session_ctx_window(sid) == 1_000_000
+    chat_mod._session_usage.pop(sid, None)

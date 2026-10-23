@@ -10395,6 +10395,19 @@ async def session_usage(session_id: str, model: str = "") -> dict:
     except Exception:
         sdk_window = None
     stored = int(u.get("context_limit", 0) or 0)
+    # A live turn may have measured the window without the post-turn probe
+    # persisting it (the probe is skipped on timeout). Promote the snapshot's
+    # value so a later cold rebuild resolves the real denominator instead of
+    # the hardcoded table.
+    measured = _positive_int(u.get("sdk_context_max_tokens"))
+    if not _positive_int(sdk_window) and measured:
+        sdk_window = measured
+        try:
+            await obs.to_thread_io(
+                "chat.context_window_write", session_id,
+                sess.set_session_ctx_window, session_id, measured, owned=True)
+        except Exception:
+            pass
     capability = await _detect_gateway_context_capability(m)
     details = _context_limit_details(
         m,
