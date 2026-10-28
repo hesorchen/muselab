@@ -304,3 +304,59 @@ def test_foreground_result_hands_immediate_background_tail_to_watcher(
             await stream.aclose()
             chat._clients.pop(key, None)
     asyncio.run(run())
+
+
+def test_idle_sdk_continuation_reply_is_staged_for_a_runtime_successor(
+        stream_env, monkeypatch):
+    """A CLI-initiated continuation must reach a rolled-over session.
+
+    2026-10-28: the watcher exited after all nine subagents settled, the CLI
+    answered the last notifications on its own, and that final reply lived only
+    in the hidden predecessor transcript, so the visible tab never showed it.
+    """
+    chat = stream_env
+    staged, scheduled = [], []
+
+    def persist(sid, broadcast, **fields):
+        staged.append((sid, broadcast.turn_id, fields))
+        return str(broadcast.turn_id)
+
+    async def noop(*_args, **_kwargs):
+        pass
+    monkeypatch.setattr(chat, "_persist_runtime_continuation_outbox", persist)
+    monkeypatch.setattr(chat, "_schedule_runtime_continuation_delivery",
+                        lambda sid, event_id: scheduled.append((sid, event_id)))
+    monkeypatch.setattr(chat, "_start_activity_early", noop)
+    monkeypatch.setattr(chat, "_finish_activity", noop)
+    monkeypatch.setattr(chat, "_refresh_sdk_session_summary", noop)
+    monkeypatch.setattr(chat.sess, "set_message_annotation", lambda *_a, **_k: None)
+
+    async def run():
+        key = ("idle-session-outbox", "model", "", "")
+        delivered = asyncio.Event()
+
+        class Client:
+            async def receive_messages(self):
+                yield AssistantMessage(content=[TextBlock("all nine are back")],
+                                       model="model", uuid="final-reply")
+                yield ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1,
+                    is_error=False, num_turns=1, session_id=key[0])
+                delivered.set()
+                await asyncio.Event().wait()
+        stream = chat._SessionStream(key, Client())
+        try:
+            await asyncio.wait_for(delivered.wait(), 5)
+            for _ in range(50):
+                if staged:
+                    break
+                await asyncio.sleep(0.02)
+            assert len(staged) == 1
+            sid, turn_id, fields = staged[0]
+            assert sid == key[0]
+            assert fields["terminal_status"] == "completed"
+            assert fields["incomplete_error"] == ""
+            assert scheduled == [(key[0], str(turn_id))]
+        finally:
+            await stream.aclose()
+            await asyncio.gather(*list(chat._maintenance_tasks), return_exceptions=True)
+    asyncio.run(run())

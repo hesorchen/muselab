@@ -22809,6 +22809,29 @@ async def _finish_sdk_delivery(
     broadcast.perf_status = status
     broadcast.perf_error_kind = ("scheduled_turn" if delivery.scheduled else "sdk_continuation") if status == "failed" else "none"
     broadcast.publish({"event": "done", "data": json.dumps(done_payload)})
+    # Claude Code can answer late task notifications on its own after the
+    # MuseLab watcher has exited. If the session was rolled over meanwhile,
+    # this runtime is a hidden predecessor: like the watcher continuation, its
+    # prose must be staged for the visible successor or the reply is lost (the
+    # source transcript is never shown). Delivery drops the outbox when the
+    # session has no successor.
+    if (not delivery.scheduled and status in {"completed", "failed"}
+            and not sess.session_is_deleting(session_id)):
+        event_id = await obs.to_thread_io(
+            "chat.continuation_outbox_write",
+            session_id,
+            _persist_runtime_continuation_outbox,
+            session_id,
+            broadcast,
+            completed_at_ms=completed_at_ms,
+            elapsed_s=elapsed_s,
+            terminal_status=status,
+            incomplete_error=done_payload["error"] if status == "failed" else "",
+            file_path=_runtime_continuation_outbox_path(
+                session_id, str(broadcast.turn_id or "")),
+        )
+        if event_id:
+            _schedule_runtime_continuation_delivery(session_id, event_id)
     if schedule_changed:
         _publish_sdk_scheduled_state(key, broadcast=broadcast)
     await _finish_activity(session_id, broadcast, status)
