@@ -1362,7 +1362,11 @@ def test_inline_quote_markers_compose_prompt_in_place_and_render_pills(
               hintVisible: !!(hint && hint.getClientRects().length),
               hintText: hint ? hint.textContent.replace(/\\s+/g, ' ').trim() : '',
             };
+            // blur() only dispatches when the textarea actually holds focus;
+            // a headless page without window focus never gives it focus, so
+            // dispatch the event the handler listens for explicitly.
             ta.blur();
+            ta.dispatchEvent(new FocusEvent('blur'));
             await shown();
             highlight.hintAfterBlur = !!(hint && hint.getClientRects().length);
 
