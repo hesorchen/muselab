@@ -292,6 +292,10 @@ def test_ducc_model_uses_real_cli_runtime_without_native_auth(
     assert captured["thinking"] == {
         "type": "enabled", "budget_tokens": 10000,
     }
+    # Native Cron triggers only reach the SDK stream when user messages are
+    # replayed; without it DUCC Cron runs lost their job attribution.
+    assert "replay-user-messages" in captured["extra_args"]
+    assert "enable_file_checkpointing" not in captured
 
 
 def test_non_claude_ducc_model_uses_catalog_name_without_claude_controls(
