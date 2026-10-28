@@ -3966,7 +3966,11 @@ async def _build_and_connect_client(
             opts_kwargs["hooks"].setdefault(event, []).append(matcher)
         if not is_ducc:
             opts_kwargs["enable_file_checkpointing"] = True
-            opts_kwargs.setdefault("extra_args", {})["replay-user-messages"] = None
+        # Replay is what surfaces a native Cron trigger (an isMeta user prompt)
+        # on the SDK stream, so MuseLab can attribute the run to its job. DUCC
+        # supports the flag; leaving it off there made every DUCC Cron run look
+        # like an unattributed background continuation (no job_id, no receipt).
+        opts_kwargs.setdefault("extra_args", {})["replay-user-messages"] = None
         # PreToolUse observes AskUserQuestion regardless of allow rules or a
         # mid-turn permission-mode transition, unlike can_use_tool. It therefore
         # owns the browser round-trip in every mode. The timeout must cover the
