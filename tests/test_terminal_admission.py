@@ -48,7 +48,7 @@ async def test_direct_send_waits_for_exact_finished_reply_owner(admission_runtim
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("next_state", ["successor", "background", "queue"])
+@pytest.mark.parametrize("next_state", ["successor", "cli_reply", "queue"])
 async def test_cleanup_wait_revalidates_successor_background_and_fifo(admission_runtime, monkeypatch, next_state):
     chat, sid = admission_runtime
     previous = chat.TurnBroadcast(session_id=sid)
@@ -62,8 +62,9 @@ async def test_cleanup_wait_revalidates_successor_background_and_fifo(admission_
         if next_state == "successor":
             successor = chat.TurnBroadcast(session_id=sid)
             chat._active_turns[sid] = successor
-        elif next_state == "background":
-            chat._sessions_with_inflight_tasks[sid] = {"background-fixture"}
+        elif next_state == "cli_reply":
+            # A reply the CLI produces on its own owns the stream.
+            monkeypatch.setattr(chat, "_session_has_sdk_delivery", lambda _sid: True)
         else:
             monkeypatch.setattr(chat.sess, "get_queue", lambda _sid: {
                 "items": [{"id": "older-command"}], "inflight": None})
@@ -76,6 +77,17 @@ async def test_cleanup_wait_revalidates_successor_background_and_fifo(admission_
         if not task.done():
             task.cancel()
         previous.close()
+
+
+@pytest.mark.asyncio
+async def test_running_background_tasks_do_not_block_admission(admission_runtime):
+    """Still-running background tasks share the session: the next turn is
+    admitted on the same CLI, which queues commands natively (2026-10-29)."""
+    chat, sid = admission_runtime
+    chat._sessions_with_inflight_tasks[sid] = {"background-fixture"}
+    broadcast = await asyncio.wait_for(chat._admit_turn(sid, "while tasks run"), 1)
+    assert chat._active_turns[sid] is broadcast
+    assert broadcast.user_text == "while tasks run"
 
 
 @pytest.mark.asyncio

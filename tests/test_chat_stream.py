@@ -4248,13 +4248,14 @@ def test_active_reports_background_reader_as_busy_not_attachable(
         chat_mod._background_origin_turn_id.pop(sid, None)
 
 
-def test_start_turn_is_queued_while_background_task_pending(
-    stream_env, client,
+def test_start_turn_is_queued_while_cli_reply_owns_stream(
+    stream_env, client, monkeypatch,
 ):
-    """A pending task retains the response boundary until its watcher exits."""
+    """Only a reply the CLI is producing on its own retains the boundary;
+    still-running background tasks share the session (2026-10-29)."""
     chat_mod = stream_env
     sid = _make_session(client)
-    chat_mod._sessions_with_inflight_tasks[sid] = {"task-1"}
+    monkeypatch.setattr(chat_mod, "_session_has_sdk_delivery", lambda _sid: _sid == sid)
     try:
         with pytest.raises(chat_mod._TurnBusy):
             asyncio.run(chat_mod._start_turn(sid, "new user prompt"))
@@ -4266,10 +4267,12 @@ def test_start_turn_is_queued_while_background_task_pending(
         chat_mod._sessions_with_inflight_tasks.pop(sid, None)
 
 
-def test_draining_reservation_rechecks_background_owner(stream_env, client):
-    """Interrupted-turn handoff must not bypass the background queue gate."""
+def test_draining_reservation_rechecks_background_owner(stream_env, client, monkeypatch):
+    """Interrupted-turn handoff must not bypass a CLI-owned reply."""
     chat_mod = stream_env
     sid = _make_session(client)
+    cli_reply = set()
+    monkeypatch.setattr(chat_mod, "_session_has_sdk_delivery", lambda _sid: _sid in cli_reply)
 
     async def exercise():
         draining = chat_mod.TurnBroadcast(sid, model="claude-sonnet-4-6")
@@ -4278,7 +4281,7 @@ def test_draining_reservation_rechecks_background_owner(stream_env, client):
 
         async def hand_off_to_watcher():
             await asyncio.sleep(0)
-            chat_mod._sessions_with_inflight_tasks[sid] = {"task-1"}
+            cli_reply.add(sid)
             draining.finish()
             chat_mod._active_turns.pop(sid, None)
 
@@ -4295,17 +4298,14 @@ def test_draining_reservation_rechecks_background_owner(stream_env, client):
     asyncio.run(exercise())
 
 
-def test_stream_busy_response_is_machine_queueable(stream_env, client):
+def test_stream_busy_response_is_machine_queueable(stream_env, client, monkeypatch):
     chat_mod = stream_env
     sid = _make_session(client)
-    chat_mod._sessions_with_inflight_tasks[sid] = {"task-1"}
-    try:
-        response = client.get(
-            f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
-            "&prompt=queue-me&model=claude-sonnet-4-6"
-        )
-    finally:
-        chat_mod._sessions_with_inflight_tasks.pop(sid, None)
+    monkeypatch.setattr(chat_mod, "_session_has_sdk_delivery", lambda _sid: _sid == sid)
+    response = client.get(
+        f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+        "&prompt=queue-me&model=claude-sonnet-4-6"
+    )
 
     assert response.status_code == 200
     assert '"kind": "turn_busy"' in response.text
@@ -6503,7 +6503,8 @@ def test_preflight_compact_trusts_the_token_count_over_the_verdict(
 
 def test_preflight_queues_while_background_watcher_owns_sdk_stream(
         stream_env, client, monkeypatch):
-    """Neither compact nor a prompt may cross a watcher's response boundary."""
+    """A watcher defers native compact but no longer blocks the prompt: the
+    turn runs on the same session (2026-10-29)."""
     chat_mod = stream_env
     sid = _make_session(client)
     answer = [
@@ -6543,11 +6544,10 @@ def test_preflight_queues_while_background_watcher_owns_sdk_stream(
     )
     events = _parse_sse(response.text)
 
-    assert fake.queried == []
+    assert fake.queried == ["send-once"]
     assert not [event for event, _data in events if event == "compact_progress"]
-    busy = [json.loads(data) for event, data in events if event == "error"]
-    assert busy and busy[-1]["kind"] == "turn_busy"
-    assert busy[-1]["cta"] == "queue"
+    assert not [json.loads(data) for event, data in events
+                if event == "error" and json.loads(data).get("kind") == "turn_busy"]
 
 
 def test_codex_preflight_rebuilds_stalled_runtime_and_retries_once(

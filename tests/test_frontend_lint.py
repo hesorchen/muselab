@@ -2663,10 +2663,12 @@ def test_background_task_gap_rolls_foreground_onto_detached_successor():
     # completed turn's footer timer. A fresh foreground send transparently
     # rolls onto an isolated successor instead of waiting for that task.
     assert "st.compacting || st.backgroundActive || st._draining" in app
-    assert "st.streaming || st.compacting || st.backgroundActive" in app
+    # Still-running background tasks no longer make the runtime busy: a new
+    # turn goes to the same session and the CLI queues it natively.
+    assert "st.streaming || st.compacting || st.backgroundActive" not in app
     assert "st.backgroundActive || st._draining" in app
     assert "status.finishing && !status.background && !status.scheduled" in app
-    assert "return status.background ? true : active;" in app
+    assert "return status.background ? false : active;" in app
     assert "async _handoffBackgroundSession(" in app
     assert "/continue-detached`" in app
     assert "_stateForDetachedSuccessor(" in app
@@ -2678,7 +2680,7 @@ def test_background_task_gap_rolls_foreground_onto_detached_successor():
     handoff_end = app.index("_ensureInheritedTaskPoller", handoff_start)
     handoff = app[handoff_start:handoff_end]
     assert 'this._requestSessionSync(childSid, "history_load"' in handoff
-    assert "_backgroundRolloverAttempted" in app
+    assert "_backgroundRolloverAttempted" not in app
     assert "owner_session_id" in app
     # A second browser may refresh its list after the first browser hid the
     # predecessor. Its still-open tab must trust the local watcher flag and
@@ -2947,18 +2949,14 @@ def test_detached_rollover_preserves_migrated_queue_fifo():
     assert "?? payload.queue_pending" in handoff
     assert "this.queuePendingItems(childState).length > 0" in handoff
     assert "return { sessionId: childSid, queuePending, rolledOver: true };" in handoff
-    # Ordinary messages commit to the source's durable queue before the
-    # expensive transcript fork. The backend migrates that accepted item in
-    # FIFO order; the browser handoff is non-blocking presentation work.
+    # Ordinary messages commit to the session's durable queue; with
+    # background tasks running they run on this same session, never a fork.
     busy = send[send.index("const confirmedBusy ="):]
     busy = busy[:busy.index("// Reconnect mode has no optimistic user bubble")]
     assert "await this._enqueueMessage(sendSid" in busy
     assert "this._commitChatRecoveryDraft(sendSid, composerInput);" in busy
-    assert "this._scheduleBackgroundHandoff(sendSid, sendState);" in busy
+    assert "this._scheduleBackgroundHandoff(sendSid, sendState);" not in busy
     assert "await this._handoffBackgroundSession" not in busy
-    assert busy.index("await this._enqueueMessage(sendSid") < busy.index(
-        "this._scheduleBackgroundHandoff(sendSid, sendState);"
-    )
     # Slash controls never enter the durable message queue. Their per-command
     # busy policy is owned by the shared dispatcher, while this send path has a
     # single delegation point and therefore cannot overtake migrated prompts
@@ -3016,10 +3014,13 @@ def test_composer_send_has_one_claim_owner_without_exposing_internal_phases():
     assert "this._syncQueueFromServer(sid);" in enqueue
     assert "await this._syncQueueFromServer(sid);" not in enqueue
 
-    # A done event with detached work rolls over proactively, and an in-flight
-    # queue POST transfers its primitive composer claim to that successor.
-    assert "if (backgroundPending > 0 && !isContinuation && !d.cancelled)" in send
-    assert "this._scheduleBackgroundHandoff(streamSid, streamState);" in send
+    # A done event with detached work no longer forks a successor: the same
+    # session keeps one conversation with its background task results. An
+    # in-flight queue POST still transfers its claim if a legacy successor
+    # exists.
+    assert "if (backgroundPending > 0 && !isContinuation && !d.cancelled)" not in send
+    # Only a 409 (input needs another runtime) still asks for a handoff.
+    assert "if (streamState.backgroundActive) {\n                    this._scheduleBackgroundHandoff(streamSid, streamState);" in send
     assert "_backgroundSuccessorSid: \"\"" in app
     assert "child._composerSubmitToken = sourceState._composerSubmitToken || null;" in app
     assert 'child._composerSubmitPhase = child._composerSubmitToken' in app

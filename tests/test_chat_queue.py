@@ -1937,21 +1937,35 @@ async def test_drain_replays_snapshot_without_reverting_session_permission(
 
 
 @pytest.mark.asyncio
-async def test_drain_waits_while_background_task_pending(
+async def test_drain_runs_queued_input_on_same_session_while_background_task_pending(
     app_module, monkeypatch,
 ):
-    """The watcher advances FIFO only after its response boundary closes."""
+    """Still-running background tasks do not defer or fork queued input.
+
+    2026-10-29: forking a successor whenever a task was pending split one
+    conversation into two CLI sessions, so the visible model never saw its own
+    task results and the prompt cache was lost. The CLI queues commands
+    natively; the queued item runs on this same session.
+    """
     from backend import chat
 
     sess = _sess(app_module)
     sid = sess.create_session()["id"]
     sess.enqueue_message(sid, "follow-up")
     starts = []
+    handoffs = []
 
-    async def fake_start_turn(*args, **kwargs):
-        starts.append((args, kwargs))
+    async def fake_start_turn(session_id, prompt, **kwargs):
+        starts.append((session_id, prompt))
+
+    async def fake_continue_detached(session_id):
+        handoffs.append(session_id)
+        return {"session_id": session_id}
 
     monkeypatch.setattr(chat, "_start_turn", fake_start_turn)
+    monkeypatch.setattr(chat, "_continue_detached_runtime", fake_continue_detached)
+    # The queued item reuses the live runtime (same permission/model/effort).
+    monkeypatch.setattr(chat, "_background_runtime_needs_rollover", lambda _sid: False)
     chat._sessions_with_inflight_tasks[sid] = {"task-1"}
     watcher = asyncio.create_task(asyncio.sleep(60))
     chat._task_watchers[sid] = watcher
@@ -1964,51 +1978,75 @@ async def test_drain_waits_while_background_task_pending(
         with contextlib.suppress(asyncio.CancelledError):
             await watcher
 
-    assert starts == []
-    queue = sess.get_queue(sid)
-    assert [item["text"] for item in queue["items"]] == ["follow-up"]
-    assert queue.get("inflight") is None
+    assert handoffs == []
+    assert [start[0] for start in starts] == [sid]
+    assert sess.get_queue(sid)["items"] == []
 
 
 @pytest.mark.asyncio
-async def test_drain_hands_off_queue_before_background_task_settles(
+async def test_drain_forks_successor_only_when_input_needs_another_runtime(
     app_module, monkeypatch,
 ):
-    """A safe successor must run queued work without waiting for the task."""
+    """A queued item with a changed runtime setting would restart the CLI and
+    end its background tasks, so that case alone keeps the successor fork."""
     from backend import chat
 
     sess = _sess(app_module)
-    source_sid = sess.create_session()["id"]
-    child_sid = sess.create_session()["id"]
-    sess.enqueue_message(source_sid, "follow-up")
-    chat._sessions_with_inflight_tasks[source_sid] = {"task-1"}
-    handoffs = []
-    scheduled = []
-    starts = []
+    sid = sess.create_session()["id"]
+    sess.enqueue_message(sid, "follow-up")
+    handoffs, starts = [], []
 
     async def fake_continue_detached(session_id):
         handoffs.append(session_id)
-        sess.migrate_queue(source_sid, child_sid)
-        return {"session_id": child_sid}
+        return {"session_id": session_id}
+
+    async def fake_start_turn(*args, **kwargs):
+        starts.append(args)
+
+    monkeypatch.setattr(chat, "_continue_detached_runtime", fake_continue_detached)
+    monkeypatch.setattr(chat, "_start_turn", fake_start_turn)
+    monkeypatch.setattr(chat, "_background_runtime_needs_rollover", lambda s: s == sid)
+    await chat._maybe_drain_queue(sid)
+
+    assert handoffs == [sid]
+    assert starts == []
+
+
+def test_runtime_reusable_requires_the_exact_live_runtime(app_module, monkeypatch):
+    from backend import chat_runtime as runtime
+
+    key = ("sid-reuse", "model-a", "auto", "")
+    monkeypatch.setitem(runtime.CLIENTS, key, object())
+    monkeypatch.setitem(runtime.CLIENT_PERMISSION, key, "bypassPermissions")
+    assert runtime.runtime_reusable("sid-reuse", "model-a", "bypassPermissions", effort="auto")
+    assert not runtime.runtime_reusable("sid-reuse", "model-a", "default", effort="auto")
+    assert not runtime.runtime_reusable("sid-reuse", "model-b", "bypassPermissions", effort="auto")
+    assert not runtime.runtime_reusable("sid-other", "model-a", "bypassPermissions", effort="auto")
+
+
+@pytest.mark.asyncio
+async def test_drain_waits_while_cli_initiated_reply_owns_stream(
+    app_module, monkeypatch,
+):
+    """Only a reply the CLI is producing on its own defers queued input."""
+    from backend import chat
+
+    sess = _sess(app_module)
+    sid = sess.create_session()["id"]
+    sess.enqueue_message(sid, "follow-up")
+    starts = []
 
     async def fake_start_turn(*args, **kwargs):
         starts.append((args, kwargs))
 
-    monkeypatch.setattr(chat, "_continue_detached_runtime", fake_continue_detached)
-    monkeypatch.setattr(chat, "_schedule_queue_drain", scheduled.append)
     monkeypatch.setattr(chat, "_start_turn", fake_start_turn)
-    try:
-        await chat._maybe_drain_queue(source_sid)
-    finally:
-        chat._sessions_with_inflight_tasks.pop(source_sid, None)
+    monkeypatch.setattr(chat, "_session_has_sdk_delivery", lambda s: s == sid)
+    await chat._maybe_drain_queue(sid)
 
-    assert handoffs == [source_sid]
-    assert scheduled == [child_sid]
     assert starts == []
-    assert sess.get_queue(source_sid)["items"] == []
-    assert [
-        item["text"] for item in sess.get_queue(child_sid)["items"]
-    ] == ["follow-up"]
+    queue = sess.get_queue(sid)
+    assert [item["text"] for item in queue["items"]] == ["follow-up"]
+    assert queue.get("inflight") is None
 
 
 @pytest.mark.asyncio
