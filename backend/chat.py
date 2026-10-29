@@ -2244,6 +2244,63 @@ def _session_has_sdk_delivery(session_id: str) -> bool:
     )
 
 
+def _session_has_background_work(session_id: str) -> bool:
+    return bool(
+        _sessions_with_inflight_tasks.get(session_id)
+        or _session_has_live_watcher(session_id)
+        or _session_has_sdk_delivery(session_id)
+    )
+
+
+def _background_runtime_needs_rollover(session_id: str) -> bool:
+    """Whether the next queued input cannot share the live background runtime.
+
+    Normally a turn runs on the same CLI session as its background tasks, so
+    the model keeps one context and prompt cache. Only when that input needs a
+    different runtime (changed permission, effort, tier, model, or a pending
+    rebuild) would reusing the session restart the CLI and end the tasks; that
+    case keeps the legacy successor fork.
+    """
+    if not _session_has_background_work(session_id):
+        return False
+    try:
+        meta = sess.get_session_meta(session_id) or {}
+        pending = sess.queue_pending_items(sess.get_queue(session_id))
+    except Exception:
+        return False
+    if not pending:
+        return False
+    item = pending[0]
+    permission = (item.get("permission") or "").strip() or "default"
+    return not chat_runtime.runtime_reusable(
+        session_id,
+        (meta.get("model") or "").strip() or MODEL,
+        permission,
+        effort=meta.get("effort") or "",
+        service_tier=meta.get("service_tier") or "",
+        plan_return_permission=item.get("plan_return_permission") or "",
+    )
+
+
+def _direct_turn_would_restart_background_runtime(
+    session_id: str, permission: str,
+) -> bool:
+    if not _session_has_background_work(session_id):
+        return False
+    try:
+        meta = sess.get_session_meta(session_id) or {}
+    except Exception:
+        return False
+    return not chat_runtime.runtime_reusable(
+        session_id,
+        (meta.get("model") or "").strip() or MODEL,
+        permission,
+        effort=meta.get("effort") or "",
+        service_tier=meta.get("service_tier") or "",
+        plan_return_permission=meta.get("plan_return_permission") or "",
+    )
+
+
 def _session_runtime_busy(session_id: str) -> bool:
     """One authoritative busy boundary for turns and detached task readers."""
     from .api_delivery import RESTORING
@@ -12193,6 +12250,14 @@ def _schedule_detached_successor_prewarm(source_sid: str) -> None:
 @router.post("/sessions/{sid}/continue-detached",
              dependencies=[Depends(require_token)])
 async def continue_detached_session_api(sid: str) -> dict:
+    meta = await obs.to_thread_io(
+        "chat.session_read", sid, sess.get_session_meta, sid) or {}
+    if not meta.get("runtime_successor") and not await obs.to_thread_io(
+            "chat.queue_runtime_check", sid,
+            _background_runtime_needs_rollover, sid):
+        # Same-session continuation: nothing to hand off. The browser keeps
+        # the tab; queued input runs here when the stream is free.
+        return {**meta, "session_id": sid, "id": sid}
     return await _continue_detached_runtime(sid)
 
 class BudgetReq(BaseModel):
@@ -14767,6 +14832,13 @@ async def turn_start(req: TurnStartReq) -> dict:
 async def _turn_start_impl(req: TurnStartReq) -> dict:
     """Admit and launch a new turn without coupling it to an SSE request."""
     permission = _validate_permission(req.permission)
+    if await obs.to_thread_io(
+            "chat.turn_runtime_check", req.session_id,
+            _direct_turn_would_restart_background_runtime,
+            req.session_id, permission):
+        # Running this turn would restart the CLI and end its background
+        # tasks. 409 makes the browser queue it; the drain hands it over.
+        raise HTTPException(409, "background tasks own the current runtime")
     _gc_images()
     prompt = req.prompt
     is_image_only = (not prompt.strip()) and bool((req.image_ids or "").strip())
@@ -16365,6 +16437,12 @@ async def _watch_inflight_tasks_owned(
                         duration_ms=getattr(msg, "duration_ms", None), result=msg)
                     if not pending:
                         break
+                    # A clean Result releases the stream while other tasks are
+                    # still running: input queued behind this reply runs now
+                    # on this same session. Incomplete/cancelled exits keep
+                    # the fence and drain only after the runtime is settled.
+                    if drain_queue:
+                        _schedule_queue_drain(session_id)
                 else:
                     if cont is not None and cont_state is not None:
                         progress = cont.native_compaction_progress(msg)
@@ -17017,9 +17095,11 @@ async def _admit_turn(
             # exact terminal owner instead of flashing a fresh queue card.
             # Ownership, background writers and deletion are rechecked below.
             draining = cur
-        elif (_sessions_with_inflight_tasks.get(session_id)
-              or _session_has_live_watcher(session_id)
-              or _session_has_sdk_delivery(session_id)):
+        elif _session_has_sdk_delivery(session_id):
+            # The CLI is producing a reply of its own (e.g. answering a task
+            # notification). Background tasks that are merely still running
+            # do not block: the session pump routes a foreground turn ahead of
+            # the idle watcher, and the CLI queues commands natively.
             raise _TurnBusy()
         else:
             broadcast = TurnBroadcast(
@@ -17049,9 +17129,7 @@ async def _admit_turn(
             cur = _active_turns.get(session_id)
             if cur is not None and not cur.done:
                 raise _TurnBusy()
-            if (_sessions_with_inflight_tasks.get(session_id)
-                    or _session_has_live_watcher(session_id)
-                    or _session_has_sdk_delivery(session_id)):
+            if _session_has_sdk_delivery(session_id):
                 raise _TurnBusy()
             broadcast = TurnBroadcast(
                 session_id=session_id, model=model or MODEL, events=spool)
@@ -20213,15 +20291,6 @@ async def _start_turn(
                                     )
                             if not queue_settled:
                                 raise RuntimeError("queue terminal ownership mismatch")
-                        if (not done_data.get("is_error")
-                                and not done_data.get("cancelled")
-                                and int(done_data.get(
-                                    "background_tasks_pending") or 0) > 0):
-                            # The Result handler persisted the exact assistant
-                            # boundary before yielding this event. Start fork +
-                            # cold-client setup now, in parallel with the slow
-                            # post-turn transcript/context bookkeeping below.
-                            _schedule_detached_successor_prewarm(session_id)
                     if (isinstance(ev, dict)
                             and ev.get("event") == "cancelled"
                             and broadcast.cancelled):
@@ -20617,27 +20686,30 @@ async def _maybe_drain_queue(session_id: str) -> None:
             return
         if session_id in _active_turns and not _active_turns[session_id].done:
             return
-        # The watcher owns a logical response boundary even though no ordinary
-        # TurnBroadcast is open. It will trigger this drain again after its
-        # final continuation releases the single SDK pump.
-        if (_sessions_with_inflight_tasks.get(session_id)
-                or _session_has_live_watcher(session_id)
-                or _session_has_sdk_delivery(session_id)):
-            queued = await obs.to_thread_io(
-                "chat.queue_read", session_id, sess.get_queue, session_id)
-            if sess.queue_pending_items(queued):
-                try:
-                    successor = await _continue_detached_runtime(session_id)
-                    successor_sid = str(successor.get("session_id") or "")
-                    if successor_sid and successor_sid != session_id:
-                        _schedule_queue_drain(successor_sid)
-                except HTTPException as exc:
-                    obs.diagnostic_line(
-                        f"[chat] queued runtime rollover deferred "
-                        f"sid={session_id[:8]} status={exc.status_code}\n"
-                    )
-                    if exc.status_code in {404, 409}:
-                        _schedule_queue_drain_retry(session_id)
+        # A CLI-initiated reply owns the stream until its Result; its finish
+        # re-kicks this drain.
+        if _session_has_sdk_delivery(session_id):
+            return
+        # Background tasks that are still running do not defer queued input:
+        # it runs on this same session, so the model keeps one continuous
+        # context (and prompt cache) with its task results. Only input that
+        # needs a different runtime falls back to a successor fork, because
+        # rebuilding this CLI would end the running tasks.
+        if await obs.to_thread_io(
+                "chat.queue_runtime_check", session_id,
+                _background_runtime_needs_rollover, session_id):
+            try:
+                successor = await _continue_detached_runtime(session_id)
+                successor_sid = str(successor.get("session_id") or "")
+                if successor_sid and successor_sid != session_id:
+                    _schedule_queue_drain(successor_sid)
+            except HTTPException as exc:
+                obs.diagnostic_line(
+                    f"[chat] queued runtime rollover deferred "
+                    f"sid={session_id[:8]} status={exc.status_code}\n"
+                )
+                if exc.status_code in {404, 409}:
+                    _schedule_queue_drain_retry(session_id)
             return
         # READY presentation events are part of the visible chronology. Commit
         # them before claiming the next FIFO item; if local I/O cannot do so,
@@ -22854,6 +22926,9 @@ async def _finish_sdk_delivery(
     if (registered_here or registration_finished) \
             and not sess.session_is_deleting(session_id):
         _remember_recent_turn(session_id, broadcast)
+        # Input queued while the CLI answered on its own was deferred by the
+        # drain; release it now that the stream is free again.
+        _schedule_queue_drain(session_id)
 
     if delivery.pending_tasks:
         client = _clients.get(key)

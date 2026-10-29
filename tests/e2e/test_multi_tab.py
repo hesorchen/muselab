@@ -978,19 +978,17 @@ def test_repeated_enter_while_background_busy_submits_one_draft(
           return app.tabState[app.currentId]._composerSubmitToken === null;
         }"""
     )
-    # The handoff is intentionally fire-and-forget after queue commit. Join
-    # its observable start before releasing the test-owned promise.
-    page.wait_for_function(
-        "() => typeof window.__releaseHandoff === 'function'")
+    # Background tasks share the session now: queue commit never forks a
+    # runtime successor, so no handoff starts.
     result = page.evaluate(
         """() => {
           const app = document.querySelector('#app')._x_dataStack[0];
           const st = app.tabState[app.currentId];
-          window.__releaseHandoff(null);
           return {
             queued: window.__queuedDrafts,
             input: app.input,
             draft: st.draft.input,
+            handoff: typeof window.__releaseHandoff === 'function',
           };
         }"""
     )
@@ -998,6 +996,7 @@ def test_repeated_enter_while_background_busy_submits_one_draft(
         "queued": [{"text": "ONLY_ONCE", "displayText": "ONLY_ONCE"}],
         "input": "",
         "draft": "",
+        "handoff": False,
     }
 
 
@@ -1172,9 +1171,10 @@ def test_image_generation_submit_timeout_and_close_cancel_are_local(
     }
 
 
-def test_background_send_resolves_before_runtime_handoff(
+def test_background_send_resolves_without_runtime_handoff(
         page: Page, backend_url, auth_token):
-    """Queue commit is synchronous; the expensive runtime fork is not."""
+    """Queue commit resolves the send; background tasks share the session,
+    so no runtime successor is forked (2026-10-29)."""
     _login(page, backend_url, auth_token)
     page.locator(".chat-input-textarea").fill("QUEUE_FIRST")
     page.wait_for_function(
@@ -1220,8 +1220,7 @@ def test_background_send_resolves_before_runtime_handoff(
         }"""
     )
     assert resolved is True
-    page.wait_for_function(
-        "() => window.__sendOrder.includes('handoff:start')")
+    page.wait_for_timeout(200)
     state = page.evaluate(
         """() => {
           const app = document.querySelector('#app')._x_dataStack[0];
@@ -1233,11 +1232,10 @@ def test_background_send_resolves_before_runtime_handoff(
         }"""
     )
     assert state == {
-        "order": ["enqueue:start", "enqueue:committed", "handoff:start"],
+        "order": ["enqueue:start", "enqueue:committed"],
         "input": "",
         "submitting": False,
     }
-    page.evaluate("() => window.__releaseHandoff()")
 
 
 def test_background_handoff_during_queue_post_settles_successor_composer(

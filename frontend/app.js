@@ -9811,7 +9811,7 @@ function portal() {
       // Enter appear inert even though the local state already knew the
       // answer. A migrated/draining queue also remains FIFO: never launch a
       // direct turn in the short child handoff gap.
-      if (st && (st.streaming || st.compacting || st.backgroundActive
+      if (st && (st.streaming || st.compacting
           || this.queuePendingItems(st).length)) {
         return true;
       }
@@ -9853,7 +9853,9 @@ function portal() {
             sid, active, status.started_at, status.background_tasks_pending);
         }
         if (!active && session) session.active = false;
-        return status.background ? true : active;
+        // Background-only means the CLI is idle while tasks run: a new turn
+        // goes straight to this same session (the CLI queues natively).
+        return status.background ? false : active;
       } catch (_) {
         return true;
       }
@@ -11464,14 +11466,12 @@ function portal() {
         if (st && turnId) st.activeTurnId = turnId;
         this._setBackgroundTaskActive(
           sid, true, startedAt, backgroundTaskCount);
-        if (expect) {
-          const handoff = await this._handoffBackgroundSession(sid, st);
-          const childSid = handoff && handoff.sessionId;
-          if (childSid && childSid !== sid) {
-            this.$nextTick(() => this._attachToServerTurn(
-              childSid, Math.max(1, tries - 1), completedTurnId));
-            return;
-          }
+        if (expect && tries > 1) {
+          // The queued item runs on this same session as soon as the server
+          // drain claims it; keep probing instead of forking a successor.
+          this._requestSessionSync(sid, "queue_attach", {
+            tries: tries - 1, completedTurnId, delayMs: 350,
+          });
         }
         this._ensureBgContPoller(sid);
         return;
@@ -34913,10 +34913,6 @@ function portal() {
           sentUserBubble._optimisticQueue = true;
         }
         this._setComposerClaimPhase(sendState, composerSubmitToken, "queue");
-        const shouldHandoffBackground = !sendState.streaming
-          && !sendState.compacting
-          && sendState.backgroundActive
-          && !opts._backgroundRolloverAttempted;
         const ok = await this._enqueueMessage(sendSid, {
           text,
           displayText: composerInput,
@@ -34941,9 +34937,6 @@ function portal() {
         }
         if (isComposerSubmission) {
           this._commitChatRecoveryDraft(sendSid, composerInput);
-        }
-        if (shouldHandoffBackground) {
-          this._scheduleBackgroundHandoff(sendSid, sendState);
         }
         if (this.currentId === sendSid) {
           sendState.atBottom = true;
@@ -35218,6 +35211,12 @@ function portal() {
                   rollbackUnstartedSend(false);
                   if (isComposerSubmission) {
                     this._commitChatRecoveryDraft(sendSid, composerInput);
+                  }
+                  // A changed runtime setting cannot share the live background
+                  // runtime; the server then hands this item to a successor.
+                  // The handoff is a no-op when it runs on this session.
+                  if (streamState.backgroundActive) {
+                    this._scheduleBackgroundHandoff(streamSid, streamState);
                   }
                   this.toast(this.lang === "zh"
                     ? "当前任务仍在收尾，消息已加入队列"
@@ -36616,9 +36615,6 @@ function portal() {
         // may already hide an eagerly-forked predecessor, and the tab must not
         // blink out while the browser adopts that successor. Continuation
         // turns are reactions on the source runtime and never fork again.
-        if (backgroundPending > 0 && !isContinuation && !d.cancelled) {
-          this._scheduleBackgroundHandoff(streamSid, streamState);
-        }
         if (d.is_error && !d.cancelled && d.snapshot_ready) {
           // A terminal failure's private display snapshot owns both any valid
           // partial answer and the separate error bubble. Adopt it only after

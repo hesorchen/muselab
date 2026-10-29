@@ -2344,6 +2344,8 @@ def test_continue_detached_rejects_foreground_active(chat_mod, client, monkeypat
         called = True
 
     monkeypatch.setattr(chat_mod, "sdk_fork_session", fake_fork)
+    # Legacy rollover path: only reached when the input needs another runtime.
+    monkeypatch.setattr(chat_mod, "_background_runtime_needs_rollover", lambda _sid: True)
     response = client.post(
         f"/api/chat/sessions/{sid}/continue-detached",
         headers={"X-Auth-Token": TEST_TOKEN},
@@ -2380,6 +2382,8 @@ def test_continue_detached_allows_canonical_done_during_postlude(
     monkeypatch.setattr(chat_mod, "_backfill_runtime_task_overlays", lambda _sid: None)
     monkeypatch.setattr(chat_mod, "_schedule_queue_drain", lambda _sid: None)
 
+    # Legacy rollover path: only reached when the input needs another runtime.
+    monkeypatch.setattr(chat_mod, "_background_runtime_needs_rollover", lambda _sid: True)
     response = client.post(
         f"/api/chat/sessions/{sid}/continue-detached",
         headers={"X-Auth-Token": TEST_TOKEN},
@@ -3281,3 +3285,28 @@ def test_failed_fork_publication_removes_activity_without_evicting_source(
     assert chat_mod.sess.get_session_meta(child_sid) is None
     assert activity.list() == [source_row]
     assert json.loads(activity.path.read_text()) == [source_row]
+
+
+def test_continue_detached_keeps_same_session_when_runtime_is_reusable(
+        chat_mod, client, monkeypatch):
+    """With background tasks running, a reusable runtime is never forked."""
+    sid = client.post(
+        "/api/chat/sessions",
+        headers={"X-Auth-Token": TEST_TOKEN, "Content-Type": "application/json"},
+        json={"name": "same session"},
+    ).json()["id"]
+    chat_mod._sessions_with_inflight_tasks[sid] = {"task-a"}
+    forked = []
+    monkeypatch.setattr(chat_mod, "sdk_fork_session", lambda *a, **k: forked.append(a))
+    monkeypatch.setattr(chat_mod, "_background_runtime_needs_rollover", lambda _sid: False)
+    try:
+        response = client.post(
+            f"/api/chat/sessions/{sid}/continue-detached",
+            headers={"X-Auth-Token": TEST_TOKEN},
+        )
+    finally:
+        chat_mod._sessions_with_inflight_tasks.pop(sid, None)
+    assert response.status_code == 200, response.text
+    assert response.json()["session_id"] == sid
+    assert forked == []
+    assert not chat_mod.sess.get_session_meta(sid).get("runtime_successor")
