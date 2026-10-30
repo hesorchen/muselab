@@ -33803,16 +33803,17 @@ function portal() {
         this.slashShow = false;
       }
 
-      // Trigger the @ picker on the LAST @ in the prefix, regardless of what
-      // sits before it. Previously we required @ to be at position 0 or
-      // preceded by whitespace — that broke mid-sentence usage like
-      // "看下 @foo.md 里写的什么" where @ follows a Chinese character.
-      // Trade-off: typing an email address ("user@example.com") will also
-      // pop the picker; that's accepted since chat input rarely contains
-      // emails and the picker auto-hides as soon as a space is typed.
-      // 2026-05-28 user request: "任何时候 @ 都弹出".
+      // Trigger the @ picker on the LAST @ in the prefix when it starts a
+      // word: at the beginning, after whitespace, or after a non-ASCII
+      // character such as Chinese ("看下@foo.md"). An @ glued to an ASCII
+      // word is an address, not a mention: "user@example.com" or a pasted
+      // "ssh --matrix work@0.pandora-…" used to pop an empty "没有匹配"
+      // panel over the composer (2026-10-30).
       const at = text.lastIndexOf("@");
-      if (at < 0) { this._cancelMentionLookup(); return; }
+      if (at < 0 || (at > 0 && /[A-Za-z0-9._%+-]/.test(text[at - 1]))) {
+        this._cancelMentionLookup();
+        return;
+      }
       const query = text.slice(at + 1);
       if (/\s/.test(query)) { this._cancelMentionLookup(); return; }
       this.mentionAnchor = at;
@@ -33876,7 +33877,8 @@ function portal() {
       }
       if (mentionSeq !== this._mentionSeq) return;
       this.mentionIdx = 0;
-      this.mentionShow = true;
+      // An empty result list is not worth a panel that covers the composer.
+      this.mentionShow = this.mentionResults.length > 0;
     },
     pickMention(i) {
       const idx = (i ?? this.mentionIdx);

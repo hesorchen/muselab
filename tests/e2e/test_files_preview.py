@@ -4090,3 +4090,38 @@ def test_upload_completion_keeps_text_typed_after_overwrite_confirmation(
         "editingAfterExit": False,
         "reload": {"path": "upload.txt", "forceReload": True},
     }
+
+
+def test_mention_picker_ignores_addresses_and_hides_when_empty(
+        page: Page, backend_url, auth_token):
+    """An @ inside an ASCII word is an address, and an empty list has no panel.
+
+    2026-10-30: pasting "ssh --matrix work@0.pandora-…" opened a "没有匹配"
+    panel over the composer.
+    """
+    _login(page, backend_url, auth_token)
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const ta = app.$refs.chatInput;
+          const type = async (text) => {
+            app._cancelMentionLookup();
+            app._setChatInput(text);
+            ta.value = text;
+            ta.setSelectionRange(text.length, text.length);
+            app.onChatInput({target: ta});
+            await new Promise(r => setTimeout(r, 450));
+            return {show: app.mentionShow, anchor: app.mentionAnchor};
+          };
+          return {
+            address: await type('ssh --matrix work@0.pandora-192987-pcs-0.www.njjs'),
+            email: await type('mail me at user@example.com'),
+            empty: await type('看一下 @zz-no-such-file-xyz'),
+            chinese: await type('看下@'),
+          };
+        }"""
+    )
+    assert result["address"]["show"] is False
+    assert result["email"]["show"] is False
+    assert result["empty"]["show"] is False
+    assert result["chinese"]["show"] is True

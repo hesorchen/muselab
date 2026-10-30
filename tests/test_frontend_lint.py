@@ -6605,3 +6605,13 @@ def test_ctx_ring_tone_ignores_an_estimated_window():
     body = app[start:app.index("\n    },", start)]
     assert "u.context_limit_is_estimate || u.context_is_estimate" in body
     assert 'return "danger"' in body and 'return "warn"' in body
+
+
+def test_mention_picker_skips_addresses_and_empty_results():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("    onChatInput(ev) {")
+    body = app[start:app.index("\n    async fetchMention(q) {", start)]
+    assert '/[A-Za-z0-9._%+-]/.test(text[at - 1])' in body
+    fetch = app[app.index("    async fetchMention(q) {"):app.index("\n    pickMention(i) {")]
+    assert "this.mentionShow = this.mentionResults.length > 0;" in fetch
+    assert "this.mentionShow = true;" not in fetch
