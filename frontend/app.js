@@ -21719,6 +21719,9 @@ function portal() {
       const top = openAbove
         ? Math.max(pad, anchorRect.top - gap - height)
         : Math.min(viewportHeight - pad - height, anchorRect.bottom + gap);
+      // The measuring write above set the unfitted max-height; Alpine skips an
+      // unchanged reactive string, so restore the fitted value directly.
+      popover.style.maxHeight = `${Math.round(fittedMax)}px`;
       this.memoryRecallPopover.style = [
         "position:fixed",
         `left:${Math.round(left)}px`,
