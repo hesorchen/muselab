@@ -343,3 +343,38 @@ async def test_sdk_aborted_result_stays_cancelled_in_background_accounting(
         assert client.disconnect_calls == 0
     finally:
         await stream.aclose()
+
+
+@pytest.mark.asyncio
+async def test_output_before_typed_notification_opens_the_continuation(
+    stream_env, monkeypatch,
+):
+    """The CLI may answer a finished task before its typed notification.
+
+    2026-10-30: those first frames were dropped (no continuation open yet),
+    the reply counted as "not started", and after the grace period the watcher
+    sent a resume prompt that the CLI queued into the visible conversation as a
+    stray "<system-reminder>All background tasks…" user bubble.
+    """
+    chat = stream_env
+    sid = "output-before-notification"
+    monkeypatch.setattr(chat, "_CONTINUATION_GRACE", 0.01)
+    monkeypatch.setattr(chat, "_CONTINUATION_TIMEOUT", 1)
+    client = QueueClient()
+    client.messages.put_nowait(assistant())
+    client.messages.put_nowait(notification(sid))
+    stream, watcher = start_watcher(chat, sid, client)
+    try:
+        await wait_until(lambda: sid in chat._active_turns)
+        await asyncio.sleep(0.05)
+        assert client.queries == []
+        client.messages.put_nowait(result(sid))
+        await asyncio.wait_for(watcher, 2)
+        bc = chat._recent_turns[sid]
+        texts = [json.loads(e["data"]).get("text", "") for e in bc.events
+                 if e.get("event") == "text"]
+        assert "synthetic response" in "".join(texts)
+        assert json.loads(bc.events[-1]["data"])["status"] == "completed"
+        assert client.queries == []
+    finally:
+        await stream.aclose()
