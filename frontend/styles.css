@@ -7315,10 +7315,14 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   display: inline-flex; flex-wrap: wrap; align-items: center;
   gap: var(--sp-2); margin-left: var(--sp-2); padding: 2px 6px;
   border-radius: var(--r-sm); font-size: var(--fs-xs);
-  /* Keep its natural width (capped to the row); the row wraps it below the
-     argument rather than shrinking it into a one-character column. */
   flex: 0 1 auto; max-width: 100%; min-width: min(16em, 100%);
 }
+/* With a background-task pill the card reads "Bash  ✓ done  summary ›" on
+   the first line and the command on full-width lines below. Side by side,
+   either the pill collapsed into a one-letter column or the command was
+   squeezed beside a one-line pill; both left large blank areas. */
+.tool:has(> .tool-task) > .tool-task { order: 1; margin-left: 0; }
+.tool:has(> .tool-task) > .tool-arg { order: 2; flex: 1 1 100%; }
 .tool-task-badge { font-weight: var(--fw-semibold); white-space: nowrap; }
 .tool-task.is-running .tool-task-badge { color: #8b5cf6; }
 .tool-task.is-completed .tool-task-badge,

@@ -6666,3 +6666,5 @@ def test_tool_row_wraps_task_pill_instead_of_squeezing_it():
     assert ".tool-arg:not(.file-link):not(.mcp-input-preview) {\n  flex: 1 1 0; min-width: min(24ch, 100%);" in tool
     pill = css[css.index("\n.tool-task {"):css.index("\n.tool-task-badge")]
     assert "min-width: min(16em, 100%)" in pill
+    assert ".tool:has(> .tool-task) > .tool-task { order: 1; margin-left: 0; }" in pill
+    assert ".tool:has(> .tool-task) > .tool-arg { order: 2; flex: 1 1 100%; }" in pill

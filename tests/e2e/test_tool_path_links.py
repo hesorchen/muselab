@@ -146,7 +146,9 @@ def test_long_bash_command_keeps_background_task_pill_readable(
     box = page.evaluate('''() => {
         const r = s => document.querySelector(s).getBoundingClientRect();
         const lh = parseFloat(getComputedStyle(document.querySelector('.tool .tool-arg')).lineHeight) || 16;
-        return {summaryW: r('.tool .tool-task-summary').width,
+        return {pillTop: r('.tool .tool-task').top, argTop: r('.tool .tool-arg').top,
+                argW: r('.tool .tool-arg').width, rowW: r('.tool').width,
+                summaryW: r('.tool .tool-task-summary').width,
                 summaryH: r('.tool .tool-task-summary').height,
                 rowH: r('.tool').height, argH: r('.tool .tool-arg').height, lh};
     }''')
@@ -156,3 +158,6 @@ def test_long_bash_command_keeps_background_task_pill_readable(
     assert box['summaryH'] <= box['lh'] * 4, box
     # No tall blank area: the row is about the command plus one pill line.
     assert box['rowH'] <= box['argH'] + box['summaryH'] + 40, box
+    # Status sits on the first line; the command uses the full card width.
+    assert box['pillTop'] < box['argTop'], box
+    assert box['argW'] > box['rowW'] * 0.8, box
