@@ -111,3 +111,48 @@ def test_read_tool_existing_file_link_still_opens_preview(page: Page, backend_ur
         const app=document.querySelector('#app')._x_dataStack[0];
         return app.selected==='notes.md' && app.rawText.includes('scratch');
     }''')
+
+
+@pytest.mark.parametrize("width", [1440, 390])
+def test_long_bash_command_keeps_background_task_pill_readable(
+    page: Page, backend_url, auth_token, width,
+):
+    """A long command must not squeeze the background-task pill into a column.
+
+    2026-10-30: the command kept its max-content flex basis, the pill beside it
+    shrank to one character wide, its summary ran down the right edge, and the
+    command floated in a tall, mostly blank row.
+    """
+    page.set_viewport_size({"width": width, "height": 900})
+    _login(page, backend_url, auth_token)
+    page.evaluate('''() => {
+        const app = document.querySelector('#app')._x_dataStack[0];
+        app.conciseChat = false;
+        const sid = app.currentId, st = app._ensureTabState(sid);
+        const command = 'cd $HOME/tmp/report && git add README.md docs/a.png && '
+          + 'git commit -q -m "Polish report styling and add screenshots ' + 'x '.repeat(160)
+          + '" && git push -u origin style/report-polish-readme';
+        st._loaded = true;
+        st.messages = [{role:'tool_use', name:'Bash', summary:command,
+          input:{command, run_in_background:true}, uuid:'pill-use', _k:'pill-use',
+          task_status:{state:'failed', task_id:'bgpill',
+            summary:'Commit the changes and push the branch over SSH'}}];
+        st.messageRange.visibleEnd = st.messages.length;
+        st.messageRange.total = st.messages.length;
+        app._activateTabState(sid);
+        st.messagesReady = true;
+    }''')
+    page.locator('.tool .tool-task-summary').wait_for(state='visible')
+    box = page.evaluate('''() => {
+        const r = s => document.querySelector(s).getBoundingClientRect();
+        const lh = parseFloat(getComputedStyle(document.querySelector('.tool .tool-arg')).lineHeight) || 16;
+        return {summaryW: r('.tool .tool-task-summary').width,
+                summaryH: r('.tool .tool-task-summary').height,
+                rowH: r('.tool').height, argH: r('.tool .tool-arg').height, lh};
+    }''')
+    # The summary keeps a readable width (well over a few characters) and
+    # stays on at most a few lines instead of one character per line.
+    assert box['summaryW'] > 120, box
+    assert box['summaryH'] <= box['lh'] * 4, box
+    # No tall blank area: the row is about the command plus one pill line.
+    assert box['rowH'] <= box['argH'] + box['summaryH'] + 40, box
