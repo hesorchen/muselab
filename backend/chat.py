@@ -16444,16 +16444,26 @@ async def _watch_inflight_tasks_owned(
                     if drain_queue:
                         _schedule_queue_drain(session_id)
                 else:
+                    is_output = isinstance(msg, (StreamEvent, AssistantMessage)) or (
+                        isinstance(msg, UserMessage)
+                        and isinstance(msg.content, list)
+                        and any(isinstance(block, ToolResultBlock)
+                                for block in msg.content)
+                    )
+                    if is_output and cont is None:
+                        # The CLI can start answering a finished task before
+                        # its typed TaskNotificationMessage reaches this lane.
+                        # Nothing else owns the background lane, so this is
+                        # the continuation: open it now. Dropping these frames
+                        # left the reply "not started", and the grace timer
+                        # then injected a redundant resume prompt that the CLI
+                        # queued into the visible conversation (2026-10-30).
+                        await _open_continuation()
                     if cont is not None and cont_state is not None:
                         progress = cont.native_compaction_progress(msg)
                         if progress is not None:
                             cont.publish(progress)
-                        if isinstance(msg, (StreamEvent, AssistantMessage)) or (
-                            isinstance(msg, UserMessage)
-                            and isinstance(msg.content, list)
-                            and any(isinstance(block, ToolResultBlock)
-                                    for block in msg.content)
-                        ):
+                        if is_output:
                             cont_state["started"] = True
                         for ev in _render_continuation_message(
                                 msg, cont_state, broadcast=cont):
