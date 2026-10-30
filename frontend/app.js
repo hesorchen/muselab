@@ -21712,15 +21712,19 @@ function portal() {
       const roomAbove = anchorRect.top - pad - gap;
       const roomBelow = viewportHeight - anchorRect.bottom - pad - gap;
       const openAbove = roomAbove >= measuredHeight || roomAbove > roomBelow;
+      // When neither side fits, shrink to the roomier side and scroll inside
+      // instead of clamping to the viewport edge over the trigger.
+      const fittedMax = Math.max(1, Math.min(maxHeight, openAbove ? roomAbove : roomBelow));
+      const height = Math.min(measuredHeight, fittedMax);
       const top = openAbove
-        ? Math.max(pad, anchorRect.top - gap - measuredHeight)
-        : Math.min(viewportHeight - pad - measuredHeight, anchorRect.bottom + gap);
+        ? Math.max(pad, anchorRect.top - gap - height)
+        : Math.min(viewportHeight - pad - height, anchorRect.bottom + gap);
       this.memoryRecallPopover.style = [
         "position:fixed",
         `left:${Math.round(left)}px`,
         `top:${Math.round(Math.max(pad, top))}px`,
         `width:${Math.round(width)}px`,
-        `max-height:${Math.round(maxHeight)}px`,
+        `max-height:${Math.round(fittedMax)}px`,
         "visibility:visible",
       ].join(";");
     },

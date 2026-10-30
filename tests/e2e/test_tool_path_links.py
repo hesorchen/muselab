@@ -147,6 +147,19 @@ def test_long_bash_command_keeps_background_task_pill_readable(
         const r = s => document.querySelector(s).getBoundingClientRect();
         const lh = parseFloat(getComputedStyle(document.querySelector('.tool .tool-arg')).lineHeight) || 16;
         return {pillTop: r('.tool .tool-task').top, argTop: r('.tool .tool-arg').top,
+                maxBlank: (() => {
+                    // Largest vertical stretch of the row that no child covers.
+                    const row = r('.tool');
+                    const spans = [...document.querySelector('.tool').children]
+                      .map(c => c.getBoundingClientRect()).filter(b => b.height > 0)
+                      .map(b => [b.top, b.bottom]).sort((a, b) => a[0] - b[0]);
+                    let edge = row.top, blank = 0;
+                    for (const [top, bottom] of spans) {
+                        blank = Math.max(blank, top - edge);
+                        edge = Math.max(edge, bottom);
+                    }
+                    return Math.max(blank, row.bottom - edge);
+                })(),
                 argW: r('.tool .tool-arg').width, rowW: r('.tool').width,
                 summaryW: r('.tool .tool-task-summary').width,
                 summaryH: r('.tool .tool-task-summary').height,
@@ -156,8 +169,9 @@ def test_long_bash_command_keeps_background_task_pill_readable(
     # stays on at most a few lines instead of one character per line.
     assert box['summaryW'] > 120, box
     assert box['summaryH'] <= box['lh'] * 4, box
-    # No tall blank area: the row is about the command plus one pill line.
-    assert box['rowH'] <= box['argH'] + box['summaryH'] + 40, box
-    # Status sits on the first line; the command uses the full card width.
+    # No tall blank area: apart from padding and the flex gap, every line of
+    # the row is covered by the name, the pill or the command.
+    assert box['maxBlank'] <= 16, box
+    # Status sits above the command; the command uses the full card width.
     assert box['pillTop'] < box['argTop'], box
     assert box['argW'] > box['rowW'] * 0.8, box
