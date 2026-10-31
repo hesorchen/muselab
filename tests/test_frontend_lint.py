@@ -6657,3 +6657,14 @@ def test_running_footer_without_pane_timer_uses_shared_clock():
     assert "this._clockedRunningElapsed(pane)" in body
     assert "if (!startedAt || pane._streamTimer) return 0;" in body
     assert "if (!museFooterClockTimer) {" in body
+
+
+def test_tool_row_wraps_task_pill_instead_of_squeezing_it():
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+    tool = css[css.index("\n.tool {"):css.index("\n.tool-result {")]
+    assert "flex-wrap: wrap" in tool
+    assert ".tool-arg:not(.file-link):not(.mcp-input-preview) {\n  flex: 1 1 0; min-width: min(24ch, 100%);" in tool
+    pill = css[css.index("\n.tool-task {"):css.index("\n.tool-task-badge")]
+    assert "min-width: min(16em, 100%)" in pill
+    assert ".tool:has(> .tool-task) > .tool-task { order: 1; margin-left: 0; }" in pill
+    assert ".tool:has(> .tool-task) > .tool-arg { order: 2; flex: 1 1 100%; }" in pill

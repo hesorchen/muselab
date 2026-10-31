@@ -5354,14 +5354,23 @@ pre.has-copy-btn .code-copy-btn.copied {
    left gutter so contents align naturally. */
 
 .tool {
-  display: flex; gap: var(--sp-2); align-items: baseline;
+  display: flex; flex-wrap: wrap; gap: var(--sp-2); align-items: baseline;
   background: var(--c-tool-bg); color: var(--c-tool-fg);
   border-left: 2px solid var(--c-tool-fg);
   padding: 5px 12px; border-radius: 0 var(--r-md) var(--r-md) 0;
   font-family: var(--font-mono); font-size: var(--fs-xs);
 }
-.tool-name { font-weight: var(--fw-semibold); }
+.tool-name { font-weight: var(--fw-semibold); flex: 0 0 auto; }
+/* The argument takes the remaining width but never less than ~24 columns.
+   A long command used to keep its full max-content basis, squeezing the
+   background-task pill beside it to one character per line: its summary
+   ran down the right edge and the command floated in a tall, mostly blank
+   row. With a bounded minimum the pill wraps below instead. File-link and
+   MCP-preview arguments are background chips that keep their content width. */
 .tool-arg { color: var(--c-fg-2); word-break: break-all; }
+.tool-arg:not(.file-link):not(.mcp-input-preview) {
+  flex: 1 1 0; min-width: min(24ch, 100%);
+}
 
 .tool-result {
   background: var(--c-bg-2); border-left: 2px solid var(--c-fg-4);
@@ -7306,7 +7315,14 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   display: inline-flex; flex-wrap: wrap; align-items: center;
   gap: var(--sp-2); margin-left: var(--sp-2); padding: 2px 6px;
   border-radius: var(--r-sm); font-size: var(--fs-xs);
+  flex: 0 1 auto; max-width: 100%; min-width: min(16em, 100%);
 }
+/* With a background-task pill the card reads "Bash  ✓ done  summary ›" on
+   the first line and the command on full-width lines below. Side by side,
+   either the pill collapsed into a one-letter column or the command was
+   squeezed beside a one-line pill; both left large blank areas. */
+.tool:has(> .tool-task) > .tool-task { order: 1; margin-left: 0; }
+.tool:has(> .tool-task) > .tool-arg { order: 2; flex: 1 1 100%; }
 .tool-task-badge { font-weight: var(--fw-semibold); white-space: nowrap; }
 .tool-task.is-running .tool-task-badge { color: #8b5cf6; }
 .tool-task.is-completed .tool-task-badge,
