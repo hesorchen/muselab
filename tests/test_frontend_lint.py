@@ -6537,6 +6537,12 @@ def test_scheduler_modal_opens_one_standalone_surface_per_topbar_entry():
     assert "if (this.isTabStreaming(tid, session)) return false;\n      const st = this.tabState[tid];\n      return !!(st && st.unread);" in app
     assert "backgroundTaskTitle(row)" in html
     assert ".activity-row.has-bg-work" in css
+    # A same-session background reaction keeps streaming after the human
+    # row closed; the row shows the blue streaming dot, above yellow.
+    assert "activitySessionStreaming(item) ? ' session-streaming' : ''" in html
+    assert 'item.state !== "running" && this.isTabStreaming(sid)' in app
+    assert css.index(".activity-row.has-bg-work:not(") < css.index(
+        ".activity-row.session-streaming:not(")
 
     # The task-detail dialog opens over the scheduler modal (both default to 900).
     css = (FRONTEND / "styles.css").read_text(encoding="utf-8")

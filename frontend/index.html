@@ -6948,7 +6948,8 @@
                         :class="item.state
                           + (activityIsUnreadResult(item) ? ' is-unread' : '')
                           + (activityRequiresAction(item) ? ' requires-action' : '')
-                          + (activityHasBackgroundWork(item) ? ' has-bg-work' : '')">
+                          + (activityHasBackgroundWork(item) ? ' has-bg-work' : '')
+                          + (activitySessionStreaming(item) ? ' session-streaming' : '')">
                   <span class="activity-state-dot"></span>
                   <span class="activity-row-main">
                     <strong class="activity-session-name"

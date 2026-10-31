@@ -38435,6 +38435,13 @@ function portal() {
       const sid = item && (item.session_id || item.thread_id);
       return !!sid && (this.isTabScheduledActive(sid) || this.isTabBackgroundActive(sid));
     },
+    // A background-task reaction streams in the same session after the human
+    // turn's row closed. Light the row like the tab's blue dot while the
+    // session still streams, instead of leaving a finished row with no dot.
+    activitySessionStreaming(item) {
+      const sid = item && (item.session_id || item.thread_id);
+      return !!sid && item.state !== "running" && this.isTabStreaming(sid);
+    },
     activityGroupUnread(group) {
       if (group?.custom || this.activitySearchQuery()) {
         return this.activityAllEvents(group)
