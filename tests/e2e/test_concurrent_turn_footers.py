@@ -173,3 +173,49 @@ def test_concurrent_streams_bound_footer_work_and_keep_live_status(
             "tasks": 64, "tailSummary": "Inspect 63",
         }
     _assert_no_browser_errors(page, errors)
+
+
+@pytest.mark.parametrize("offset,running", [(300, True), (0, False)])
+def test_live_footer_survives_a_tail_window_without_the_turn_user(
+    page, backend_url, auth_token, offset, running,
+):
+    """A refresh mid-way through a long turn loads only the history tail.
+
+    2026-10-31: the turn had over 400 rows, so the reloaded window had no user
+    boundary and every live row lost its Running footer.  Only an unloaded
+    earlier history may stand in for that boundary.
+    """
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+    _app_eval(
+        page,
+        """
+        app.conciseChat = false;
+        const sid = app.currentId, st = app._ensureTabState(sid);
+        st._loaded = true;
+        st.messages = [
+          {role: 'tool_use', name: 'Bash', summary: 'ls', input: {command: 'ls'},
+           id: 'tail-use', uuid: 'tail-use', _k: 'tail-use'},
+          {role: 'tool_result', id: 'tail-use', tool_name: 'Bash',
+           preview: 'README.md', uuid: 'tail-result', _k: 'tail-result'},
+        ];
+        Object.assign(st.messageRange, {
+          offset: arg, total: arg + 2, visibleStart: 0, visibleEnd: 2,
+        });
+        st.streaming = true;
+        st.activeTurnId = 'turn-live';
+        app._activateTabState(sid);
+        st.messagesReady = true;
+        """,
+        offset,
+    )
+    sid = _app_eval(page, "return app.currentId;")
+    pane = page.locator(f'.msg-pane[data-tid="{sid}"]')
+    expect(pane.locator(".tool")).to_be_visible()
+    status = pane.locator(".turn-footer:visible .turn-status.running")
+    if running:
+        expect(status).to_be_visible()
+    else:
+        expect(status).to_have_count(0)
+    _assert_no_browser_errors(page, errors)

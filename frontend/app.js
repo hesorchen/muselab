@@ -4916,7 +4916,14 @@ function portal() {
           break;
         }
       }
-      if (!ownerUser) return false;
+      if (!ownerUser) {
+        // A long turn can outgrow the history tail loaded after a refresh: the
+        // resident window then starts inside the turn and its user boundary is
+        // still on the server. Only that case may continue to the newest-
+        // segment check below; a fully resident pane without a user has no turn.
+        const offset = Number(pane.messageRange && pane.messageRange.offset);
+        if (!(offset > 0)) return false;
+      }
 
       // A native steering bubble divides the visible assistant/tool stream,
       // but it is still part of this same logical turn. Pane-level live state
@@ -4926,7 +4933,7 @@ function portal() {
         if (pane.messages[k] && pane.messages[k].role === "user") return false;
       }
 
-      const ownerTurnId = String(ownerUser._turnId || "");
+      const ownerTurnId = String((ownerUser && ownerUser._turnId) || "");
       const activeTurnId = String(pane.activeTurnId || "");
       if (ownerTurnId && activeTurnId) return ownerTurnId === activeTurnId;
 
