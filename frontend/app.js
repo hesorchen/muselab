@@ -4,6 +4,8 @@ let museEditor = null;
 let museEditorPreview = { version: 0, blocks: [], scrollTargets: {}, patching: false };
 const museEditorAssets = new Map();
 const museRichMessages = new WeakMap();
+// One shared 1s clock for running footers that have no pane timer.
+let museFooterClockTimer = 0;
 const museTranscriptPerf = new Map();
 // One bounded worker, shared by history decoration and code highlighting.
 // A stalled parser is terminated; the complete plain text remains readable.
@@ -724,6 +726,7 @@ function portal() {
     // evaluate against undefined on the initial paint. Restored from
     // localStorage in init(); see conciseHidesToolUse().
     conciseChat: false,
+    _footerClock: 0,
     // Compact orchestration: the per-tab `compacting` flag (see
     // _blankTabState) marks the window where the CLI is busy summarising
     // *that session's* history. User messages typed during compact go into
@@ -5089,9 +5092,22 @@ function portal() {
         ? Math.max(
             Number((m && m.elapsed) || 0),
             Number((pane && pane.streamElapsed) || 0),
+            this._clockedRunningElapsed(pane),
           )
         : Number(m && m.elapsed);
       return Number.isFinite(value) && value >= 0 ? value : null;
+    },
+    // A footer can be "running" from the server's stored turn_status while
+    // this pane has no timer (no attached stream, no background attach). It
+    // then only changed when history reloaded. Count from the server-derived
+    // start on a shared 1s clock instead.
+    _clockedRunningElapsed(pane) {
+      const startedAt = Number(pane && pane._runningTurnStartHint) || 0;
+      if (!startedAt || pane._streamTimer) return 0;
+      if (!museFooterClockTimer) {
+        museFooterClockTimer = setInterval(() => { this._footerClock = Date.now(); }, 1000);
+      }
+      return Math.max(0, (Math.max(this._footerClock, Date.now()) - startedAt) / 1000);
     },
     turnFooterModel(m, pane, sid) {
       const stored = String((m && m.model) || "");
@@ -11552,7 +11568,8 @@ function portal() {
           st.backgroundTaskCount = 1;
         }
         if (!st._streamStartedAt) {
-          st._streamStartedAt = startedAt ? Number(startedAt) * 1000 : Date.now();
+          st._streamStartedAt = startedAt ? Number(startedAt) * 1000
+            : (st._runningTurnStartHint || Date.now());
         }
         if (!st._streamTimer) {
           st._streamTimer = setInterval(() => {
@@ -11572,6 +11589,7 @@ function portal() {
       if (st._streamTimer) clearInterval(st._streamTimer);
       st._streamTimer = null;
       st._streamStartedAt = 0;
+      st._runningTurnStartHint = 0;
       st.streamElapsed = 0;
     },
     _bgHasRunningCard(sid) {
@@ -20387,7 +20405,9 @@ function portal() {
       if (!(elapsed > 0)) return;
       const startedAt = Date.now() - elapsed * 1000;
       st._runningTurnStartHint = startedAt;
-      if ((st.streaming || st.es) && st._streamStartedAt
+      // Any running pane timer: a live stream, or the background-task timer
+      // that /active starts at now because it reports started_at: 0.
+      if (st._streamTimer && st._streamStartedAt
           && startedAt < st._streamStartedAt - 1000) {
         st._streamStartedAt = startedAt;
         st.streamElapsed = elapsed;

@@ -6637,6 +6637,10 @@ def test_running_footer_start_comes_from_the_server_running_tail():
     assert "st._runningTurnStartHint = startedAt;" in helper
     assert "st._runningTurnStartHint = 0;" in helper
     assert "startedAt < st._streamStartedAt - 1000" in helper
+    # The background-task timer (no live stream) must be corrected too.
+    assert "st._streamTimer && st._streamStartedAt" in helper
+    assert "(st.streaming || st.es) && st._streamStartedAt" not in helper
+    assert "(st._runningTurnStartHint || Date.now())" in app
     envelopes = app[app.index("    _historyEnvelopes(sid, list) {"):]
     assert envelopes.index("this._adoptRunningTurnStart(sid, source);") < 200
     assert ("if (isContinuation) _streamStartMs = "
@@ -6644,3 +6648,12 @@ def test_running_footer_start_comes_from_the_server_running_tail():
     assert "if (isContinuation) _streamStartMs = Date.now();" not in app
     # Every place that ends the live turn forgets the hint.
     assert app.count("_runningTurnStartHint = 0;") >= 5
+
+
+def test_running_footer_without_pane_timer_uses_shared_clock():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("    turnFooterElapsed(m, pane) {")
+    body = app[start:app.index("\n    turnFooterModel(", start)]
+    assert "this._clockedRunningElapsed(pane)" in body
+    assert "if (!startedAt || pane._streamTimer) return 0;" in body
+    assert "if (!museFooterClockTimer) {" in body

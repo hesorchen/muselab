@@ -288,3 +288,76 @@ def test_running_footer_keeps_the_server_start_after_history_and_new_rows(
     )
     assert hint == 0
     _assert_no_browser_errors(page, errors)
+
+
+def test_running_footer_ticks_from_server_start_while_only_background_is_active(
+    page, backend_url, auth_token,
+):
+    """2026-10-31: /active reported background work with started_at 0.
+
+    The pane was not streaming; the background timer started at now, so the
+    footer stayed on the history snapshot and moved only on the next reload.
+    """
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+    _app_eval(
+        page,
+        """
+        app.conciseChat = false;
+        const sid = app.currentId, st = app._ensureTabState(sid);
+        st._loaded = true;
+        app._setBackgroundTaskActive(sid, true, 0, 1);
+        st.messages = app._historyEnvelopes(sid, [
+          {role: 'tool_use', name: 'Bash', summary: 'sleep 90',
+           input: {command: 'sleep 90'}, id: 'bg-use', uuid: 'bg-use',
+           turn_status: 'running', elapsed: 600},
+        ]);
+        Object.assign(st.messageRange, {
+          offset: 300, total: 301, visibleStart: 0, visibleEnd: 1,
+        });
+        app._activateTabState(sid);
+        st.messagesReady = true;
+        """,
+    )
+    sid = _app_eval(page, "return app.currentId;")
+    elapsed = page.locator(
+        f'.msg-pane[data-tid="{sid}"] .turn-footer:visible .msg-elapsed')
+    expect(elapsed).to_have_text(re.compile(r"· 10m0[0-2]s"))
+    expect(elapsed).to_have_text(re.compile(r"· 10m0[4-9]s"), timeout=8000)
+    _app_eval(page, "app._setBackgroundTaskActive(app.currentId, false);")
+    assert _app_eval(
+        page, "return app._ensureTabState(app.currentId)._runningTurnStartHint;") == 0
+    _assert_no_browser_errors(page, errors)
+
+
+def test_running_footer_ticks_without_any_pane_timer(page, backend_url, auth_token):
+    """Server says running, but this pane neither streams nor tracks background."""
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+    _app_eval(
+        page,
+        """
+        app.conciseChat = false;
+        const sid = app.currentId, st = app._ensureTabState(sid);
+        st._loaded = true;
+        st.messages = app._historyEnvelopes(sid, [
+          {role: 'tool_use', name: 'Bash', summary: 'sleep 90',
+           input: {command: 'sleep 90'}, id: 'idle-use', uuid: 'idle-use',
+           turn_status: 'running', elapsed: 600},
+        ]);
+        Object.assign(st.messageRange, {
+          offset: 300, total: 301, visibleStart: 0, visibleEnd: 1,
+        });
+        app._activateTabState(sid);
+        st.messagesReady = true;
+        """,
+    )
+    sid = _app_eval(page, "return app.currentId;")
+    assert _app_eval(page, "return !app._ensureTabState(app.currentId)._streamTimer;")
+    elapsed = page.locator(
+        f'.msg-pane[data-tid="{sid}"] .turn-footer:visible .msg-elapsed')
+    expect(elapsed).to_have_text(re.compile(r"· 10m0[0-2]s"))
+    expect(elapsed).to_have_text(re.compile(r"· 10m0[4-9]s"), timeout=8000)
+    _assert_no_browser_errors(page, errors)
