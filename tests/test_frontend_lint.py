@@ -5294,6 +5294,11 @@ def test_running_turn_footer_is_owned_by_active_user_boundary():
     assert "ownerTurnId === activeTurnId" in helper
     assert helper.index("for (let k = index + 1") < helper.index(
         "if (ownerTurnId && activeTurnId)")
+    # A tail window that starts inside a long turn has no resident user row;
+    # only unloaded earlier history may stand in for that boundary.
+    assert "pane.messageRange && pane.messageRange.offset" in helper
+    assert helper.index("if (!(offset > 0)) return false;") < helper.index(
+        "for (let k = index + 1")
     assert "this._turnMessageBelongsToActiveTurn(m, pane)" in status
     assert "pane && pane.streaming && m && !m.ts" not in status
     assert "this._turnMessageBelongsToActiveTurn(m, pane)" in model
