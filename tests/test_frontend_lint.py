@@ -6626,3 +6626,13 @@ def test_mention_picker_skips_addresses_and_empty_results():
     fetch = app[app.index("    async fetchMention(q) {"):app.index("\n    pickMention(i) {")]
     assert "this.mentionShow = this.mentionResults.length > 0;" in fetch
     assert "this.mentionShow = true;" not in fetch
+
+
+def test_running_footer_elapsed_advances_from_the_history_snapshot():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("    turnFooterElapsed(m, pane) {")
+    body = app[start:app.index("\n    turnFooterModel(", start)]
+    assert "this._runningSnapshotElapsed(m, pane)" in body
+    assert "museRunningElapsedAnchors.get(m)" in body
+    assert "anchor.snapshot !== snapshot" in body
+    assert "snapshot + Math.max(0, (now - anchor.at) / 1000)" in body

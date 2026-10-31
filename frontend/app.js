@@ -4,6 +4,8 @@ let museEditor = null;
 let museEditorPreview = { version: 0, blocks: [], scrollTargets: {}, patching: false };
 const museEditorAssets = new Map();
 const museRichMessages = new WeakMap();
+// Running footers: when each row's server elapsed snapshot was first seen.
+const museRunningElapsedAnchors = new WeakMap();
 const museTranscriptPerf = new Map();
 // One bounded worker, shared by history decoration and code highlighting.
 // A stalled parser is terminated; the complete plain text remains readable.
@@ -5086,11 +5088,29 @@ function portal() {
     turnFooterElapsed(m, pane) {
       const value = this.turnFooterStatus(m, pane) === "running"
         ? Math.max(
-            Number((m && m.elapsed) || 0),
+            this._runningSnapshotElapsed(m, pane),
             Number((pane && pane.streamElapsed) || 0),
           )
         : Number(m && m.elapsed);
       return Number.isFinite(value) && value >= 0 ? value : null;
+    },
+    // A running tail loaded from history carries the server's elapsed at read
+    // time. The pane timer can start later (reconnect, background attach), so
+    // max(snapshot, timer) froze on the snapshot and jumped at each reload.
+    // Advance the snapshot by browser time since it was first seen; that needs
+    // no server/browser clock agreement. Reading pane.streamElapsed keeps the
+    // 1s re-render.
+    _runningSnapshotElapsed(m, pane) {
+      const snapshot = Number((m && m.elapsed) || 0);
+      if (!(snapshot > 0) || !m || typeof m !== "object") return 0;
+      void (pane && pane.streamElapsed);
+      const now = Date.now();
+      let anchor = museRunningElapsedAnchors.get(m);
+      if (!anchor || anchor.snapshot !== snapshot) {
+        anchor = { snapshot, at: now };
+        museRunningElapsedAnchors.set(m, anchor);
+      }
+      return snapshot + Math.max(0, (now - anchor.at) / 1000);
     },
     turnFooterModel(m, pane, sid) {
       const stored = String((m && m.model) || "");
