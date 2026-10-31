@@ -6626,3 +6626,34 @@ def test_mention_picker_skips_addresses_and_empty_results():
     fetch = app[app.index("    async fetchMention(q) {"):app.index("\n    pickMention(i) {")]
     assert "this.mentionShow = this.mentionResults.length > 0;" in fetch
     assert "this.mentionShow = true;" not in fetch
+
+
+def test_running_footer_start_comes_from_the_server_running_tail():
+    """A refresh mid-continuation must not restart the footer at 1s."""
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("    _adoptRunningTurnStart(sid, source) {")
+    helper = app[start:app.index("\n    _historyEnvelopes(sid, list) {", start)]
+    assert "Date.now() - elapsed * 1000" in helper
+    assert "st._runningTurnStartHint = startedAt;" in helper
+    assert "st._runningTurnStartHint = 0;" in helper
+    assert "startedAt < st._streamStartedAt - 1000" in helper
+    # The background-task timer (no live stream) must be corrected too.
+    assert "st._streamTimer && st._streamStartedAt" in helper
+    assert "(st.streaming || st.es) && st._streamStartedAt" not in helper
+    assert "(st._runningTurnStartHint || Date.now())" in app
+    envelopes = app[app.index("    _historyEnvelopes(sid, list) {"):]
+    assert envelopes.index("this._adoptRunningTurnStart(sid, source);") < 200
+    assert ("if (isContinuation) _streamStartMs = "
+            "streamState._runningTurnStartHint || Date.now();") in app
+    assert "if (isContinuation) _streamStartMs = Date.now();" not in app
+    # Every place that ends the live turn forgets the hint.
+    assert app.count("_runningTurnStartHint = 0;") >= 5
+
+
+def test_running_footer_without_pane_timer_uses_shared_clock():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("    turnFooterElapsed(m, pane) {")
+    body = app[start:app.index("\n    turnFooterModel(", start)]
+    assert "this._clockedRunningElapsed(pane)" in body
+    assert "if (!startedAt || pane._streamTimer) return 0;" in body
+    assert "if (!museFooterClockTimer) {" in body
