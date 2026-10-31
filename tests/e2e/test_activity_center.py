@@ -2411,3 +2411,51 @@ def test_ungrouped_uses_latest_activity_despite_saved_manual_positions(page, bac
     open_groups()
     expect(lane(re.compile('未分组|Ungrouped')).locator('.activity-session-name')).to_have_text(
         ['Old fixture', 'Newest fixture', 'Middle fixture'])
+
+
+def test_finished_row_shows_streaming_dot_while_session_still_streams(
+    page: Page, backend_url, auth_token,
+):
+    """A same-session background reaction streams after the human row closed.
+
+    2026-10-31: the row stayed "completed" with no dot while the session tab
+    showed the blue streaming dot.  The row must light up like the tab.
+    """
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app._stopActivityEvents();
+          await Promise.allSettled(Object.values(app._activityFetchPromises || {}));
+          app.refreshSessions = async () => {};
+          app.fetchActivity = async () => true;
+          const row = (id, name) => ({
+            id: id + '-row', kind: 'turn', session_id: id, session_name: name,
+            task_summary: 'Write the report', workspace: '/tmp/e2e',
+            workspace_name: 'e2e', state: 'completed', read: true,
+            started_at: 100, finished_at: 200, updated_at: 200,
+          });
+          app.sessions = [
+            {id: 'live-session', name: 'Live reaction', turn_active: true,
+             active: true, background_active: false, updated_at: 200},
+            {id: 'idle-session', name: 'Idle session', turn_active: false,
+             active: false, background_active: false, updated_at: 200},
+          ];
+          app.activity.viewLoaded = true;
+          app.activity.view = 'timeline';
+          app.activity.events = [row('live-session', 'Live reaction'),
+                                 row('idle-session', 'Idle session')];
+          void app.openActivityCenter();
+        }"""
+    )
+    live = page.locator(".activity-row").filter(has_text="Live reaction")
+    idle = page.locator(".activity-row").filter(has_text="Idle session")
+    expect(live).to_have_class(re.compile(r"\bsession-streaming\b"))
+    expect(idle).not_to_have_class(re.compile(r"\bsession-streaming\b"))
+    dots = page.evaluate(
+        """() => Object.fromEntries([...document.querySelectorAll('.activity-row')]
+            .map(row => [row.querySelector('.activity-session-name').textContent.trim(),
+                         getComputedStyle(row.querySelector('.activity-state-dot')).visibility]))"""
+    )
+    assert dots == {"Live reaction": "visible", "Idle session": "hidden"}, dots
