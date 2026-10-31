@@ -6628,11 +6628,19 @@ def test_mention_picker_skips_addresses_and_empty_results():
     assert "this.mentionShow = true;" not in fetch
 
 
-def test_running_footer_elapsed_advances_from_the_history_snapshot():
+def test_running_footer_start_comes_from_the_server_running_tail():
+    """A refresh mid-continuation must not restart the footer at 1s."""
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
-    start = app.index("    turnFooterElapsed(m, pane) {")
-    body = app[start:app.index("\n    turnFooterModel(", start)]
-    assert "this._runningSnapshotElapsed(m, pane)" in body
-    assert "museRunningElapsedAnchors.get(m)" in body
-    assert "anchor.snapshot !== snapshot" in body
-    assert "snapshot + Math.max(0, (now - anchor.at) / 1000)" in body
+    start = app.index("    _adoptRunningTurnStart(sid, source) {")
+    helper = app[start:app.index("\n    _historyEnvelopes(sid, list) {", start)]
+    assert "Date.now() - elapsed * 1000" in helper
+    assert "st._runningTurnStartHint = startedAt;" in helper
+    assert "st._runningTurnStartHint = 0;" in helper
+    assert "startedAt < st._streamStartedAt - 1000" in helper
+    envelopes = app[app.index("    _historyEnvelopes(sid, list) {"):]
+    assert envelopes.index("this._adoptRunningTurnStart(sid, source);") < 200
+    assert ("if (isContinuation) _streamStartMs = "
+            "streamState._runningTurnStartHint || Date.now();") in app
+    assert "if (isContinuation) _streamStartMs = Date.now();" not in app
+    # Every place that ends the live turn forgets the hint.
+    assert app.count("_runningTurnStartHint = 0;") >= 5

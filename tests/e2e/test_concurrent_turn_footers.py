@@ -223,14 +223,14 @@ def test_live_footer_survives_a_tail_window_without_the_turn_user(
     _assert_no_browser_errors(page, errors)
 
 
-def test_running_footer_elapsed_keeps_ticking_from_a_history_snapshot(
+def test_running_footer_keeps_the_server_start_after_history_and_new_rows(
     page, backend_url, auth_token,
 ):
-    """A history tail carries the server's elapsed at read time.
+    """2026-10-31: a refresh mid-continuation restarted the footer at 1s.
 
-    2026-10-31: the pane timer started later than the turn, so the footer
-    showed max(snapshot, timer) = the frozen snapshot and only jumped when
-    the next reload brought a new one.  It must advance every second.
+    The history tail says the turn has run 600s. The pane timer started just
+    now, as a continuation reconnect does. The footer must show ~10m, keep
+    ticking, and keep that start on a live row appended afterwards.
     """
     errors = _capture_browser_errors(page)
     page.set_viewport_size({"width": 1440, "height": 900})
@@ -241,21 +241,20 @@ def test_running_footer_elapsed_keeps_ticking_from_a_history_snapshot(
         app.conciseChat = false;
         const sid = app.currentId, st = app._ensureTabState(sid);
         st._loaded = true;
-        st.messages = [
-          {role: 'tool_use', name: 'Bash', summary: 'sleep 90',
-           input: {command: 'sleep 90'}, id: 'snap-use', uuid: 'snap-use',
-           _k: 'snap-use', turn_status: 'running', elapsed: 600,
-           turn_started_at: Date.now() - 600000},
-        ];
-        Object.assign(st.messageRange, {
-          offset: 300, total: 301, visibleStart: 0, visibleEnd: 1,
-        });
         st.streaming = true;
         st._streamStartedAt = Date.now();
         st.streamElapsed = 0;
         st._streamTimer = setInterval(() => {
           st.streamElapsed = (Date.now() - st._streamStartedAt) / 1000;
         }, 1000);
+        st.messages = app._historyEnvelopes(sid, [
+          {role: 'tool_use', name: 'Bash', summary: 'sleep 90',
+           input: {command: 'sleep 90'}, id: 'snap-use', uuid: 'snap-use',
+           turn_status: 'running', elapsed: 600},
+        ]);
+        Object.assign(st.messageRange, {
+          offset: 300, total: 301, visibleStart: 0, visibleEnd: 1,
+        });
         app._activateTabState(sid);
         st.messagesReady = true;
         """,
@@ -264,6 +263,28 @@ def test_running_footer_elapsed_keeps_ticking_from_a_history_snapshot(
     elapsed = page.locator(
         f'.msg-pane[data-tid="{sid}"] .turn-footer:visible .msg-elapsed')
     expect(elapsed).to_have_text(re.compile(r"· 10m0[0-2]s"))
-    # Same row object, same snapshot: the label must move on its own.
     expect(elapsed).to_have_text(re.compile(r"· 10m0[4-9]s"), timeout=8000)
+    # A live row without its own elapsed must not fall back to a fresh start.
+    _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(app.currentId);
+        st.messages.push({role: 'tool_result', id: 'snap-use', tool_name: 'Bash',
+          preview: 'done', uuid: 'live-result', _k: 'live-result'});
+        st.messageRange.total += 1;
+        st.messageRange.visibleEnd = st.messages.length;
+        """,
+    )
+    expect(page.locator(f'.msg-pane[data-tid="{sid}"] .msg')).to_have_count(2)
+    expect(elapsed).to_have_text(re.compile(r"· 10m(0[4-9]|1\d)s"))
+    # Once history reports the turn ended, the hint is forgotten.
+    hint = _app_eval(
+        page,
+        """
+        const sid = app.currentId, st = app._ensureTabState(sid);
+        app._adoptRunningTurnStart(sid, [{turn_status: 'completed', elapsed: 700}]);
+        return st._runningTurnStartHint;
+        """,
+    )
+    assert hint == 0
     _assert_no_browser_errors(page, errors)

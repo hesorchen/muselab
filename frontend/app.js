@@ -4,8 +4,6 @@ let museEditor = null;
 let museEditorPreview = { version: 0, blocks: [], scrollTargets: {}, patching: false };
 const museEditorAssets = new Map();
 const museRichMessages = new WeakMap();
-// Running footers: when each row's server elapsed snapshot was first seen.
-const museRunningElapsedAnchors = new WeakMap();
 const museTranscriptPerf = new Map();
 // One bounded worker, shared by history decoration and code highlighting.
 // A stalled parser is terminated; the complete plain text remains readable.
@@ -322,6 +320,7 @@ const _EMPTY_ACTIVE_SESSION_PANE = Object.freeze({
   streamElapsed: 0,
   _streamTimer: null,
   _streamStartedAt: 0,
+  _runningTurnStartHint: 0,
   sessionUsage: _EMPTY_SESSION_USAGE,
   pendingQueue: Object.freeze([]),
   _queueAdmission: null,
@@ -5088,29 +5087,11 @@ function portal() {
     turnFooterElapsed(m, pane) {
       const value = this.turnFooterStatus(m, pane) === "running"
         ? Math.max(
-            this._runningSnapshotElapsed(m, pane),
+            Number((m && m.elapsed) || 0),
             Number((pane && pane.streamElapsed) || 0),
           )
         : Number(m && m.elapsed);
       return Number.isFinite(value) && value >= 0 ? value : null;
-    },
-    // A running tail loaded from history carries the server's elapsed at read
-    // time. The pane timer can start later (reconnect, background attach), so
-    // max(snapshot, timer) froze on the snapshot and jumped at each reload.
-    // Advance the snapshot by browser time since it was first seen; that needs
-    // no server/browser clock agreement. Reading pane.streamElapsed keeps the
-    // 1s re-render.
-    _runningSnapshotElapsed(m, pane) {
-      const snapshot = Number((m && m.elapsed) || 0);
-      if (!(snapshot > 0) || !m || typeof m !== "object") return 0;
-      void (pane && pane.streamElapsed);
-      const now = Date.now();
-      let anchor = museRunningElapsedAnchors.get(m);
-      if (!anchor || anchor.snapshot !== snapshot) {
-        anchor = { snapshot, at: now };
-        museRunningElapsedAnchors.set(m, anchor);
-      }
-      return snapshot + Math.max(0, (now - anchor.at) / 1000);
     },
     turnFooterModel(m, pane, sid) {
       const stored = String((m && m.model) || "");
@@ -9121,6 +9102,7 @@ function portal() {
         streamElapsed: 0,
         _streamTimer: null,
         _streamStartedAt: 0,
+        _runningTurnStartHint: 0,
         _streamRichRenderCount: 0,
         _streamPlainRenderCount: 0,
         _deferredStreamRich: [],
@@ -13864,6 +13846,7 @@ function portal() {
       st._serverActiveObserved = false;
       st.streamElapsed = 0;
       st._streamStartedAt = 0;
+      st._runningTurnStartHint = 0;
     },
 
     // Central brake on transparent reconnects. Incremental resume makes the
@@ -20384,8 +20367,35 @@ function portal() {
       this._queueHistoryRichRender(message, sid);
       return true;
     },
+    // A running tail from history carries the server's elapsed at read time.
+    // Turn it into a browser-clock start (no server/browser clock agreement
+    // needed). A continuation reconnect has no truthful start of its own and
+    // used Date.now(), so a refresh restarted the footer at 1s; an earlier
+    // attach left the timer behind the snapshot. Pane-level, so live rows
+    // appended afterwards keep the same start.
+    _adoptRunningTurnStart(sid, source) {
+      const st = sid && this.tabState && this.tabState[sid];
+      const tail = Array.isArray(source) ? source[source.length - 1] : null;
+      if (!st || !tail || !tail.turn_status) return;
+      if (tail.turn_status !== "running") {
+        // The turn this hint described has ended; a later reaction must not
+        // inherit its start.
+        st._runningTurnStartHint = 0;
+        return;
+      }
+      const elapsed = Number(tail.elapsed);
+      if (!(elapsed > 0)) return;
+      const startedAt = Date.now() - elapsed * 1000;
+      st._runningTurnStartHint = startedAt;
+      if ((st.streaming || st.es) && st._streamStartedAt
+          && startedAt < st._streamStartedAt - 1000) {
+        st._streamStartedAt = startedAt;
+        st.streamElapsed = elapsed;
+      }
+    },
     _historyEnvelopes(sid, list) {
       const source = list || [];
+      this._adoptRunningTurnStart(sid, source);
       const renderKeys = source.map(m => this._historyMessageKey(sid, m));
       const uniqueKeys = new Set();
       for (const key of renderKeys) {
@@ -35104,7 +35114,7 @@ function portal() {
       // Fresh (non-reconnect) sends always start at now.
       let _streamStartMs;
       if (isReconnect) {
-        if (isContinuation) _streamStartMs = Date.now();
+        if (isContinuation) _streamStartMs = streamState._runningTurnStartHint || Date.now();
         else if (opts.startedAt) _streamStartMs = opts.startedAt * 1000;
         else if (streamState._streamStartedAt) _streamStartMs = streamState._streamStartedAt;
         else _streamStartMs = Date.now();
@@ -35159,6 +35169,7 @@ function portal() {
         streamState._streamOwnerToken = "";
         streamState.streamPhase = "";
         streamState._continuationAwaitingReaction = false;
+        streamState._runningTurnStartHint = 0;
         streamState.es = null;
         streamState._streamStartController = null;
         streamState._cancelBeforeStream = false;
@@ -35709,6 +35720,7 @@ function portal() {
             streamState._streamTimer = null;
           }
           streamState._streamStartedAt = 0;
+          streamState._runningTurnStartHint = 0;
           streamState.streamElapsed = 0;
           return;
         }
@@ -36303,6 +36315,7 @@ function portal() {
         streamState._streamOwnerToken = "";
         streamState.streamPhase = "";
         streamState._continuationAwaitingReaction = false;
+        streamState._runningTurnStartHint = 0;
         streamState.es = null;
         if (streamState._flushLivePresentation === flushLivePresentation) {
           streamState._flushLivePresentation = null;
