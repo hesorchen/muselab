@@ -14570,6 +14570,7 @@ function portal() {
       if (!this._confirmLoseEdits()) return false;
       const previous = this.activeWorkspace;
       if (previous) this._captureWorkspaceSurface(previous);
+      this._captureChatPosition(this.currentId);
       this._stopFileEvents(false);
       this._teardownTerminalView();
       this.terminals = [];
@@ -15325,7 +15326,7 @@ function portal() {
           await this._pullSessionList(false, id);
           if (!this.sessions.find(s => s.id === id)) return false;
         }
-        await this.activateTab(id);
+        await this.activateTab(id, { keepPosition: true });
         if (this.currentId !== id) return false;
         // activateTab intentionally no-ops when the requested tab is already
         // current. Activity/deep-link navigation must still reveal chat on
@@ -17656,9 +17657,14 @@ function portal() {
       return q ? `📦 Compacting… queued ${q}` : "📦 Compacting…";
     },
 
-    async activateTab(tid) {
+    async activateTab(tid, options = {}) {
       if (tid === this.currentId) {
         const st = this._ensureTabState(tid);
+        // A deep link (task center, notification, ?session=) into the session
+        // that is already open must not move a reader who is mid-history. The
+        // tab strip still means "jump to latest" on a click of the active tab.
+        const keepPosition = !!options.keepPosition && this.isAwayFromLatest(tid);
+        if (keepPosition) this._captureChatPosition(tid);
         const meta = (this.sessions || []).find(session => session.id === tid);
         const canonicalCount = Math.max(
           0, Number(meta && meta.message_count) || 0);
@@ -17675,6 +17681,12 @@ function portal() {
         this._ensureNonEmptyMessageRange(st);
         st.messagesReady = true;
         this._touchTranscriptPane(tid);
+        if (keepPosition) {
+          // The anchor was only for a quiet reload above; the reader has not
+          // left, so do not let a later switch apply this stale spot.
+          st._readingAnchor = null;
+          return;
+        }
         await this.returnToLatest(tid);
         return;
       }
@@ -18885,10 +18897,10 @@ function portal() {
       if (activatedState) {
         this._scheduleDeferredStreamRich(this.currentId, activatedState);
       }
-      // Selecting a conversation means opening its latest state, not restoring a
-      // stale historical viewport. Reader-controlled position is preserved only
-      // while staying inside the same active tab; every explicit tab selection
-      // re-engages tail follow before loading/remounting the pane.
+      // Selecting a conversation reopens where the reader left it: the saved
+      // reading anchor (see _captureChatPosition) when they were mid-history,
+      // otherwise the latest state with tail follow re-engaged before the
+      // loading/remounting of the pane.
       const selectedState = this._ensureTabState(this.currentId);
       this._enforceMessageRangeInvariant(selectedState);
       this.ackCurrentActivity();
@@ -18957,9 +18969,10 @@ function portal() {
           this.$nextTick(() => {
             if (this.currentId !== target || this.tabState[target] !== stCur) return;
             // This callback runs after x-show has exposed the warm target pane.
-            // Explicit selection means latest: acquire the logical tail before
-            // any physical scroll so a middle DOM window cannot masquerade as it.
-            void this.returnToLatest(target);
+            // A reader who left mid-history resumes at that message; otherwise
+            // acquire the logical tail before any physical scroll so a middle
+            // DOM window cannot masquerade as it.
+            void this._enterSessionPosition(target);
           });
         } else {
           // Cold LRU miss: canonical data is resident, but Alpine must reconstruct
@@ -18983,7 +18996,7 @@ function portal() {
                 return;
               }
               try {
-                const latest = await this.returnToLatest(target);
+                const latest = await this._enterSessionPosition(target);
                 if (!latest) {
                   this._failTranscriptLoad(mountToken);
                   return;
@@ -19342,7 +19355,7 @@ function portal() {
           st.transcriptLoadPhase = "idle";
         }
         if (loaded && quiet && sid === this.currentId) {
-          try { return await this.returnToLatest(sid); }
+          try { return await this._enterSessionPosition(sid); }
           catch (_) { return false; }
         }
         return !!loaded;
@@ -21349,6 +21362,29 @@ function portal() {
         return false;
       } finally {
         st._loadingLater = false;
+      }
+    },
+    // One viewport of lookahead, as for the later edge, so the preceding page
+    // is mounted before the reader reaches the physical top.
+    _chatNearEarlierEdge(el) {
+      return !!el && el.scrollTop < Math.max(el.clientHeight, 200);
+    },
+    _userScrolledTowardEarlier(st) {
+      return !!st && !!st._scrollTowardEarlierAt
+        && st._scrollTowardEarlierAt === st._userScrollAt
+        && Date.now() - st._userScrollAt < 2500;
+    },
+    async _autoLoadEarlier(sid) {
+      const st = sid && this.tabState && this.tabState[sid];
+      if (!st || sid !== this.currentId || st._loadingEarlier
+          || !this.hasMoreHistory(sid)
+          || Date.now() < (st._autoEarlierBlockedUntil || 0)) return;
+      const before = this.earlierMessageCount(sid);
+      await this.loadEarlierMessages(sid);
+      // A load that revealed nothing (offline, server error) must not refire
+      // on every scroll event near the top; the button stays for a manual retry.
+      if (this.tabState[sid] === st && this.earlierMessageCount(sid) >= before) {
+        st._autoEarlierBlockedUntil = Date.now() + 5000;
       }
     },
     _chatNearLaterEdge(el) {
@@ -34014,6 +34050,83 @@ function portal() {
       const el = this._chatBodyElement();
       if (!st || !el || sid !== this.currentId) return;
       st.scrollTop = el.scrollTop;
+      // Leaving a session mid-history remembers the first visible message and
+      // its offset from the viewport top. Message identity survives the pane
+      // remount and the shared scroller's height change that a raw scrollTop
+      // does not. A reader parked at the tail records nothing and keeps
+      // following the latest message.
+      if (!this.isAwayFromLatest(sid)) {
+        st._readingAnchor = null;
+        return;
+      }
+      // A workspace switch unmounts this pane before openTab captures again;
+      // an unmounted pane has no geometry, so keep the anchor taken while it
+      // was still on screen instead of overwriting it with nothing.
+      const anchor = this._captureReadingAnchor(el, sid);
+      if (anchor) st._readingAnchor = anchor;
+    },
+    _captureReadingAnchor(el, sid) {
+      const anchor = this._captureViewportMessageAnchor(el, sid);
+      const msg = anchor && this._messageElement(sid, anchor.key);
+      if (!msg) return null;
+      return { key: anchor.key, offset: this._layoutTopIn(msg, el) };
+    },
+    // Top of `msg` below the scroller's top edge, ignoring any transform. A
+    // revealed pane replays the `msg-in` entrance (translateY(4px) -> none), and
+    // pinning to the mid-animation rect would leave the message 4px off once it
+    // settles.
+    _layoutTopIn(msg, scroller) {
+      let shift = 0;
+      try {
+        shift = Number(new DOMMatrixReadOnly(
+          getComputedStyle(msg).transform).m42) || 0;
+      } catch (_) { /* no transform support: use the plain rect */ }
+      return msg.getBoundingClientRect().top - shift
+        - scroller.getBoundingClientRect().top;
+    },
+    // Selecting a session reopens where the reader left it, or the latest
+    // message when they were following the tail (or the spot cannot be found).
+    async _enterSessionPosition(sid) {
+      const st = sid && this.tabState && this.tabState[sid];
+      const anchor = st && st._readingAnchor;
+      if (st) st._readingAnchor = null;
+      if (anchor && st.atBottom === false && this.currentId === sid
+          && this._restoreReadingAnchor(sid, st, anchor)) return true;
+      return this.returnToLatest(sid);
+    },
+    _restoreReadingAnchor(sid, st, anchor) {
+      const el = this._chatBodyElement();
+      if (!el || !anchor || !this._messageElement(sid, anchor.key)) return false;
+      const userScrollAt = Number(st._userScrollAt) || 0;
+      const apply = () => {
+        const msg = this._messageElement(sid, anchor.key);
+        if (!msg) return 0;
+        const delta = this._layoutTopIn(msg, el) - anchor.offset;
+        if (Math.abs(delta) >= 1) el.scrollTop += delta;
+        return delta;
+      };
+      apply();
+      // `.msg` uses content-visibility:auto, so the rows above the anchor
+      // realize their real heights after the first scroll. Keep the anchored
+      // message pinned until two consecutive frames agree, and stop as soon as
+      // the reader moves or leaves.
+      let frames = 0;
+      let stable = 0;
+      const step = () => {
+        if (this.currentId !== sid || this.tabState[sid] !== st
+            || st.atBottom !== false
+            || (Number(st._userScrollAt) || 0) !== userScrollAt) return;
+        stable = Math.abs(apply()) < 1 ? stable + 1 : 0;
+        if (stable < 2 && ++frames < 30) {
+          requestAnimationFrame(step);
+          return;
+        }
+        st.scrollTop = el.scrollTop;
+        this._scheduleMessageViewportSync(sid);
+      };
+      requestAnimationFrame(step);
+      this._scheduleMessageViewportSync(sid);
+      return true;
     },
     _restoreChatPosition(sid = this.currentId) {
       const st = sid && this.tabState && this.tabState[sid];
@@ -34033,6 +34146,7 @@ function portal() {
       const st = this.currentId && this.tabState && this.tabState[this.currentId];
       const pointer = this._chatPointerScroll;
       let movedTowardLatest = false;
+      let movedTowardEarlier = false;
       if (st && pointer?.sid === this.currentId
           && Math.abs(el.scrollTop - pointer.top) > 1) {
         const direction = el.scrollTop > pointer.top ? 1 : -1;
@@ -34046,6 +34160,7 @@ function portal() {
         const previousAt = Number(st._lastVirtualScrollAt) || now;
         const delta = el.scrollTop - previousTop;
         movedTowardLatest = delta > 1;
+        movedTowardEarlier = delta < -1;
         const elapsed = Math.max(8, now - previousAt);
         st._virtualScrollDirection = delta < -1 ? -1 : (delta > 1 ? 1 : st._virtualScrollDirection);
         st._virtualScrollVelocity = Math.min(20000, Math.abs(delta) * 1000 / elapsed);
@@ -34056,6 +34171,12 @@ function portal() {
         // made long-session scrolling compete with the gesture itself.
       }
       this._scheduleMessageViewportSync(this.currentId);
+      // Reaching the top loads the preceding page. Only a recent upward user
+      // gesture owns this; layout and restore scrolls never page by themselves.
+      if (st && movedTowardEarlier && this._userScrolledTowardEarlier(st)
+          && this._chatNearEarlierEdge(el)) {
+        void this._autoLoadEarlier(this.currentId);
+      }
       // While WE are programmatically pinning to the bottom (the settle loop),
       // every per-frame `scrollTop = scrollHeight` fires this handler. Its
       // geometry read (scrollHeight/clientHeight) forces a synchronous reflow,
@@ -34120,6 +34241,7 @@ function portal() {
       st._userScrollAt = this._userScrollAt;
       if (direction > 0) {
         st._scrollTowardLatestAt = st._userScrollAt;
+        st._scrollTowardEarlierAt = 0;
         // At the physical bottom another wheel/touch gesture need not produce
         // a scroll event. It must still be able to reveal pending local messages.
         const body = this._chatBodyElement();
@@ -34132,6 +34254,12 @@ function portal() {
         return;
       }
       st._scrollTowardLatestAt = 0;
+      st._scrollTowardEarlierAt = st._userScrollAt;
+      // The wheel/touch/key that starts at the physical top produces no scroll
+      // event, so it has to be able to page on its own.
+      if (this._chatNearEarlierEdge(this._chatBodyElement())) {
+        void this._autoLoadEarlier(this.currentId);
+      }
       if (st.atBottom !== false && !this._messageRangeHasLater(st)) {
         st._pausedTailKey = st.messages[st.messageRange.visibleEnd - 1]?._k || "";
       }

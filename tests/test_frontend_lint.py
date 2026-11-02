@@ -2442,7 +2442,7 @@ def test_task_rows_force_targeted_session_lookup_and_activate_the_linked_workspa
     # must deterministically follow it with an id-bearing request.
     assert "await this._pullSessionList(false, id)" in deep
     assert "if (!this.sessions.find(s => s.id === id)) return false" in deep
-    assert "await this.activateTab(id)" in deep
+    assert "await this.activateTab(id, { keepPosition: true })" in deep
     assert "if (this.currentId !== id) return false" in deep
     assert 'this.setMobileTab("chat")' in deep
 
@@ -3943,14 +3943,14 @@ def test_warm_transcript_panes_skip_remount_skeleton_and_full_highlight():
     warm = switch[warm_start:cold_start]
 
     assert "stCur.messagesReady = true" in warm
-    assert "this.returnToLatest(target)" in warm
+    assert "this._enterSessionPosition(target)" in warm
     assert "this._scrollChatTailNow(target, stCur)" not in warm
     assert "messagesReady = false" not in warm
     assert "highlightCode" not in warm
     cold = switch[cold_start:]
     assert "stCur.messagesReady = false" in cold
-    assert cold.index("stCur.messagesReady = true") < cold.index("this.returnToLatest(target)")
-    assert cold.index("this.returnToLatest(target)") < cold.index("this._afterPaint(() =>")
+    assert cold.index("stCur.messagesReady = true") < cold.index("this._enterSessionPosition(target)")
+    assert cold.index("this._enterSessionPosition(target)") < cold.index("this._afterPaint(() =>")
     assert 'x-for="tid in warmTranscriptTabIds()"' in html
     assert 'x-show="tid === currentId"' in html
 
@@ -3976,18 +3976,32 @@ def test_tab_selection_and_layout_changes_share_one_tail_follow_controller():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
 
-    activate_start = app.index("    async activateTab(tid) {")
+    activate_start = app.index("    async activateTab(tid, options = {}) {")
     activate_end = app.index("    _scrollTabIntoView(tid) {", activate_start)
     activate = app[activate_start:activate_end]
     assert "if (tid === this.currentId)" in activate
     assert "await this.returnToLatest(tid)" in activate
+    assert "options.keepPosition" in activate
 
     switch_start = app.index("    async switchSession() {")
     switch_end = app.index("    _afterPaint(fn) {", switch_start)
     switch = app[switch_start:switch_end]
     assert "selectedState.atBottom = true" not in switch
-    assert "await this.returnToLatest(target)" in switch
-    assert switch.count("this.returnToLatest(target)") >= 2
+    # Selecting a session reopens where the reader left it, or at the tail.
+    assert "await this._enterSessionPosition(target)" in switch
+    assert switch.count("this._enterSessionPosition(target)") >= 2
+    enter_start = app.index("    async _enterSessionPosition(sid) {")
+    enter = app[enter_start:app.index("    _restoreReadingAnchor(", enter_start)]
+    assert "st.atBottom === false" in enter
+    assert "return this.returnToLatest(sid)" in enter
+    capture_start = app.index("    _captureChatPosition(sid = this.currentId) {")
+    capture = app[capture_start:app.index("    _captureReadingAnchor(", capture_start)]
+    assert "if (!this.isAwayFromLatest(sid))" in capture
+    # An unmounted pane (workspace switch) must keep the anchor taken earlier.
+    assert "if (anchor) st._readingAnchor = anchor;" in capture
+    deeplink_start = app.index("    async _openSessionFromDeeplink(id, workspace = \"\") {")
+    deeplink = app[deeplink_start:app.index("    // Close a tab.", deeplink_start)]
+    assert "this.activateTab(id, { keepPosition: true })" in deeplink
     assert "this._scrollChatTailNow(target, stCur)" not in switch
     assert "this._restoreChatPosition(target)" not in switch
 
@@ -4044,14 +4058,25 @@ def test_history_paging_uses_smaller_mobile_pages_only_on_user_request():
     scroll_start = app.index("    onChatScroll() {")
     scroll_end = app.index("    // Stamp the last genuine user scroll gesture", scroll_start)
     scroll = app[scroll_start:scroll_end]
+    # Reaching the top pages the preceding history, but only on a recent upward
+    # user gesture; layout/restore scrolls never page by themselves.
     assert "loadEarlierMessages(" not in scroll
     assert "_scheduleTransparentHistory(" not in scroll
+    assert "this._userScrolledTowardEarlier(st)" in scroll
+    assert "this._chatNearEarlierEdge(el)" in scroll
+    assert "void this._autoLoadEarlier(this.currentId)" in scroll
     # Jumped windows continue forward on a downward user gesture only.
     assert "st._scrollTowardLatestAt === st._userScrollAt" in scroll
     assert "void this._revealLaterHistory(this.currentId)" in scroll
     intent_start = app.index("    _applyChatScrollIntent(direction) {")
     intent = app[intent_start:app.index("    _userScrollIntent(ev) {", intent_start)]
     assert "void this._revealLaterHistory(this.currentId)" in intent
+    assert "void this._autoLoadEarlier(this.currentId)" in intent
+    auto_start = app.index("    async _autoLoadEarlier(sid) {")
+    auto = app[auto_start:app.index("    _chatNearLaterEdge(el) {", auto_start)]
+    assert "st._loadingEarlier" in auto
+    assert "_autoEarlierBlockedUntil" in auto
+    assert "await this.loadEarlierMessages(sid)" in auto
     reveal_start = app.index("    async _revealLaterHistory(sid) {")
     reveal = app[reveal_start:app.index("    _chatNearLaterEdge(el) {", reveal_start)]
     assert "st._loadingLater || st.streaming || st.es" in reveal
@@ -4372,7 +4397,7 @@ def test_cold_history_reveal_never_marks_a_nonempty_session_with_an_empty_range(
     assert "if (loadedButBehindCanonical) st._pendingExternalUpdate = true" in switch
     assert "await this._ensureSessionLoaded(target);" in switch
 
-    activate_start = app.index("async activateTab(tid)")
+    activate_start = app.index("async activateTab(tid, options = {})")
     activate_end = app.index("_scrollTabIntoView(tid)", activate_start)
     activate = app[activate_start:activate_end]
     assert "if (tid === this.currentId)" in activate
@@ -6170,7 +6195,7 @@ def test_completed_turn_reconciliation_survives_a_new_stream_owner():
 
 def test_tab_activation_checks_canonical_installation_watermark():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
-    activate_start = app.index("    async activateTab(tid) {")
+    activate_start = app.index("    async activateTab(tid, options = {}) {")
     activate_end = app.index("\n    _scrollTabIntoView", activate_start)
     activate = app[activate_start:activate_end]
     switch_start = app.index("    async switchSession() {")

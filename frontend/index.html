@@ -2093,10 +2093,11 @@
             </div>
           </template>
 
-          <!-- Long histories are count-paged explicitly. The browser receives and
-               mounts only the newest 100 canonical blocks until the reader asks
-               for the preceding page; reaching the top never starts background
-               history work. -->
+          <!-- Long histories are count-paged. The browser receives and mounts
+               only the newest 100 canonical blocks; scrolling up to the top
+               edge loads the preceding page automatically (_autoLoadEarlier).
+               The button stays as the visible progress state and as a manual
+               retry when a load fails or the content is too short to scroll. -->
           <div x-show="hasMoreHistory()" class="load-earlier-wrap">
             <button type="button"
                     class="load-earlier-btn"
