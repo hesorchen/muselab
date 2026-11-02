@@ -6,6 +6,8 @@ MuseLab's optional long-term memory stores durable business context,
 preferences, decisions, and agent experience. It is disabled by default and is
 not a repository-wide file RAG feature.
 
+Besides automatic per-turn recall, the Agent can search, trace, write and correct memories itself through an MCP server named `muselab-memory`, and external CLIs such as Claude Code or Ducc can share the same memory over a stdio bridge. See [Agent-autonomous memory](#agent-autonomous-memory).
+
 ## Architecture
 
 The canonical SQLite Registry retains evidence, Episodes, provenance,
@@ -20,14 +22,14 @@ flowchart LR
     D --> V["Verifier<br/>evidence, conflict, value checks"]
     V -->|"inferred"| R[("SQLite Registry<br/>source of truth: provenance, versions, conflicts, review, jobs")]
     U["Brain button / Memory Center"] -->|"confirmed"| R
-    A["Agent memory tools<br/>write / update / delete"] -->|"inferred + audit"| R
+    A["Agent memory tools (MCP)<br/>write / update / delete"] -->|"inferred + audit"| R
     R -.->|"rebuildable index"| X[("Qdrant / pgvector")]
     R --> H["Hybrid recall<br/>lexical + dense + metadata"]
     X --> H
     H --> C["Bounded, untrusted chat context"]
 ```
 
-Memories are written through three entry points — background dreaming, user confirmation in the UI, and Agent tool calls — all landing in the same Registry.
+Memories are written through three entry points — background dreaming, user confirmation in the UI, and Agent MCP tool calls — all landing in the same Registry. The same MCP tools also provide read-only search (`memory_search`) and evidence tracing (`memory_get_evidence`).
 
 Each user has one logical memory pool. Workspaces, domains, topics, and entities are soft metadata, not isolated memory stores. Rebuild the retrieval index from the Registry after changing the embedding model or vector database.
 
@@ -74,7 +76,7 @@ the discoverable directory while preserving its audit trail.
 
 ## Agent-autonomous memory
 
-In active mode every chat session gets the in-process MCP server `muselab-memory`, so the Agent can call:
+In `active` mode every chat session gets the in-process MCP server `muselab-memory` (it is not attached in `off` / `shadow` mode, and bridge calls then return a "memory is not active" error). Inside the Agent the tools are named `mcp__muselab-memory__<tool>` and are added to the session's allow list, so calls do not prompt for permission. Side-question sessions do not get the server. The Agent can call:
 
 | Tool | Purpose |
 | --- | --- |
@@ -83,6 +85,8 @@ In active mode every chat session gets the in-process MCP server `muselab-memory
 | `memory_write` | Save one durable fact, preference, decision or lesson; exact duplicates are ignored and similar memories are returned for merging |
 | `memory_update` | Correct or rewrite any memory (including user-confirmed ones) as a new `supersedes` version; the old version stays in history |
 | `memory_delete` | Forget a wrong, obsolete or duplicate memory and remove its vector |
+
+`memory_search` results carry a `status` field (`ok` / `partial` / `timeout` / `error`). On `timeout` or `error` the search did not finish and the note says explicitly that this is not a "no match", so the Agent should retry the same query shortly. `partial` means some retrieval channels did not finish and results may be incomplete. "No matching memory" is returned only when the search really found nothing.
 
 The Agent may modify any memory without confirmation. Every write, update and delete is audited (`agent_write` / `agent_update` / `agent_delete`); new versions are `inferred` and carry the session source and the edit reason, so the memory center can inspect and revert them. Tool output is always marked as untrusted background data.
 
@@ -149,6 +153,17 @@ claude mcp add muselab-memory -e MUSELAB_URL=http://127.0.0.1:8765 \
   -e MUSELAB_TOKEN=<token> -e MUSELAB_MEMORY_CLIENT=claude-code -- \
   python3 /path/to/muselab/scripts/muselab_memory_mcp.py
 ```
+
+Environment variables read by the bridge:
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `MUSELAB_URL` | Base URL of the running MuseLab backend | `http://127.0.0.1:8765` |
+| `MUSELAB_TOKEN` | MuseLab access token, sent as `X-Auth-Token` | empty (a 401/403 response hints to check the token) |
+| `MUSELAB_MEMORY_CLIENT` | Client label recorded in the write audit (max 64 chars) | `external` |
+| `MUSELAB_SESSION_ID` | Optional MuseLab session id to attribute writes to | empty |
+
+The bridge only forwards calls, with a 30-second timeout per call. If MuseLab is not running or not in `active` mode, the tool returns an error instead of failing silently. `GET /api/memory/agent/tools` returns the tool names and parameter schemas; web sessions and the bridge share one definition (`backend/memory_tool_specs.py`).
 
 ## Source evidence tracebacks
 

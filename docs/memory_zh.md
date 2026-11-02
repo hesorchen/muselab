@@ -5,6 +5,10 @@
 MuseLab 的长期记忆是默认关闭的可选能力。它面向长期业务背景、偏好、决策和 Agent
 经验，不是“把项目文件全部向量化”的代码库 RAG。
 
+除了每轮自动召回，Agent 还能通过名为 `muselab-memory` 的 MCP 服务主动检索、回溯、写入和更正记忆；
+Claude Code、Ducc 等外部 CLI 也可经 stdio 桥接共用同一份记忆。详见
+[Agent 自主记忆](#agent-自主记忆)。
+
 ## 架构
 
 ```mermaid
@@ -14,14 +18,14 @@ flowchart LR
     D --> V["Verifier<br/>证据、冲突、价值检查"]
     V -->|"inferred"| R[("SQLite Registry<br/>真相源：来源、版本、冲突、审核、队列")]
     U["脑形按钮 / 记忆中心"] -->|"confirmed"| R
-    A["Agent 记忆工具<br/>write / update / delete"] -->|"inferred + 审计"| R
+    A["Agent 记忆工具（MCP）<br/>write / update / delete"] -->|"inferred + 审计"| R
     R -.->|"可重建索引"| X[("Qdrant / pgvector")]
     R --> H["混合召回<br/>lexical + dense + metadata"]
     X --> H
     H --> C["有界、不可信的聊天上下文"]
 ```
 
-写入有三个入口：后台做梦整理、用户在界面确认、Agent 通过工具主动维护，最终都落到同一个 Registry。
+写入有三个入口：后台做梦整理、用户在界面确认、Agent 通过 MCP 工具主动维护，最终都落到同一个 Registry。同一组 MCP 工具也提供只读的检索（`memory_search`）与证据回溯（`memory_get_evidence`）。
 
 一个用户只有一个逻辑记忆池。工作区、业务、主题和实体是软元数据，不是彼此隔绝的
 “记忆空间”。向量数据库只保存可重建的检索索引；切换 Embedding 模型或数据库后可
@@ -83,7 +87,7 @@ stateDiagram-v2
 
 ## Agent 自主记忆
 
-主动模式下，每个聊天会话会挂载进程内 MCP 服务 `muselab-memory`，Agent 可自行调用：
+记忆模式为 `active` 时，每个聊天会话会挂载进程内 MCP 服务 `muselab-memory`（`off`／`shadow` 模式不挂载；外部桥接调用会返回“记忆未启用”错误）。工具在 Agent 侧的完整名称是 `mcp__muselab-memory__<工具名>`，已自动加入该会话的允许列表，调用不会逐次弹出权限确认。侧问（side question）会话不挂载。Agent 可自行调用：
 
 | 工具 | 作用 |
 | --- | --- |
@@ -92,6 +96,8 @@ stateDiagram-v2
 | `memory_write` | 写入一条可长期复用的事实、偏好、决策或经验；完全相同的记忆不重复写入，并返回相近记忆供合并 |
 | `memory_update` | 更正或改写任意记忆（含用户确认过的记忆），生成 `supersedes` 新版本，旧版本保留在历史中 |
 | `memory_delete` | 删除错误、过时或重复的记忆，同时清理向量索引 |
+
+`memory_search` 的返回包含 `status` 字段（`ok`／`partial`／`timeout`／`error`）。`timeout` 或 `error` 表示检索未完成，返回的提示会明确说明“这不是无匹配”，Agent 应稍后重试同一查询；`partial` 表示部分检索通道未完成，结果可能不全；只有真正无命中时才提示“No matching memory”。
 
 Agent 可以不经确认地修改任何记忆。所有写入、更正和删除都会记录审计（`agent_write`／`agent_update`／`agent_delete`），新版本标记为 `inferred` 并附带会话来源与修改原因，可在记忆中心查看和回退。工具返回的内容一律标记为不可信背景数据。
 
@@ -158,6 +164,17 @@ claude mcp add muselab-memory -e MUSELAB_URL=http://127.0.0.1:8765 \
   -e MUSELAB_TOKEN=<token> -e MUSELAB_MEMORY_CLIENT=claude-code -- \
   python3 /path/to/muselab/scripts/muselab_memory_mcp.py
 ```
+
+桥接脚本读取的环境变量：
+
+| 变量 | 作用 | 默认值 |
+| --- | --- | --- |
+| `MUSELAB_URL` | 运行中的 MuseLab 后端地址 | `http://127.0.0.1:8765` |
+| `MUSELAB_TOKEN` | MuseLab 访问 Token，以 `X-Auth-Token` 发送 | 空（返回 401／403 时提示检查 Token） |
+| `MUSELAB_MEMORY_CLIENT` | 写入审计中记录的客户端标签（最长 64 字符） | `external` |
+| `MUSELAB_SESSION_ID` | 可选，把写入归属到指定的 MuseLab 会话 | 空 |
+
+桥接只是转发：单次调用超时 30 秒，MuseLab 未运行或未处于 `active` 模式时工具返回错误，而不是静默失败。`GET /api/memory/agent/tools` 返回工具名与参数 schema，网页会话和桥接使用同一份定义（`backend/memory_tool_specs.py`）。
 
 ## 现场证据回溯
 
