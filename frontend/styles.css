@@ -12634,6 +12634,9 @@ html[data-theme="eyecare"] .tool-error-hint {
 .queue-outbox .msg.user.queued .bubble { width: 100%; max-width: none; box-sizing: border-box; border: 1px solid var(--c-border); background: var(--c-bg-2); color: var(--c-fg-1); opacity: 1; animation: none !important; }
 .queue-outbox .queued-header { color: var(--c-fg-2); border-color: var(--c-border); }
 .queue-outbox .queued-act { color: var(--c-fg-2); }
+.queue-outbox .queued-bubble.is-cancelling .queued-text,
+.queue-outbox .queued-bubble.is-cancelling .queued-attach,
+.queue-outbox .queued-bubble.is-cancelling .queued-quote-list { opacity: .5; }
 .queue-outbox .queued-act:hover { color: var(--c-fg-0); background: var(--c-bg-4); }
 .queue-outbox .queued-text { color: var(--c-fg-1); white-space: pre-wrap; max-height: 90px; overflow-y: auto; overflow-wrap: anywhere; }
 .memory-center-toolbar { display: flex; align-items: center; gap: 8px; }
