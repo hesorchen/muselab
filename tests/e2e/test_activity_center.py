@@ -694,8 +694,10 @@ def test_desktop_timeline_defaults_to_fifteen_rows_in_larger_modal(
 
     modal = page.locator(".activity-modal")
     expect(modal).to_be_visible()
-    expect(page.locator(".activity-row")).to_have_count(15)
-    expect(page.locator(".activity-group-more")).to_have_text("还有 5 条")
+    # The first page is 15 rows, but the ledger is lazy: what fits the visible
+    # area plus the prefetch margin is revealed on its own.
+    expect(page.locator(".activity-row")).to_have_count(20)
+    expect(page.locator(".activity-group-more:visible")).to_have_count(0)
     page.wait_for_timeout(250)
 
     geometry = page.evaluate(
@@ -722,9 +724,7 @@ def test_desktop_timeline_defaults_to_fifteen_rows_in_larger_modal(
     assert geometry["modalTop"] >= 0
     assert geometry["modalBottom"] <= geometry["viewportHeight"]
 
-    page.locator(".activity-group-more").click()
     expect(page.locator(".activity-row")).to_have_count(20)
-    expect(page.locator(".activity-group-more")).to_have_text("收起")
 
     # The larger ledger is desktop-only. The existing phone contract remains
     # a full-width modal with an internally scrolling body.
@@ -771,7 +771,7 @@ def test_activity_search_finds_capped_sessions_and_combines_with_status_filter(
           app.activity.expanded = {};
           app.activity.loading = false;
           app.activity.customGroups = [];
-          app.activity.events = Array.from({length: 20}, (_, index) => ({
+          app.activity.events = Array.from({length: 120}, (_, index) => ({
             id: `search-row-${index}`,
             kind: 'turn',
             session_id: index === 0 ? 'needle-session-uuid' : `session-${index}`,
@@ -805,10 +805,12 @@ def test_activity_search_finds_capped_sessions_and_combines_with_status_filter(
 
     search = page.locator(".activity-searchbar input")
     expect(search).to_be_visible()
-    expect(page.locator(".activity-row")).to_have_count(15)
+    # Only the first lazy pages are mounted; the oldest row (the target) is not.
+    shown = page.locator(".activity-row").count()
+    assert 15 <= shown < 120, shown
 
-    # The target is older than the timeline cap, so filtering must happen before
-    # the 15-row slice rather than against the already-visible rows.
+    # The target is older than what is mounted, so filtering must happen before
+    # the lazy slice rather than against the already-visible rows.
     search.fill("Needle")
     expect(page.locator(".activity-row")).to_have_count(1)
     expect(page.locator(".activity-row")).to_contain_text("Needle Alpha")
@@ -1872,8 +1874,8 @@ def test_live_updates_and_all_status_time_view(page: Page, backend_url, auth_tok
 
     session_labels = page.locator(".activity-group .activity-session-name")
     task_labels = page.locator(".activity-group .activity-task-summary")
-    expect(session_labels).to_have_count(15)
-    expect(task_labels).to_have_count(15)
+    expect(session_labels).to_have_count(17)
+    expect(task_labels).to_have_count(17)
     assert session_labels.all_text_contents()[:3] == [
         "Activity test", "Activity test", "Activity test",
     ]
@@ -1908,9 +1910,8 @@ def test_live_updates_and_all_status_time_view(page: Page, backend_url, auth_tok
     ]
     assert pin_requests == [{"pinned": True}, {"pinned": False}]
 
-    more = page.locator(".activity-group-more")
-    expect(more).to_have_text("2 more")
-    more.click()
+    # The lazy ledger already revealed all 17 rows, so there is nothing to expand.
+    expect(page.locator(".activity-group-more:visible")).to_have_count(0)
     expect(session_labels).to_have_count(17)
     expect(task_labels).to_have_count(17)
 
@@ -2459,3 +2460,102 @@ def test_finished_row_shows_streaming_dot_while_session_still_streams(
                          getComputedStyle(row.querySelector('.activity-state-dot')).visibility]))"""
     )
     assert dots == {"Live reaction": "visible", "Idle session": "hidden"}, dots
+
+
+_SEED_ACTIVITY = """async ([view, count]) => {
+  const app = document.querySelector('#app')._x_dataStack[0];
+  app._stopActivityEvents();
+  await Promise.allSettled(Object.values(app._activityFetchPromises || {}));
+  app.lang = 'zh';
+  app.activity.viewLoaded = true;
+  app.activity.view = view;
+  app.activity.expanded = {};
+  app.activity.shown = {};
+  app.activity.loading = false;
+  app.activity.events = Array.from({length: count}, (_, index) => ({
+    id: `lazy-${index}`, kind: 'turn', session_id: `lazy-session-${index}`,
+    session_name: `Lazy session ${index + 1}`, task_summary: `Lazy task ${index + 1}`,
+    workspace: '/tmp/e2e', workspace_name: 'e2e', state: 'completed', read: true,
+    started_at: 100 + index, finished_at: 200 + index, updated_at: 300 + index,
+  }));
+  app.activity.summary = {
+    running: 0, unread: 0, attention: 0,
+    groups: {review: 0, running: 0, failed: 0, history: count},
+    group_unread: {review: 0, running: 0, failed: 0, history: 0}, workspaces: [],
+  };
+  app.activity.show = true;
+  await new Promise(resolve => app.$nextTick(resolve));
+}"""
+
+
+def test_timeline_reveals_further_rows_while_scrolling_without_a_click(
+    page: Page, backend_url, auth_token,
+):
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+    page.evaluate(_SEED_ACTIVITY, ["timeline", 120])
+    rows = page.locator(".activity-row")
+    # First page is 15 rows; pages of 30 are added until the end of the list is
+    # more than a screen away. 120 rows are far more than that.
+    expect(rows).not_to_have_count(0)
+    page.wait_for_timeout(800)
+    initial = rows.count()
+    assert 15 <= initial < 120, initial
+    # Nothing more loads while the reader stays put.
+    page.wait_for_timeout(800)
+    expect(rows).to_have_count(initial)
+
+    body = page.locator(".activity-body")
+    box = body.bounding_box()
+    page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+    for _ in range(40):
+        if rows.count() >= 120:
+            break
+        page.mouse.wheel(0, 1800)
+        page.wait_for_timeout(150)
+    expect(rows).to_have_count(120)
+    expect(page.locator(".activity-group-more:visible")).to_have_count(0)
+    first_label = page.locator(".activity-row").first.inner_text()
+    assert "Lazy" in first_label
+
+
+def test_status_lanes_keep_the_compact_cap_and_manual_expand(
+    page: Page, backend_url, auth_token,
+):
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+    page.evaluate(_SEED_ACTIVITY, ["status", 12])
+    rows = page.locator(".activity-row")
+    expect(rows).to_have_count(5)
+    page.wait_for_timeout(800)
+    expect(rows).to_have_count(5)
+    more = page.locator(".activity-group-more:visible")
+    expect(more).to_have_text("还有 7 条")
+    more.click()
+    expect(rows).to_have_count(12)
+    expect(more).to_have_text("收起")
+
+
+def test_timeline_stays_lazy_in_the_phone_layout(page: Page, backend_url, auth_token):
+    page.set_viewport_size({"width": 390, "height": 844})
+    _login(page, backend_url, auth_token)
+    page.evaluate(_SEED_ACTIVITY, ["timeline", 120])
+    rows = page.locator(".activity-row")
+    expect(rows).not_to_have_count(0)
+    page.wait_for_timeout(1000)
+    initial = rows.count()
+    assert 15 <= initial < 120, initial
+    page.wait_for_timeout(800)
+    expect(rows).to_have_count(initial)
+    # Scrolling the list to its end reveals more rows without any click.
+    for _ in range(40):
+        if rows.count() >= 120:
+            break
+        page.evaluate(
+            """() => {
+              const more = document.querySelector('.activity-group-more');
+              if (more) more.scrollIntoView({block: 'end'});
+            }"""
+        )
+        page.wait_for_timeout(150)
+    expect(rows).to_have_count(120)

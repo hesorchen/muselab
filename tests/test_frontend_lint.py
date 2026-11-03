@@ -1959,6 +1959,12 @@ def test_activity_center_groups_by_attention_order_and_read_state():
     assert 'group?.key === "timeline"' in app
     assert "this.activityGroupCap(group)" in app
     assert "activityHiddenCount(group)" in app
+    # Long ledgers (timeline, custom lanes) reveal rows on scroll; the compact
+    # status lanes keep their cap and explicit toggle.
+    assert "activityLazyGroup(group)" in app
+    assert "ACTIVITY_PAGE: 30" in app
+    assert "new IntersectionObserver(entries" in app[app.index("    observeActivityMore(el, group) {"):]
+    assert "observeActivityMore($el, group)" in (FRONTEND / "index.html").read_text(encoding="utf-8")
     assert '"/api/activity?limit=500"' in app
     fetch_start = app.index("    async fetchActivity(opts = {}) {")
     fetch_end = app.index("\n    async openActivityCenter()", fetch_start)
