@@ -2931,7 +2931,7 @@ def test_fifo_admission_projects_after_durable_queue_without_transcript_flash():
     assert "if (!queueAdmissionAsyncHandoff) clearOwnedQueueAdmission();" in send
     assert "mirrorState._queueAdmission = null;" in app
     assert 'x-for="(q, qi) in queueDisplayItems(activeSession)"' in html
-    assert ":disabled=\"q._admissionPending || queueActionBusy" in html
+    assert ":disabled=\"q._admissionPending || queueItemCancelling(q, activeSession) || queueActionBusy" in html
 
 def test_detached_rollover_preserves_migrated_queue_fifo():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
@@ -5422,7 +5422,13 @@ def test_queue_controls_validate_mutations_and_block_send_during_interrupt():
     assert "sendState._stoppingTurnId || sendState._uncertainSubmission" in app
     assert "this._holdPendingSnapshot(sid, true)" in app
     assert "queueActionBusy(currentId, 'edit:' + q.id)" in html
-    assert "queueActionBusy(currentId, 'remove:' + q.id)" in html
+    # Remove is disabled through queueItemCancelling, which covers the same
+    # per-item mutation key plus a queue-wide discard and a cancelling outbox row.
+    assert ':disabled="queueItemCancelling(q, activeSession)"' in html
+    assert "st?._queueMutating?.['remove:' + item.id]" in app
+    assert "st?._queueMutating?.discard" in app
+    assert "item?._outgoingRecord?.cancelRequested" in app
+    assert "'is-cancelling': queueItemCancelling(q, activeSession)" in html
     assert "sess.pause_queue_if_nonempty" not in chat
     assert "editPendingQueueItem(currentId, q.id)" in html
     assert "removePendingQueueItem(currentId, q.id)" in html

@@ -3388,7 +3388,9 @@
             <div class="msg user queued">
               <div class="msg-row queued-row"
                    :class="{ 'avoids-tail-nav': isAwayFromLatest() }">
-                <div class="bubble user-bubble queued-bubble">
+                <div class="bubble user-bubble queued-bubble"
+                     :class="{ 'is-cancelling': queueItemCancelling(q, activeSession) }"
+                     :aria-busy="queueItemCancelling(q, activeSession) ? 'true' : null">
                   <div class="queued-header">
                     <span class="queued-icon"><svg><use href="#i-clock"/></svg></span>
                     <span class="queued-label"
@@ -3396,15 +3398,16 @@
                     <span style="flex:1"></span>
                     <button class="queued-act icon-btn sm"
                             @click="!q._admissionPending && editPendingQueueItem(currentId, q.id)"
-                            :disabled="q._admissionPending || queueActionBusy(currentId, 'edit:' + q.id)"
+                            :disabled="q._admissionPending || queueItemCancelling(q, activeSession) || queueActionBusy(currentId, 'edit:' + q.id)"
                             :title="lang==='zh' ? '编辑' : 'Edit'">
                       <svg><use href="#i-edit"/></svg>
                     </button>
                     <button class="queued-act icon-btn sm"
                             @click="q._admissionPending ? cancelOutgoing(currentId, q._submitToken) : removePendingQueueItem(currentId, q.id)"
-                            :disabled="queueActionBusy(currentId, 'remove:' + q.id)"
+                            :disabled="queueItemCancelling(q, activeSession)"
                             :title="lang==='zh' ? '移除' : 'Remove'">
-                      <svg><use href="#i-x"/></svg>
+                      <span class="spinner-sm" x-show="queueItemCancelling(q, activeSession)"></span>
+                      <svg x-show="!queueItemCancelling(q, activeSession)"><use href="#i-x"/></svg>
                     </button>
                   </div>
                   <div class="queued-quote-list" x-show="q.pendingQuotes && q.pendingQuotes.length">
@@ -3461,7 +3464,9 @@
             <button class="btn-ghost sm"
                     @click="discardQueue(currentId)"
                     :disabled="queueActionBusy(currentId, 'discard')"
-                    x-text="lang==='zh' ? '清空列表' : 'Clear list'"></button>
+                    x-text="queueActionBusy(currentId, 'discard')
+                      ? (lang==='zh' ? '正在清空…' : 'Clearing…')
+                      : (lang==='zh' ? '清空列表' : 'Clear list')"></button>
           </div>
 
         </section>

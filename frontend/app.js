@@ -10003,6 +10003,11 @@ function portal() {
         ? ["待发送 " + pending, ...(review ? ["需处理 " + review] : [])].join(" · ")
         : ["Pending " + pending, ...(review ? ["Needs review " + review] : [])].join(" · ");
     },
+    queueItemCancelling(item, st = this.activeSessionPane()) {
+      return !!(st?._queueMutating?.['remove:' + item.id]
+        || st?._queueMutating?.discard
+        || item?._outgoingRecord?.cancelRequested);
+    },
     queueItemLabel(item, st = this.activeSessionPane()) {
       if (st?._queueMutating?.['remove:' + item.id] || st?._queueMutating?.discard) {
         return this.lang === "zh" ? "正在取消" : "Cancelling";
