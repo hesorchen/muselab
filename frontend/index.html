@@ -7012,8 +7012,10 @@
             </template>
             <button class="activity-group-more" type="button"
                     x-show="activityHiddenCount(group) > 0"
-                    @click="toggleActivityGroup(group.key)"
-                    x-text="activity.expanded[group.key]
+                    x-init="activityLazyGroup(group) && observeActivityMore($el, group)"
+                    @click="activityLazyGroup(group)
+                      ? loadMoreActivity(group) : toggleActivityGroup(group.key)"
+                    x-text="!activityLazyGroup(group) && activity.expanded[group.key]
                       ? (lang==='zh' ? '收起' : 'Show less')
                       : (lang==='zh'
                           ? '还有 ' + activityHiddenCount(group) + ' 条'

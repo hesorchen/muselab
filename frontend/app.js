@@ -899,6 +899,7 @@ function portal() {
       },
       // group key -> true when the user asked to see past the row cap.
       expanded: {},
+      shown: {},
       // Selected group keys. Empty array = no filter = show every group.
       filter: [],
       // Local search over the loaded activity snapshot. Keep this derived from
@@ -38323,6 +38324,7 @@ function portal() {
       this.cancelActivityGroupEditor();
       this.onActivityDragEnd();
       this.onActivityGroupOrderDragEnd();
+      this._stopActivityMoreObserver();
       if (wasOpen) this._closeFocusSurface("activity");
     },
     setActivityView(view) {
@@ -38349,6 +38351,7 @@ function portal() {
     ACTIVITY_GROUP_CAP: 5,
     ACTIVITY_CUSTOM_GROUP_CAP: 50,
     ACTIVITY_TIMELINE_CAP: 15,
+    ACTIVITY_PAGE: 30,
     ACTIVITY_GROUP_COLORS: [
       "blue", "violet", "cyan", "green", "amber", "rose", "gray",
     ],
@@ -38568,8 +38571,72 @@ function portal() {
     },
     activityEvents(group) {
       const all = this.activityAllEvents(group);
+      if (this.activityLazyGroup(group)) {
+        return all.slice(0, this.activityShownCount(group));
+      }
       if (this.activity.expanded[group.key]) return all;
       return all.slice(0, this.activityGroupCap(group));
+    },
+    // The timeline and custom lanes are long ledgers: they reveal further rows
+    // as the reader scrolls instead of behind a button. The compact status
+    // lanes keep their small cap and explicit "N more" toggle, otherwise the
+    // first lane would swallow the overview.
+    activityLazyGroup(group) {
+      return group?.key === "timeline" || !!group?.custom;
+    },
+    activityShownCount(group) {
+      return Math.max(
+        this.activityGroupCap(group), Number(this.activity.shown[group.key]) || 0);
+    },
+    loadMoreActivity(group) {
+      if (!this.activityLazyGroup(group)) return false;
+      const total = this.activityAllEvents(group).length;
+      const shown = this.activityShownCount(group);
+      if (shown >= total) return false;
+      this.activity.shown[group.key] = Math.min(total, shown + this.ACTIVITY_PAGE);
+      return true;
+    },
+    // Auto-reveal: the "N more" row of a lazy lane loads the next page by
+    // itself once it is within a screen of the visible area. Re-observing after
+    // each page makes a short page keep filling until the row scrolls away.
+    observeActivityMore(el, group) {
+      if (!el || typeof IntersectionObserver === "undefined") return;
+      // The nearest scrolling ancestor decides what is "visible": the body on
+      // desktop, but the modal itself where the phone layout lifts the body's
+      // max-height. Without a scroller the viewport is the root.
+      let root = null;
+      for (let node = el.parentElement; node; node = node.parentElement) {
+        if (/(auto|scroll|overlay)/.test(getComputedStyle(node).overflowY)) {
+          root = node;
+          break;
+        }
+      }
+      if (!this._activityMoreObserver || this._activityMoreRoot !== root) {
+        if (this._activityMoreObserver) this._activityMoreObserver.disconnect();
+        this._activityMoreRoot = root;
+        this._activityMoreObserver = new IntersectionObserver(entries => {
+          for (const entry of entries) {
+            if (!entry.isIntersecting) continue;
+            const target = entry.target;
+            const lane = target.__activityLane;
+            if (!lane || !this.activity.show) continue;
+            if (!this.loadMoreActivity(lane)) continue;
+            this._activityMoreObserver.unobserve(target);
+            this.$nextTick(() => {
+              if (this._activityMoreObserver && target.isConnected) {
+                this._activityMoreObserver.observe(target);
+              }
+            });
+          }
+        }, { root, rootMargin: "0px 0px 320px 0px" });
+      }
+      el.__activityLane = group;
+      this._activityMoreObserver.observe(el);
+    },
+    _stopActivityMoreObserver() {
+      if (this._activityMoreObserver) this._activityMoreObserver.disconnect();
+      this._activityMoreObserver = null;
+      this._activityMoreRoot = null;
     },
     activityGroupCap(group) {
       if (group?.key === "timeline") return this.ACTIVITY_TIMELINE_CAP;
@@ -38577,8 +38644,9 @@ function portal() {
       return this.ACTIVITY_GROUP_CAP;
     },
     activityHiddenCount(group) {
-      return Math.max(
-        0, this.activityAllEvents(group).length - this.activityGroupCap(group));
+      const shown = this.activityLazyGroup(group)
+        ? this.activityShownCount(group) : this.activityGroupCap(group);
+      return Math.max(0, this.activityAllEvents(group).length - shown);
     },
     toggleActivityGroup(key) {
       this.activity.expanded[key] = !this.activity.expanded[key];
@@ -38920,6 +38988,7 @@ function portal() {
         this.fetchActivity().catch(() => {});
       }
       this.activity.expanded = {};
+      this.activity.shown = {};
       this._activityRevision = Math.max(this._activityRevision, responseRevision);
     },
     async persistActivityGroupOrder(next, previous) {
