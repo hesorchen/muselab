@@ -5,12 +5,12 @@
   "direct_packages": [
     {
       "name": "alpinejs",
-      "version": "3.14.1",
+      "version": "3.14.9",
       "license": "MIT",
       "license_files": [
         "licenses/Alpine-MIT.txt"
       ],
-      "source": "https://www.npmjs.com/package/alpinejs/v/3.14.1"
+      "source": "https://www.npmjs.com/package/alpinejs/v/3.14.9"
     },
     {
       "name": "marked",
@@ -769,8 +769,8 @@
     "scripts/vendor/package.json": "40cb77d790372eadf0b6ab945890a66746fe45b01827ceefefb103afa4c124fe"
   },
   "assets": {
-    "alpine.dev.js": "677d9fcfa51c138008b99f3218c4cd6df7a56ab2987b5bf23a746784390f2604",
-    "alpine.min.js": "358d9afbb1ab5befa2f48061a30776e5bcd7707f410a606ba985f98bc3b1c034",
+    "alpine.dev.js": "ecec94086e8a82e4b86aeca1048e5c6edd46445f29d928b00fb62333cfe0901e",
+    "alpine.min.js": "3ed1eed252488921df65e363d6715deb04d7f92aaedb9e52199fdf73cb1e0ad3",
     "cm/addon/edit/closebrackets.min.js": "df4a87dd3b175b509468755b74d06f0e82ff56f213f341f776c26ff0f0d27b37",
     "cm/addon/edit/matchbrackets.min.js": "f359c5f395a2a08191557d40b61ef8c3893803da9019171cc44b8d9c8c7d4a3a",
     "cm/addon/mode/simple.min.js": "9c31d15000adff2ac99ecc025ea3df24babfc004a63deeca9ca946a491d1dd4e",

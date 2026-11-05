@@ -23,7 +23,7 @@ configured network access.
 
 | Component | Version | License | Upstream |
 |---|---|---|---|
-| Alpine.js | v3.14.1 | MIT | <https://github.com/alpinejs/alpine> |
+| Alpine.js | v3.14.9 | MIT | <https://github.com/alpinejs/alpine> |
 | marked | v13.0.0 | MIT | <https://github.com/markedjs/marked> |
 | DOMPurify | v3.4.16 | Apache 2.0 / MPL 2.0 (dual) | <https://github.com/cure53/DOMPurify> |
 | highlight.js | v11.10.0 + language extras + theme CSS | BSD 3-Clause | <https://github.com/highlightjs/highlight.js> |
