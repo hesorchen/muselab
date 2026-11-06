@@ -14,6 +14,7 @@ def runtime(app_module, monkeypatch):
     kicks = []
     monkeypatch.setattr(chat, "_schedule_queue_drain", kicks.append)
     monkeypatch.setattr(chat, "_session_runtime_busy", lambda sid: False)
+    monkeypatch.setattr(chat, "_session_main_loop_busy", lambda sid: False)
     return console, chat, sessions, kicks
 
 

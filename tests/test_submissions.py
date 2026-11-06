@@ -1,5 +1,6 @@
 """A lost response must not create a duplicate model/queue admission."""
 import asyncio
+import contextlib
 
 import pytest
 from fastapi import HTTPException
@@ -94,7 +95,15 @@ async def test_queue_replay_does_not_enqueue_twice(app_module):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("queued", [False, True])
-async def test_foreground_steering_allows_background_and_queue_origin(app_module, monkeypatch, queued):
+@pytest.mark.parametrize("watcher", [False, True])
+async def test_foreground_steering_allows_background_and_queue_origin(
+    app_module, monkeypatch, queued, watcher,
+):
+    """Background work (pins or a live watcher) never vetoes steering.
+
+    2026-11-07: a watcher left alive by an earlier turn's tasks downgraded every
+    "adjust" to FIFO, so the message waited for the whole running turn.
+    """
     from backend import chat, sessions
     sid = sessions.create_session()["id"]
     writes = []
@@ -111,6 +120,9 @@ async def test_foreground_steering_allows_background_and_queue_origin(app_module
         broadcast.queue_item_id = "root-queue-item"
     chat._active_turns[sid] = broadcast
     chat._sessions_with_inflight_tasks[sid] = {"background-task"}
+    live_watcher = asyncio.create_task(asyncio.sleep(60)) if watcher else None
+    if live_watcher is not None:
+        chat._task_watchers[sid] = live_watcher
     try:
         response = await chat.enqueue_api(sid, chat.QueueEnqueueReq(
             text="adjust fixture", delivery="adjust", active_turn_id=broadcast.turn_id,
@@ -121,6 +133,11 @@ async def test_foreground_steering_allows_background_and_queue_origin(app_module
     finally:
         chat._active_turns.pop(sid, None)
         chat._sessions_with_inflight_tasks.pop(sid, None)
+        if live_watcher is not None:
+            chat._task_watchers.pop(sid, None)
+            live_watcher.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await live_watcher
         broadcast.close()
 
 

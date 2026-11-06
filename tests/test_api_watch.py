@@ -329,7 +329,7 @@ def test_reply_is_bounded_assistant_text_and_not_completion_proof(
         }
 
     monkeypatch.setattr(chat, "get_session_api", history)
-    monkeypatch.setattr(chat, "_session_runtime_busy", lambda session: True)
+    monkeypatch.setattr(chat, "_session_main_loop_busy", lambda session: True)
     response = client.get(f"/api/watch/sessions/{sid}/reply", headers=auth)
     assert response.status_code == 200
     data = response.json()
