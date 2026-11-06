@@ -1136,3 +1136,24 @@ async def test_mux_setup_storage_failure_retires_listener_and_prior_children(cha
         broken.close()
         await asyncio.gather(first.events.flush_async(), broken.events.flush_async(),
                              return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_mux_forwards_turnless_background_activity_as_root_frame(chat_mod):
+    stream = await _open_mux(chat_mod, {})
+    try:
+        payload = json.dumps({"parent_tool_use_id": "toolu-child", "delta": "x"})
+        assert chat_mod._publish_background_activity(
+            "side-session", {"event": "subagent_delta", "data": payload})
+        async with asyncio.timeout(2):
+            while True:
+                frame = await anext(stream)
+                if frame["event"] == "background_activity":
+                    break
+        assert json.loads(frame["data"]) == {
+            "session_id": "side-session", "type": "subagent_delta", "data": payload,
+        }
+        assert "side-session" not in chat_mod._active_turns
+    finally:
+        await stream.aclose()
+    assert not chat_mod._background_activity_listeners

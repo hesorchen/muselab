@@ -378,3 +378,132 @@ async def test_output_before_typed_notification_opens_the_continuation(
         assert client.queries == []
     finally:
         await stream.aclose()
+
+
+def subagent_delta(sid, text, *, parent="toolu-subagent"):
+    return StreamEvent(
+        uuid="subagent-message", session_id=sid, parent_tool_use_id=parent,
+        event={"type": "content_block_delta", "index": 0,
+               "delta": {"type": "text_delta", "text": text}},
+    )
+
+
+@pytest.mark.asyncio
+async def test_subagent_output_does_not_occupy_the_main_loop_slot(stream_env):
+    """A running subagent is background work, not a main-loop turn.
+
+    2026-11-06: forwarded subagent frames opened the headless continuation, so
+    `_active_turns` stayed occupied for the whole subagent run (255 s, 736 s):
+    the tab showed "streaming", direct sends were refused and the queue waited.
+    """
+    chat = stream_env
+    sid = "subagent-only-output"
+    side = []
+    def listener(session_id, event):
+        side.append((session_id, event))
+    chat._background_activity_listeners.add(listener)
+    client = QueueClient()
+    client.messages.put_nowait(subagent_delta(sid, "child "))
+    client.messages.put_nowait(subagent_delta(sid, "progress"))
+    stream, watcher = start_watcher(chat, sid, client)
+    try:
+        await wait_until(lambda: len(side) == 2)
+        assert sid not in chat._active_turns
+        assert {event["event"] for _sid, event in side} == {"subagent_delta"}
+        assert {session_id for session_id, _event in side} == {sid}
+        status = chat._session_active_status(
+            sid, runtime_lineage=[], durable_runtime_task_ids=(),
+            continuation_disk_state=(frozenset(), ""))
+        assert status["background"] is True
+        assert status["attachable"] is False
+        # The main loop is idle: a foreground turn may be admitted now.
+        assert not chat._session_has_sdk_delivery(sid)
+        assert not watcher.done()
+    finally:
+        chat._background_activity_listeners.discard(listener)
+        watcher.cancel()
+        with suppress(asyncio.CancelledError):
+            await watcher
+        await stream.aclose()
+
+
+@pytest.mark.asyncio
+async def test_main_thread_reaction_still_claims_the_slot_after_subagent_output(
+    stream_env, monkeypatch,
+):
+    chat = stream_env
+    sid = "subagent-then-reaction"
+    monkeypatch.setattr(chat, "_CONTINUATION_GRACE", 0.01)
+    monkeypatch.setattr(chat, "_CONTINUATION_TIMEOUT", 1)
+    side = []
+    def listener(session_id, event):
+        side.append(event)
+    chat._background_activity_listeners.add(listener)
+    client = QueueClient()
+    client.messages.put_nowait(subagent_delta(sid, "child"))
+    stream, watcher = start_watcher(chat, sid, client)
+    try:
+        await wait_until(lambda: side)
+        assert sid not in chat._active_turns
+        client.messages.put_nowait(notification(sid))
+        await wait_until(lambda: sid in chat._active_turns)
+        client.messages.put_nowait(assistant())
+        client.messages.put_nowait(result(sid))
+        await asyncio.wait_for(watcher, 2)
+        events = [e["event"] for e in chat._recent_turns[sid].events]
+        assert "task_notification" in events
+        assert "subagent_delta" not in events
+        assert json.loads(chat._recent_turns[sid].events[-1]["data"])["status"] == "completed"
+        assert client.queries == []
+    finally:
+        chat._background_activity_listeners.discard(listener)
+        await stream.aclose()
+
+
+@pytest.mark.asyncio
+async def test_subagent_output_reaches_a_live_foreground_turn(stream_env):
+    """A foreground turn admitted mid-run is the live carrier for side frames."""
+    chat = stream_env
+    sid = "subagent-with-foreground"
+    side = []
+    def listener(session_id, event):
+        side.append(event)
+    chat._background_activity_listeners.add(listener)
+    foreground = chat.TurnBroadcast(
+        session_id=sid, model="m", events=await chat._new_replay_spool())
+    chat._active_turns[sid] = foreground
+    client = QueueClient()
+    client.messages.put_nowait(subagent_delta(sid, "child"))
+    stream, watcher = start_watcher(chat, sid, client)
+    try:
+        await wait_until(lambda: any(
+            e.get("event") == "subagent_delta" for e in foreground.events))
+        assert chat._active_turns[sid] is foreground
+        assert side == []
+    finally:
+        chat._background_activity_listeners.discard(listener)
+        chat._active_turns.pop(sid, None)
+        watcher.cancel()
+        with suppress(asyncio.CancelledError):
+            await watcher
+        await stream.aclose()
+
+
+@pytest.mark.asyncio
+async def test_idle_subagent_output_never_begins_a_delivery(stream_env):
+    """Without a watcher, idle subagent output still must not take the slot."""
+    chat = stream_env
+    sid = "idle-subagent-output"
+    key = (sid, "claude-sonnet-4-6", "", "")
+    side = []
+    def listener(session_id, event):
+        side.append((session_id, event["event"]))
+    chat._background_activity_listeners.add(listener)
+    try:
+        await chat._consume_sdk_idle_message(key, subagent_delta(sid, "child"))
+        assert side == [(sid, "subagent_delta")]
+        assert key not in chat._sdk_deliveries
+        assert sid not in chat._active_turns
+    finally:
+        chat._background_activity_listeners.discard(listener)
+        chat._idle_subagent_muxes.pop(sid, None)
