@@ -108,6 +108,43 @@ async def disconnect_unpooled_client(
         )
 
 
+def runtime_reuse_blocker(
+    session_id: str,
+    model: str,
+    permission: str,
+    effort: str = "",
+    service_tier: str = "",
+    plan_return_permission: str = "",
+) -> str:
+    """Why ``get_client`` would NOT reuse the live client, or ``""`` if it would.
+
+    A changed permission, effort, tier, model, plan return or pending rebuild
+    replaces the CLI process, which would end its running background tasks.
+    """
+    hooks = _require_hooks()
+    if session_id in hooks.pending_runtime_rebuilds:
+        return "pending_rebuild"
+    effort = hooks.normalize_effort(effort)
+    key = (session_id, model, effort, (service_tier or "").strip())
+    plan_return_permission = hooks.normalize_plan_return_permission(
+        permission, plan_return_permission)
+    if CLIENTS.get(key) is None:
+        return "no_client"
+    if CLIENT_PERMISSION.get(key) != permission:
+        return "permission_mismatch"
+    if permission == "plan" and CLIENT_PLAN_RETURN.get(key, "") != plan_return_permission:
+        return "plan_return_mismatch"
+    if hooks.runtime_config_signature is not None:
+        cached_config = CLIENT_CONFIG.get(key)
+        if cached_config is not None and cached_config != hooks.runtime_config_signature(model):
+            # get_client defers this refresh while background work runs, so
+            # the live client is still the one that would be used.
+            if not (hooks.has_runtime_background_work
+                    and hooks.has_runtime_background_work(session_id)):
+                return "config_changed"
+    return ""
+
+
 def runtime_reusable(
     session_id: str,
     model: str,
@@ -116,30 +153,10 @@ def runtime_reusable(
     service_tier: str = "",
     plan_return_permission: str = "",
 ) -> bool:
-    """Whether ``get_client`` would reuse the live client for these settings.
-
-    A changed permission, effort, tier, model, plan return or pending rebuild
-    replaces the CLI process, which would end its running background tasks.
-    """
-    hooks = _require_hooks()
-    if session_id in hooks.pending_runtime_rebuilds:
-        return False
-    effort = hooks.normalize_effort(effort)
-    key = (session_id, model, effort, (service_tier or "").strip())
-    plan_return_permission = hooks.normalize_plan_return_permission(
-        permission, plan_return_permission)
-    if CLIENTS.get(key) is None or CLIENT_PERMISSION.get(key) != permission:
-        return False
-    if permission == "plan" and CLIENT_PLAN_RETURN.get(key, "") != plan_return_permission:
-        return False
-    if hooks.runtime_config_signature is not None:
-        cached_config = CLIENT_CONFIG.get(key)
-        if cached_config is not None and cached_config != hooks.runtime_config_signature(model):
-            # get_client defers this refresh while background work runs, so
-            # the live client is still the one that would be used.
-            return bool(hooks.has_runtime_background_work
-                        and hooks.has_runtime_background_work(session_id))
-    return True
+    """Whether ``get_client`` would reuse the live client for these settings."""
+    return not runtime_reuse_blocker(
+        session_id, model, permission, effort, service_tier,
+        plan_return_permission)
 
 
 async def get_client(

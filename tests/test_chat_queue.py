@@ -2025,6 +2025,81 @@ def test_runtime_reusable_requires_the_exact_live_runtime(app_module, monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_drain_records_why_a_pending_queue_was_left_untouched(
+    app_module, monkeypatch,
+):
+    """A stuck queue must be diagnosable from the log, not silent."""
+    import types
+
+    from backend import chat
+
+    sess = _sess(app_module)
+    sid = sess.create_session()["id"]
+    sess.enqueue_message(sid, "follow-up")
+    events = []
+    monkeypatch.setattr(
+        chat, "_perf_event", lambda name, /, **kw: events.append((name, kw)))
+    chat._active_turns[sid] = types.SimpleNamespace(done=False)
+    try:
+        await chat._maybe_drain_queue(sid)
+    finally:
+        chat._active_turns.pop(sid, None)
+
+    assert [kw["reason"] for name, kw in events
+            if name == "queue.drain_deferred"] == ["active_turn"]
+
+
+@pytest.mark.asyncio
+async def test_direct_turn_409_records_the_blocking_reason(
+    app_module, monkeypatch,
+):
+    from fastapi import HTTPException
+
+    from backend import chat
+
+    sess = _sess(app_module)
+    sid = sess.create_session()["id"]
+    events = []
+    monkeypatch.setattr(
+        chat, "_perf_event", lambda name, /, **kw: events.append((name, kw)))
+    monkeypatch.setattr(
+        chat, "_direct_turn_would_restart_background_runtime",
+        lambda *_a: "pending_rebuild")
+    with pytest.raises(HTTPException) as caught:
+        await chat._turn_start_impl(
+            chat.TurnStartReq(session_id=sid, prompt="hi"))
+
+    assert caught.value.status_code == 409
+    assert [kw["reason"] for name, kw in events
+            if name == "turn.deferred_for_background"] == ["pending_rebuild"]
+
+
+def test_runtime_reuse_blocker_names_each_reason(app_module):
+    from backend import chat_runtime
+
+    sid = "blocker-sid"
+    key = (sid, "m", chat_runtime._require_hooks().normalize_effort(""), "")
+    chat_runtime.CLIENTS.pop(key, None)
+    assert chat_runtime.runtime_reuse_blocker(sid, "m", "default") == "no_client"
+    assert not chat_runtime.runtime_reusable(sid, "m", "default")
+    chat_runtime.CLIENTS[key] = object()
+    chat_runtime.CLIENT_PERMISSION[key] = "bypassPermissions"
+    try:
+        assert chat_runtime.runtime_reuse_blocker(
+            sid, "m", "default") == "permission_mismatch"
+        assert chat_runtime.runtime_reuse_blocker(
+            sid, "m", "bypassPermissions") == ""
+        assert chat_runtime.runtime_reusable(sid, "m", "bypassPermissions")
+        chat_runtime._require_hooks().pending_runtime_rebuilds.add(sid)
+        assert chat_runtime.runtime_reuse_blocker(
+            sid, "m", "bypassPermissions") == "pending_rebuild"
+    finally:
+        chat_runtime._require_hooks().pending_runtime_rebuilds.discard(sid)
+        chat_runtime.CLIENTS.pop(key, None)
+        chat_runtime.CLIENT_PERMISSION.pop(key, None)
+
+
+@pytest.mark.asyncio
 async def test_drain_waits_while_cli_initiated_reply_owns_stream(
     app_module, monkeypatch,
 ):
