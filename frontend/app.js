@@ -12875,6 +12875,12 @@ function portal() {
         try { payload = JSON.parse(ev.data) || {}; } catch (_) {}
         this._handleScheduledHistoryUpdate(payload);
       });
+      source.addEventListener("background_activity", ev => {
+        if (!markRootFrame(true)) return;
+        let payload = {};
+        try { payload = JSON.parse(ev.data) || {}; } catch (_) {}
+        this._handleBackgroundActivity(payload);
+      });
       for (const type of CHAT_MUX_STREAM_EVENTS) {
         source.addEventListener(type, ev => {
           if (!markRootFrame(type !== "ping")) return;
@@ -12907,6 +12913,67 @@ function portal() {
       // The per-session reducers retain logical ownership while the one native
       // transport reconnects. In particular, do not synthesize `error`/`done`.
       this._scheduleChatMuxReconnect();
+    },
+    // Subagent sidechain frames and task progress that arrive while the main
+    // loop is idle belong to no turn. The server sends them as root frames so
+    // they never make the session look busy; apply them to the session's task
+    // cards and Subagent threads directly. Gaps are repaired from SDK history.
+    _handleBackgroundActivity(payload) {
+      const sid = String(payload && payload.session_id || "");
+      const st = sid && this.tabState[sid];
+      if (!st) return;
+      let d = null;
+      try { d = JSON.parse(payload.data); } catch (_) { return; }
+      if (!d || typeof d !== "object") return;
+      switch (String(payload.type || "")) {
+        case "subagent_delta":
+          this._applySubagentDelta(sid, st, d);
+          break;
+        case "subagent_block":
+          this._applySubagentBlock(sid, st, d);
+          break;
+        case "task_started":
+          this._applyBackgroundTaskPatch(st, d.tool_use_id, {
+            task_id: d.task_id, state: "running", description: d.description || "",
+          });
+          break;
+        case "task_progress":
+          this._applyBackgroundTaskPatch(st, d.tool_use_id, {
+            task_id: d.task_id, state: "running",
+            usage: d.usage || null, last_tool_name: d.last_tool_name || "",
+          });
+          break;
+        case "task_notification": {
+          const state = ["completed", "failed", "stopped"].includes(d.status)
+            ? d.status : "done";
+          this._applyBackgroundTaskPatch(st, d.tool_use_id, {
+            task_id: d.task_id, state, summary: d.summary || "",
+            summary_length: d.summary_length, summary_truncated: d.summary_truncated,
+            output_file: d.output_file || "", usage: d.usage || null,
+          });
+          const remaining = Number(d.background_tasks_pending);
+          if (Number.isFinite(remaining)) {
+            this._setBackgroundTaskActive(sid, remaining > 0, 0, remaining);
+          }
+          break;
+        }
+        default:
+          break;
+      }
+    },
+    _applyBackgroundTaskPatch(st, toolUseId, patch) {
+      const toolId = String(toolUseId || "");
+      const taskId = String(patch && patch.task_id || "");
+      if (!toolId && !taskId) return;
+      const card = (st.messages || []).find(message => message
+        && message.role === "tool_use"
+        && ((toolId && String(message.id || "") === toolId)
+          || (taskId && message.task_status
+            && String(message.task_status.task_id || "") === taskId)));
+      if (!card) return;
+      card.task_status = this._normalizeTaskStatusPreview(
+        Object.assign({}, card.task_status || {}, patch));
+      this._syncOpenTaskDetail(card.task_status, card);
     },
     _handleScheduledHistoryUpdate(payload) {
       const sid = String(payload && payload.session_id || "");

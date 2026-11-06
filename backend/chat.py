@@ -1749,6 +1749,26 @@ _RECENT_TURN_TTL = env_int("MUSELAB_RECENT_TURN_TTL", 60, min_value=1)
 # `_active_turns` between two scans. These callbacks attach a replay reader at
 # the admission boundary, before the runtime can publish or finish the turn.
 _mux_turn_listeners: set[Callable[[TurnBroadcast], None]] = set()
+# Subagent sidechain frames and task progress belong to no main-loop turn: the
+# SDK streams them while the parent loop is idle. Fan them out live to every
+# mux subscriber WITHOUT occupying `_active_turns`, so a running subagent never
+# makes the session look busy or blocks the next user turn. Delivery is
+# best-effort; browsers repair gaps from the SDK subagent history.
+_background_activity_listeners: set[Callable[[str, dict], None]] = set()
+_idle_subagent_muxes: dict[str, chat_subagents.SubagentStreamMux] = {}
+
+
+def _publish_background_activity(session_id: str, event: dict) -> bool:
+    """Deliver one turnless activity event; True when any browser received it."""
+    delivered = False
+    for listener in tuple(_background_activity_listeners):
+        try:
+            listener(session_id, event)
+            delivered = True
+        except Exception:
+            # One disconnected browser must never affect the SDK reader.
+            continue
+    return delivered
 
 
 def _announce_mux_turn(broadcast: TurnBroadcast) -> None:
@@ -15654,6 +15674,12 @@ async def _watch_inflight_tasks_owned(
     action. The CLI also persists the auto-continue to the session JSONL, so a
     user who isn't looking still sees it on next load.
 
+    Only main-loop work opens the continuation: a task settlement (the CLI
+    reacts to it) or parent output. Forwarded subagent frames and task progress
+    are turnless background activity; with no live carrier they go to
+    `_publish_background_activity`, so a running subagent never occupies
+    `_active_turns` and the next user turn is admitted on this same runtime.
+
     `pending` maps task_id -> description for tasks still in flight at turn end.
     Drains client.receive_messages() until every pending task settles + its
     continuation closes, or the watch times out.
@@ -15767,9 +15793,13 @@ async def _watch_inflight_tasks_owned(
             delivered = True
         if delivered:
             return True
-        obs.diagnostic_line(
-            f"[chat] task watcher: settlement had no carrier "
-            f"sid={session_id[:8]} event={event.get('event')}\n")
+        # No main-loop turn is live: this is turnless background activity.
+        if _publish_background_activity(session_id, event):
+            return True
+        if event.get("event") == "task_notification":
+            obs.diagnostic_line(
+                f"[chat] task watcher: settlement had no carrier "
+                f"sid={session_id[:8]} event={event.get('event')}\n")
         return False
 
     async def _close_continuation(
@@ -16195,8 +16225,6 @@ async def _watch_inflight_tasks_owned(
                 # tracked disconnect fence below before releasing anything.
                 break
             if chat_subagents.is_subagent_message(msg):
-                if cont is None:
-                    await _open_continuation()
                 for record in subagent_mux.feed(msg):
                     _emit_settlement({
                         "event": record["event"],
@@ -16283,11 +16311,12 @@ async def _watch_inflight_tasks_owned(
                     break
 
                 if chat_subagents.is_subagent_message(msg):
-                    # Forwarded child text may precede TaskNotification.  Open
-                    # the headless continuation lazily so no child frame is
-                    # discarded while waiting for task settlement.
-                    if cont is None:
-                        await _open_continuation()
+                    # A forwarded subagent frame is background activity, not a
+                    # main-loop reply: it must not open the continuation, which
+                    # would occupy `_active_turns` (tab "streaming", direct
+                    # sends refused, queue stalled) for the whole subagent run.
+                    # It reaches an open continuation or a live foreground turn
+                    # when one exists, otherwise the turnless activity lane.
                     for record in subagent_mux.feed(msg):
                         _emit_settlement({
                             "event": record["event"],
@@ -16380,24 +16409,23 @@ async def _watch_inflight_tasks_owned(
                         pending[tid] = desc
                         _pin_background_task(session_id, tid)
                         _reschedule_watch_deadline()
-                    if cont is not None and accepted_start:
-                        cont.publish({"event": "task_started",
-                                      "data": json.dumps({
+                    if accepted_start:
+                        _emit_settlement({"event": "task_started",
+                                          "data": json.dumps({
                             "task_id": tid,
                             "tool_use_id": getattr(msg, "tool_use_id", None),
                             "description": desc,
                             "task_type": getattr(msg, "task_type", None),
                         })})
                 elif isinstance(msg, TaskProgressMessage):
-                    if cont is not None:
-                        cont.publish({"event": "task_progress",
+                    _emit_settlement({"event": "task_progress",
                                       "data": json.dumps({
-                            "task_id": getattr(msg, "task_id", "") or "",
-                            "tool_use_id": getattr(msg, "tool_use_id", None),
-                            "last_tool_name": getattr(
-                                msg, "last_tool_name", None),
-                            "usage": dict(getattr(msg, "usage", None) or {}),
-                        })})
+                        "task_id": getattr(msg, "task_id", "") or "",
+                        "tool_use_id": getattr(msg, "tool_use_id", None),
+                        "last_tool_name": getattr(
+                            msg, "last_tool_name", None),
+                        "usage": dict(getattr(msg, "usage", None) or {}),
+                    })})
                 elif (notifs := _parse_task_notifications(
                         _usermsg_task_notification_text(msg))):
                     # FALLBACK text path: terminal completion arrived as a
@@ -21146,6 +21174,23 @@ async def _subscribe_multiplex(
             prefix_events=prefix_events,
         )
 
+    def _offer_background_activity(session_id: str, event: dict) -> None:
+        """Forward turnless subagent/task activity as a root frame."""
+        if closed:
+            return
+        try:
+            output.put_nowait({
+                "event": "background_activity",
+                "data": json.dumps({
+                    "session_id": session_id,
+                    "type": str(event.get("event") or ""),
+                    "data": event.get("data") or "",
+                }, ensure_ascii=False),
+            })
+        except asyncio.QueueFull:
+            # Best-effort live view; the browser repairs from SDK history.
+            pass
+
     async def _reconcile() -> None:
         nonlocal last_scheduled_history_poll
         for key, task in list(preparing.items()):
@@ -21380,6 +21425,7 @@ async def _subscribe_multiplex(
         # Register and snapshot without an await between them. Turn admission runs
         # on this same event loop, so no accepted broadcast can fall into the gap.
         _mux_turn_listeners.add(_offer_broadcast)
+        _background_activity_listeners.add(_offer_background_activity)
         for session_id, checkpoint in tuple(pending_checkpoints.items()):
             requested_turn_id = str(checkpoint.get("turn_id") or "")
             recent = _get_recent_turn(session_id)
@@ -21415,6 +21461,7 @@ async def _subscribe_multiplex(
     finally:
         closed = True
         _mux_turn_listeners.discard(_offer_broadcast)
+        _background_activity_listeners.discard(_offer_background_activity)
         if output_get is not None:
             output_get.cancel()
         if reconcile_task is not None:
@@ -23055,6 +23102,19 @@ async def _consume_sdk_idle_message(key: chat_runtime.ClientKey, message: Any) -
             if pending and client is not None:
                 _spawn_task_watcher(key[0], client, pending)
             return
+        if chat_subagents.is_subagent_message(message):
+            # Subagent output while the parent loop is idle is background
+            # activity: never begin a delivery (which would occupy the slot).
+            mux = _idle_subagent_muxes.get(key[0])
+            if mux is None:
+                mux = _idle_subagent_muxes[key[0]] = (
+                    chat_subagents.SubagentStreamMux(key[0]))
+            for record in mux.feed(message):
+                _publish_background_activity(key[0], {
+                    "event": record["event"],
+                    "data": json.dumps(record["data"]),
+                })
+            return
         begins_output = isinstance(message, AssistantMessage)
         if isinstance(message, StreamEvent):
             begins_output = (message.event or {}).get("type") in {
@@ -23074,6 +23134,7 @@ async def _consume_sdk_idle_message(key: chat_runtime.ClientKey, message: Any) -
 
 def _on_sdk_runtime_disconnected(session_id: str) -> None:
     """Retain interrupted schedule receipts and close their active delivery."""
+    _idle_subagent_muxes.pop(session_id, None)
     with _sdk_cron_state_lock:
         jobs = _sdk_cron_jobs.get(session_id, {})
         for raw in jobs.values():
