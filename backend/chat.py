@@ -2284,14 +2284,18 @@ def _background_runtime_needs_rollover(session_id: str) -> bool:
 
 def _direct_turn_would_restart_background_runtime(
     session_id: str, permission: str,
-) -> bool:
+) -> str:
+    """Reason a direct turn would restart the CLI under live background work.
+
+    Returns ``""`` (falsy) when the turn can share the live runtime.
+    """
     if not _session_has_background_work(session_id):
-        return False
+        return ""
     try:
         meta = sess.get_session_meta(session_id) or {}
     except Exception:
-        return False
-    return not chat_runtime.runtime_reusable(
+        return ""
+    return chat_runtime.runtime_reuse_blocker(
         session_id,
         (meta.get("model") or "").strip() or MODEL,
         permission,
@@ -14832,12 +14836,16 @@ async def turn_start(req: TurnStartReq) -> dict:
 async def _turn_start_impl(req: TurnStartReq) -> dict:
     """Admit and launch a new turn without coupling it to an SSE request."""
     permission = _validate_permission(req.permission)
-    if await obs.to_thread_io(
-            "chat.turn_runtime_check", req.session_id,
-            _direct_turn_would_restart_background_runtime,
-            req.session_id, permission):
+    restart_reason = await obs.to_thread_io(
+        "chat.turn_runtime_check", req.session_id,
+        _direct_turn_would_restart_background_runtime,
+        req.session_id, permission)
+    if restart_reason:
         # Running this turn would restart the CLI and end its background
         # tasks. 409 makes the browser queue it; the drain hands it over.
+        _perf_event("turn.deferred_for_background",
+                    sid8=obs.short_id(req.session_id),
+                    reason=restart_reason, permission=permission)
         raise HTTPException(409, "background tasks own the current runtime")
     _gc_images()
     prompt = req.prompt
@@ -20644,6 +20652,12 @@ def _schedule_queue_drain_retry(session_id: str, delay_s: float = 1.0) -> None:
     task.add_done_callback(_done)
 
 
+def _note_queue_deferred(session_id: str, reason: str) -> None:
+    """Record why a non-empty queue was left untouched by a drain pass."""
+    _perf_event("queue.drain_deferred", sid8=obs.short_id(session_id),
+                reason=reason)
+
+
 async def _maybe_drain_queue(session_id: str) -> None:
     """Start the next unstarted input when its exact runtime owner is free.
 
@@ -20695,10 +20709,12 @@ async def _maybe_drain_queue(session_id: str) -> None:
                     _schedule_queue_drain(successor_sid)
             return
         if session_id in _active_turns and not _active_turns[session_id].done:
+            _note_queue_deferred(session_id, "active_turn")
             return
         # A CLI-initiated reply owns the stream until its Result; its finish
         # re-kicks this drain.
         if _session_has_sdk_delivery(session_id):
+            _note_queue_deferred(session_id, "sdk_delivery")
             return
         # Background tasks that are still running do not defer queued input:
         # it runs on this same session, so the model keeps one continuous
@@ -20720,6 +20736,9 @@ async def _maybe_drain_queue(session_id: str) -> None:
                 )
                 if exc.status_code in {404, 409}:
                     _schedule_queue_drain_retry(session_id)
+            else:
+                if not successor_sid or successor_sid == session_id:
+                    _note_queue_deferred(session_id, "rollover_no_successor")
             return
         # READY presentation events are part of the visible chronology. Commit
         # them before claiming the next FIFO item; if local I/O cannot do so,
@@ -20738,6 +20757,7 @@ async def _maybe_drain_queue(session_id: str) -> None:
             _runtime_lineage_has_ready_continuation,
             session_id,
         ):
+            _note_queue_deferred(session_id, "continuation_ready")
             return
         item = await obs.to_thread_io(
             "chat.queue_claim",

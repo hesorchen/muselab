@@ -35420,8 +35420,8 @@ function portal() {
                     this._scheduleBackgroundHandoff(streamSid, streamState);
                   }
                   this.toast(this.lang === "zh"
-                    ? "当前任务仍在收尾，消息已加入队列"
-                    : "The current task is still finishing; message queued",
+                    ? "当前任务或后台任务仍在运行，消息已加入队列，结束后自动发送"
+                    : "A task is still running; message queued and will send when it ends",
                   "info", 2800);
                   return true;
                 }
