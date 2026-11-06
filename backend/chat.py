@@ -15674,11 +15674,13 @@ async def _watch_inflight_tasks_owned(
     action. The CLI also persists the auto-continue to the session JSONL, so a
     user who isn't looking still sees it on next load.
 
-    Only main-loop work opens the continuation: a task settlement (the CLI
-    reacts to it) or parent output. Forwarded subagent frames and task progress
-    are turnless background activity; with no live carrier they go to
-    `_publish_background_activity`, so a running subagent never occupies
-    `_active_turns` and the next user turn is admitted on this same runtime.
+    Only main-loop work opens the continuation: parent output from the CLI, or
+    the explicit resume query this watcher sends after the reaction grace.
+    Task settlements, task progress and forwarded subagent frames are turnless
+    background activity; with no live carrier they go to
+    `_publish_background_activity`. A settlement the CLI has not yet reacted to
+    (for example while other tasks still run) therefore never occupies
+    `_active_turns`, and the next user turn is admitted on this same runtime.
 
     `pending` maps task_id -> description for tasks still in flight at turn end.
     Drains client.receive_messages() until every pending task settles + its
@@ -15694,6 +15696,11 @@ async def _watch_inflight_tasks_owned(
     watch_started = obs.monotonic()
     watched_task_ids = set(pending)
     continuation_seen = False
+    # A task settled since the last main-loop Result and the CLI has not yet
+    # produced output for it. This is a wait, not main-loop work, so it holds
+    # no `_active_turns` slot; the grace timer below runs from this clock.
+    awaiting_reaction = False
+    reaction_wait_started_at: float | None = None
     watch_error_kind = "none"
     cont: TurnBroadcast | None = None
     cont_state: dict | None = None
@@ -15729,6 +15736,9 @@ async def _watch_inflight_tasks_owned(
         slot; the occupied live broadcast remains an optional second carrier.
         """
         nonlocal cont, cont_state, continuation_seen
+        nonlocal awaiting_reaction, reaction_wait_started_at
+        awaiting_reaction = False
+        reaction_wait_started_at = None
         if not _owns_generation():
             return
         spool = await _new_replay_spool()
@@ -16093,8 +16103,6 @@ async def _watch_inflight_tasks_owned(
             pending.pop(task_id, None)
             last_settle_status = str(status or "") or None
             if outcome:
-                if cont is None:
-                    await _open_continuation()
                 _emit_settlement({
                     "event": "task_notification",
                     "data": json.dumps({
@@ -16120,8 +16128,6 @@ async def _watch_inflight_tasks_owned(
                 continue
             pending.pop(task_id, None)
             if outcome:
-                if cont is None:
-                    await _open_continuation()
                 _emit_settlement({
                     "event": "task_notification",
                     "data": json.dumps({
@@ -16276,11 +16282,27 @@ async def _watch_inflight_tasks_owned(
                     # Absolute lease, never refreshed by progress/heartbeat
                     # messages. Started model/tool execution may be silent.
                     read_to = lease - elapsed
+                elif not pending and awaiting_reaction:
+                    # Every task settled but the CLI has not reacted yet. Same
+                    # grace as an unstarted continuation, without the slot.
+                    now = loop.time()
+                    if reaction_wait_started_at is None:
+                        reaction_wait_started_at = now
+                    lease = (_STOPPED_CONTINUATION_GRACE
+                             if last_settle_status == "stopped"
+                             else _CONTINUATION_GRACE)
+                    read_to = lease - (now - reaction_wait_started_at)
                 try:
                     if read_to is not None and read_to <= 0:
                         raise asyncio.TimeoutError
                     msg = await _next_message(read_to)
                 except asyncio.TimeoutError:
+                    if (cont is None and awaiting_reaction and not pending
+                            and last_settle_status != "stopped"
+                            and _owns_generation()):
+                        # The explicit resume query makes the main loop busy:
+                        # that, not the settlement, is what claims the slot.
+                        await _open_continuation()
                     if await _request_explicit_resume("continuation grace elapsed"):
                         _reopen_stream()
                         continue
@@ -16346,8 +16368,10 @@ async def _watch_inflight_tasks_owned(
                     pending.pop(tid, None)
                     _reschedule_watch_deadline()
                     if won_typed:
-                        if cont is None:
-                            await _open_continuation()
+                        # Settlement is lifecycle, not main-loop output: the
+                        # CLI may defer its reaction (other tasks still run).
+                        # Only its actual output opens the continuation.
+                        awaiting_reaction = True
                         _emit_settlement({"event": "task_notification",
                                           "data": json.dumps({
                             "task_id": tid,
@@ -16374,8 +16398,7 @@ async def _watch_inflight_tasks_owned(
                         pending.pop(tid, None)
                         _reschedule_watch_deadline()
                         if won_updated:
-                            if cont is None:
-                                await _open_continuation()
+                            awaiting_reaction = True
                             terminal["background_tasks_pending"] = len(pending)
                             _emit_settlement({
                                 "event": "task_notification",
@@ -16453,8 +16476,8 @@ async def _watch_inflight_tasks_owned(
                         if outcome:
                             won.append(n)
                     _reschedule_watch_deadline()
-                    if won and cont is None:
-                        await _open_continuation()
+                    if won:
+                        awaiting_reaction = True
                     for n in won:
                         _emit_settlement({"event": "task_notification",
                                           "data": json.dumps({
@@ -16471,6 +16494,8 @@ async def _watch_inflight_tasks_owned(
                     # their (later) notifications; otherwise we're done.
                     await _close_continuation(
                         duration_ms=getattr(msg, "duration_ms", None), result=msg)
+                    awaiting_reaction = False
+                    reaction_wait_started_at = None
                     if not pending:
                         break
                     # A clean Result releases the stream while other tasks are
@@ -16612,6 +16637,11 @@ async def _watch_inflight_tasks_owned(
             await _settle_active_turn_sidecar_owned(
                 session_id, release=True)
 
+    if (not continuation_seen and not pending and not watcher_cancelled
+            and not watcher_failed and last_settle_status == "stopped"):
+        # A user-stopped task with no CLI reaction ends as stopped, exactly as
+        # the former eagerly-opened continuation reported it.
+        watch_result.update(status="stopped", error="")
     if watcher_cancelled:
         watch_result["status"] = "cancelled"
     elif (watcher_failed or pending) and watch_result["status"] == "completed":

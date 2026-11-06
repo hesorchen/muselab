@@ -153,7 +153,7 @@ async def test_explicit_resume_has_a_full_response_lease(stream_env, monkeypatch
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("exit_kind", ["deadline", "eof", "cancel", "stopped"])
+@pytest.mark.parametrize("exit_kind", ["deadline", "eof", "cancel"])
 async def test_missing_result_fences_exact_runtime_before_queue_release(
     stream_env, monkeypatch, exit_kind,
 ):
@@ -172,10 +172,8 @@ async def test_missing_result_fences_exact_runtime_before_queue_release(
     client = QueueClient()
     client.fail_first_disconnect = exit_kind == "deadline"
     client.allow_disconnect.clear()
-    client.messages.put_nowait(notification(
-        sid, status="stopped" if exit_kind == "stopped" else "completed"))
-    if exit_kind != "stopped":
-        client.messages.put_nowait(assistant())
+    client.messages.put_nowait(notification(sid))
+    client.messages.put_nowait(assistant())
     stream, watcher = start_watcher(chat, sid, client)
     try:
         await wait_until(lambda: sid in chat._active_turns)
@@ -203,7 +201,7 @@ async def test_missing_result_fences_exact_runtime_before_queue_release(
             await asyncio.wait_for(watcher, 2)
         assert drains == [sid]
         done = json.loads(chat._recent_turns[sid].events[-1]["data"])
-        if exit_kind not in {"cancel", "stopped"}:
+        if exit_kind != "cancel":
             assert done["kind"] == "background_continuation_incomplete"
             assert done["is_error"] is True
         if exit_kind == "cancel":
@@ -446,13 +444,16 @@ async def test_main_thread_reaction_still_claims_the_slot_after_subagent_output(
         await wait_until(lambda: side)
         assert sid not in chat._active_turns
         client.messages.put_nowait(notification(sid))
-        await wait_until(lambda: sid in chat._active_turns)
+        await wait_until(lambda: any(e["event"] == "task_notification" for e in side))
+        # The settlement is lifecycle; only the CLI's own output is main-loop work.
+        assert sid not in chat._active_turns
         client.messages.put_nowait(assistant())
+        await wait_until(lambda: sid in chat._active_turns)
         client.messages.put_nowait(result(sid))
         await asyncio.wait_for(watcher, 2)
         events = [e["event"] for e in chat._recent_turns[sid].events]
-        assert "task_notification" in events
         assert "subagent_delta" not in events
+        assert "text" in events
         assert json.loads(chat._recent_turns[sid].events[-1]["data"])["status"] == "completed"
         assert client.queries == []
     finally:
@@ -507,3 +508,91 @@ async def test_idle_subagent_output_never_begins_a_delivery(stream_env):
     finally:
         chat._background_activity_listeners.discard(listener)
         chat._idle_subagent_muxes.pop(sid, None)
+
+
+def _start_watcher_for(chat, sid, client, task_ids):
+    for task_id in task_ids:
+        chat._pin_background_task(sid, task_id)
+    key = (sid, "claude-sonnet-4-6", "", "")
+    chat._clients[key] = client
+    stream = chat._ensure_session_stream(key, client)
+    watcher = asyncio.create_task(chat._watch_inflight_tasks(
+        sid, client, {task_id: task_id for task_id in task_ids}, None))
+    chat._task_watchers[sid] = watcher
+    return stream, watcher
+
+
+def _notification_for(sid, task_id, *, status="completed"):
+    return TaskNotificationMessage(
+        subtype="task_notification", data={}, task_id=task_id, status=status,
+        output_file=None, summary=task_id, uuid="note-" + task_id,
+        session_id=sid, tool_use_id="tool-" + task_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_settlement_while_other_tasks_run_keeps_the_session_idle(
+    stream_env, monkeypatch,
+):
+    """2026-11-06: a finished Bash task opened the continuation while two
+    subagents kept running; the CLI never reacted, so the tab stayed blue
+    ("streaming") for 10+ minutes after the turn footer said completed."""
+    chat = stream_env
+    sid = "settled-one-of-three"
+    monkeypatch.setattr(chat, "_CONTINUATION_GRACE", 0.01)
+    side = []
+
+    def listener(session_id, event):
+        side.append(event)
+
+    chat._background_activity_listeners.add(listener)
+    client = QueueClient()
+    client.messages.put_nowait(_notification_for(sid, "bash-task"))
+    stream, watcher = _start_watcher_for(
+        chat, sid, client, ["bash-task", "agent-a", "agent-b"])
+    try:
+        await wait_until(lambda: side)
+        await asyncio.sleep(0.05)
+        assert side[0]["event"] == "task_notification"
+        assert json.loads(side[0]["data"])["background_tasks_pending"] == 2
+        assert sid not in chat._active_turns
+        status = chat._session_active_status(
+            sid, runtime_lineage=[], durable_runtime_task_ids=(),
+            continuation_disk_state=(frozenset(), ""))
+        assert status["background"] is True
+        # Grace only applies once every task settled: no premature resume.
+        assert client.queries == []
+        assert not watcher.done()
+    finally:
+        chat._background_activity_listeners.discard(listener)
+        watcher.cancel()
+        with suppress(asyncio.CancelledError):
+            await watcher
+        await stream.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stopped_task_without_reaction_ends_idle_and_keeps_runtime(
+    stream_env, monkeypatch,
+):
+    chat = stream_env
+    sid = "stopped-no-reaction"
+    monkeypatch.setattr(chat, "_STOPPED_CONTINUATION_GRACE", 0.01)
+    drains = []
+
+    async def drain(session_id):
+        drains.append(session_id)
+
+    monkeypatch.setattr(chat, "_maybe_drain_queue", drain)
+    client = QueueClient()
+    client.messages.put_nowait(notification(sid, status="stopped"))
+    stream, watcher = start_watcher(chat, sid, client)
+    try:
+        outcome = await asyncio.wait_for(watcher, 2)
+        assert outcome["status"] == "stopped"
+        assert sid not in chat._active_turns
+        assert client.disconnect_calls == 0
+        assert client.queries == []
+        assert drains == [sid]
+    finally:
+        await stream.aclose()
