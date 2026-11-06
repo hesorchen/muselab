@@ -4044,12 +4044,19 @@ def test_watcher_settles_from_terminal_task_updated_without_notification(stream_
         await chat_mod._watch_inflight_tasks(
             sid, fake_client, {"task_killed": "long command"})
 
+    side = []
+
+    def listener(session_id, event):
+        side.append(event)
+
+    chat_mod._background_activity_listeners.add(listener)
     try:
         asyncio.run(run())
-        bc = chat_mod._recent_turns.get(sid)
-        assert bc is not None
+        # A stopped task with no CLI reaction is lifecycle only: it updates the
+        # card through the turnless lane and never occupies the turn slot.
+        assert sid not in chat_mod._recent_turns
         terminal_event = next(
-            event for event in bc.events if event.get("event") == "task_notification"
+            event for event in side if event.get("event") == "task_notification"
         )
         payload = json.loads(terminal_event["data"])
         assert payload["task_id"] == "task_killed"
@@ -4058,6 +4065,7 @@ def test_watcher_settles_from_terminal_task_updated_without_notification(stream_
         assert sid not in chat_mod._sessions_with_inflight_tasks
         assert sid not in chat_mod._task_watchers
     finally:
+        chat_mod._background_activity_listeners.discard(listener)
         chat_mod._sessions_with_inflight_tasks.pop(sid, None)
         chat_mod._task_watchers.pop(sid, None)
         chat_mod._active_turns.pop(sid, None)

@@ -15701,6 +15701,10 @@ async def _watch_inflight_tasks_owned(
     # no `_active_turns` slot; the grace timer below runs from this clock.
     awaiting_reaction = False
     reaction_wait_started_at: float | None = None
+    # Settlements published while no continuation was open. They are replayed
+    # into the continuation when the CLI reacts, so its replay stays complete
+    # (card flip + reaction) for browsers that attach to it later.
+    reaction_backlog: list[dict] = []
     watch_error_kind = "none"
     cont: TurnBroadcast | None = None
     cont_state: dict | None = None
@@ -15774,6 +15778,9 @@ async def _watch_inflight_tasks_owned(
             "wait_started_at": None,
             "incomplete_error": None,
         }
+        for event in reaction_backlog:
+            b.publish(event)
+        reaction_backlog.clear()
 
     def _emit_settlement(event: dict) -> bool:
         """Deliver a terminal task event, continuation or not.
@@ -15794,6 +15801,8 @@ async def _watch_inflight_tasks_owned(
         genuinely nobody to publish to.
         """
         delivered = False
+        if cont is None and event.get("event") == "task_notification":
+            reaction_backlog.append(event)
         if cont is not None:
             cont.publish(event)
             delivered = True
@@ -16320,6 +16329,10 @@ async def _watch_inflight_tasks_owned(
                         await _terminate_expired_tasks(
                             "message stream ended before task settlement")
                         break
+                    if (bg_q is None and cont is None and awaiting_reaction
+                            and last_settle_status != "stopped"
+                            and _owns_generation()):
+                        await _open_continuation()
                     if (bg_q is None
                             and await _request_explicit_resume("message stream ended")):
                         _reopen_stream()
@@ -16496,6 +16509,7 @@ async def _watch_inflight_tasks_owned(
                         duration_ms=getattr(msg, "duration_ms", None), result=msg)
                     awaiting_reaction = False
                     reaction_wait_started_at = None
+                    reaction_backlog.clear()
                     if not pending:
                         break
                     # A clean Result releases the stream while other tasks are
