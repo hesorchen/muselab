@@ -399,7 +399,8 @@ async def test_subagent_output_does_not_occupy_the_main_loop_slot(stream_env):
     chat = stream_env
     sid = "subagent-only-output"
     side = []
-    listener = lambda session_id, event: side.append((session_id, event))
+    def listener(session_id, event):
+        side.append((session_id, event))
     chat._background_activity_listeners.add(listener)
     client = QueueClient()
     client.messages.put_nowait(subagent_delta(sid, "child "))
@@ -435,7 +436,8 @@ async def test_main_thread_reaction_still_claims_the_slot_after_subagent_output(
     monkeypatch.setattr(chat, "_CONTINUATION_GRACE", 0.01)
     monkeypatch.setattr(chat, "_CONTINUATION_TIMEOUT", 1)
     side = []
-    listener = lambda session_id, event: side.append(event)
+    def listener(session_id, event):
+        side.append(event)
     chat._background_activity_listeners.add(listener)
     client = QueueClient()
     client.messages.put_nowait(subagent_delta(sid, "child"))
@@ -464,7 +466,8 @@ async def test_subagent_output_reaches_a_live_foreground_turn(stream_env):
     chat = stream_env
     sid = "subagent-with-foreground"
     side = []
-    listener = lambda session_id, event: side.append(event)
+    def listener(session_id, event):
+        side.append(event)
     chat._background_activity_listeners.add(listener)
     foreground = chat.TurnBroadcast(
         session_id=sid, model="m", events=await chat._new_replay_spool())
@@ -493,7 +496,8 @@ async def test_idle_subagent_output_never_begins_a_delivery(stream_env):
     sid = "idle-subagent-output"
     key = (sid, "claude-sonnet-4-6", "", "")
     side = []
-    listener = lambda session_id, event: side.append((session_id, event["event"]))
+    def listener(session_id, event):
+        side.append((session_id, event["event"]))
     chat._background_activity_listeners.add(listener)
     try:
         await chat._consume_sdk_idle_message(key, subagent_delta(sid, "child"))
