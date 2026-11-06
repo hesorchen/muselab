@@ -52,6 +52,7 @@ _COMMAND_WRAPPER_MARKERS = (
     "<command-args>",
     "<local-command-stdout>",
     "<local-command-stderr>",
+    "<local-command-caveat>",
     "<system-reminder>",
     "<task-notification>",
 )

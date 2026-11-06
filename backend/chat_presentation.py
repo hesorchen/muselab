@@ -8,9 +8,12 @@ from typing import Any, Callable
 from .task_summaries import normalize_task_summary
 
 
+# `local-command-caveat` is the CLI's own "this command ran locally" note. It is
+# written as a separate user message next to a /compact or other local command
+# and must never reach the UI as something the user said.
 _CLI_SLASH_TAGS_RE = re.compile(
     r"<(command-name|command-message|command-args|"
-    r"local-command-stdout|local-command-stderr)>.*?</\1>",
+    r"local-command-stdout|local-command-stderr|local-command-caveat)>.*?</\1>",
     re.DOTALL,
 )
 _TASK_NOTIFICATION_RE = re.compile(
