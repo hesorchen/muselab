@@ -2264,6 +2264,35 @@ def _session_has_sdk_delivery(session_id: str) -> bool:
     )
 
 
+# Session state model (SDK-aligned). Two independent questions, never mixed:
+#
+# 1. Who owns the CLI main loop?  `_active_turns[sid]` (plus a pending CLI
+#    delivery). Exactly one prompt is between query and ResultMessage: a user
+#    turn, a CLI-initiated prompt (task notification it dequeued, scheduled
+#    trigger, our explicit resume) or its parent output. This alone gates turn
+#    admission, queue drain, native steering, the blue "streaming" dot and the
+#    stop button.
+# 2. Is background work pinned to this CLI process?  Running tasks, a live
+#    watcher, a CLI delivery. This alone gates anything that would replace or
+#    kill the process (rebuild, compact, clear, recover, restore, rollover).
+#    It never refuses or queues a user turn on the same runtime.
+#
+# Task settlements, task progress and subagent frames are lifecycle events of
+# (2); they never occupy (1).
+
+
+def _is_cli_initiated_prompt(msg: Any) -> bool:
+    """Whether the CLI started a main-loop turn of its own with this prompt."""
+    if not isinstance(msg, UserMessage):
+        return False
+    origin = sdk_lifecycle.normalize_origin(getattr(msg, "origin", None))
+    if origin is not None:
+        return origin["kind"] != "human"
+    # Some CLI builds omit MessageOrigin on the dequeued notification prompt;
+    # its <task-notification> body is then the only provenance.
+    return bool(_parse_task_notifications(_usermsg_task_notification_text(msg)))
+
+
 def _session_has_background_work(session_id: str) -> bool:
     return bool(
         _sessions_with_inflight_tasks.get(session_id)
@@ -2322,6 +2351,17 @@ def _direct_turn_would_restart_background_runtime(
         effort=meta.get("effort") or "",
         service_tier=meta.get("service_tier") or "",
         plan_return_permission=meta.get("plan_return_permission") or "",
+    )
+
+
+def _session_main_loop_busy(session_id: str) -> bool:
+    """Question (1): a prompt currently owns the CLI main loop."""
+    from .api_delivery import RESTORING
+    active = _active_turns.get(session_id)
+    return bool(
+        session_id in RESTORING
+        or (active is not None and not active.done)
+        or _session_has_sdk_delivery(session_id)
     )
 
 
@@ -8624,7 +8664,6 @@ def _admitted_steering_turn(
         or bc.is_scheduled_delivery
         or bc.result_forwarded
         or bc.steering_closed
-        or _session_has_live_watcher(session_id)
     ):
         return None
     requested_permission = (permission or "").strip()
@@ -16358,6 +16397,18 @@ async def _watch_inflight_tasks_owned(
                             "data": json.dumps(record["data"]),
                         })
                     continue
+
+                if _is_cli_initiated_prompt(msg):
+                    # The CLI dequeued its own prompt (a task notification it
+                    # is now answering, or our explicit resume): its main loop
+                    # is busy from this moment, before any model output. Claim
+                    # the slot now so the session shows "running" at once and
+                    # the reaction grace never fires for work that started.
+                    if cont is None:
+                        await _open_continuation()
+                    if cont_state is not None:
+                        cont_state["started"] = True
+                        cont_state["wait_started_at"] = None
 
                 if isinstance(msg, TaskNotificationMessage):
                     # PRIMARY typed path. Phase-0 probe (2026-06-11, CLI

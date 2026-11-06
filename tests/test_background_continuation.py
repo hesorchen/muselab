@@ -596,3 +596,73 @@ async def test_stopped_task_without_reaction_ends_idle_and_keeps_runtime(
         assert drains == [sid]
     finally:
         await stream.aclose()
+
+
+def _cli_notification_prompt(sid):
+    from claude_agent_sdk import UserMessage
+    return UserMessage(
+        content=(
+            "<task-notification>\n<task-id>synthetic-task</task-id>\n"
+            "<status>completed</status>\n<summary>synthetic task</summary>\n"
+            "</task-notification>"
+        ),
+        uuid="cli-dequeued-notification",
+    )
+
+
+@pytest.mark.asyncio
+async def test_cli_dequeued_notification_claims_the_slot_before_output(
+    stream_env, monkeypatch,
+):
+    """The CLI's own prompt is the start of main-loop work.
+
+    2026-11-07: the CLI dequeued a task notification at 00:26:42 but produced
+    its first output 24 s later. The watcher only treated model output as the
+    start, so the UI showed no running turn and the 8 s grace sent a needless
+    explicit resume while the CLI was already working.
+    """
+    chat = stream_env
+    sid = "cli-dequeued-notification"
+    monkeypatch.setattr(chat, "_CONTINUATION_GRACE", 0.02)
+    monkeypatch.setattr(chat, "_CONTINUATION_TIMEOUT", 1)
+    client = QueueClient()
+    client.messages.put_nowait(notification(sid))
+    client.messages.put_nowait(_cli_notification_prompt(sid))
+    stream, watcher = start_watcher(chat, sid, client)
+    try:
+        await wait_until(lambda: sid in chat._active_turns)
+        await asyncio.sleep(0.08)
+        assert client.queries == []
+        assert not watcher.done()
+        client.messages.put_nowait(assistant())
+        client.messages.put_nowait(result(sid))
+        await asyncio.wait_for(watcher, 2)
+        events = [e["event"] for e in chat._recent_turns[sid].events]
+        assert "task_notification" in events
+        assert "text" in events
+        assert client.queries == []
+    finally:
+        await stream.aclose()
+
+
+def test_turn_gates_never_consult_background_work(stream_env):
+    """Main-loop ownership gates must not depend on background-work signals.
+
+    Each of these once queued or refused a user turn because a task, watcher or
+    subagent was alive (#317, #331, #332, steering 2026-11-07).
+    """
+    import inspect
+
+    chat = stream_env
+    background_signals = (
+        "_sessions_with_inflight_tasks", "_session_has_live_watcher",
+        "_session_has_background_work", "_task_watchers",
+    )
+    for gate in (chat._admitted_steering_turn, chat._eligible_steering_turn,
+                 chat._session_main_loop_busy):
+        source = inspect.getsource(gate)
+        for signal in background_signals:
+            assert signal not in source, (gate.__name__, signal)
+    admit = inspect.getsource(chat._admit_turn)
+    for signal in background_signals:
+        assert signal not in admit, ("_admit_turn", signal)

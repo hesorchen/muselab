@@ -220,8 +220,13 @@ async def latest_reply(
     reply = reply[:_REPLY_LIMIT] + ("…" if truncated else "")
     queue = await asyncio.to_thread(sess.get_queue, session_id)
     pending = len(queue.get("items") or [])
-    busy = chat._session_runtime_busy(session_id) or bool(queue.get("inflight"))
-    status = "执行中" if busy else "等待执行" if pending else "会话空闲"
+    busy = chat._session_main_loop_busy(session_id) or bool(queue.get("inflight"))
+    status = (
+        "执行中" if busy
+        else "等待执行" if pending
+        else "后台任务运行中" if chat._session_has_background_work(session_id)
+        else "会话空闲"
+    )
     # This is a session snapshot, not proof that one particular request ran.
     message = f"{_title(meta)}\n{status}（排队 {pending} 条）\n\n"
     message += reply or "最近消息中暂无文字回复，请在 MuseLab 查看详情。"

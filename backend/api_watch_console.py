@@ -205,9 +205,11 @@ def _home(scope: str) -> dict:
 
 
 def _status(sid: str, queue: dict) -> str:
-    if chat._session_runtime_busy(sid) or queue.get("inflight"):
+    if chat._session_main_loop_busy(sid) or queue.get("inflight"):
         return "执行中"
-    return "等待执行" if queue.get("items") else "会话空闲"
+    if queue.get("items"):
+        return "等待执行"
+    return "后台任务运行中" if chat._session_has_background_work(sid) else "会话空闲"
 
 
 async def _recent(scope: str, workspace: Path) -> dict:
