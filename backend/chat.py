@@ -8660,7 +8660,7 @@ def _admitted_steering_turn(
         or bc.cancelled
         or not turn_id
         or bc.turn_id != turn_id
-        or bc.is_continuation
+        or (bc.is_continuation and bc.runtime_client is None)
         or bc.is_scheduled_delivery
         or bc.result_forwarded
         or bc.steering_closed
@@ -15744,6 +15744,11 @@ async def _watch_inflight_tasks_owned(
     # into the continuation when the CLI reacts, so its replay stays complete
     # (card flip + reaction) for browsers that attach to it later.
     reaction_backlog: list[dict] = []
+    # A Result that arrived while native steering commands targeting the open
+    # continuation were still unsettled. The CLI may still fold them into this
+    # reaction or run them next; keep the continuation (and its reader) open
+    # until their terminal lifecycle, exactly like a foreground turn.
+    steering_deferred_result: ResultMessage | None = None
     watch_error_kind = "none"
     cont: TurnBroadcast | None = None
     cont_state: dict | None = None
@@ -15794,6 +15799,13 @@ async def _watch_inflight_tasks_owned(
         b.parent_turn_id = _background_origin_turn_id.get(session_id, "")
         b.is_continuation = True
         b.perf_client = "warm"
+        # The CLI main loop is already running this prompt, so it accepts
+        # native `priority=next` commands exactly as for a user turn.
+        b.permission = str((continuation_meta or {}).get("permission") or "")
+        if isinstance(client, MuseLabSDKClient):
+            b.runtime_client = client
+            b.query_committed = True
+            b.steering_ready.set()
         continuation_seen = True
         async with _lock:
             if not _owns_generation():
@@ -15869,12 +15881,18 @@ async def _watch_inflight_tasks_owned(
         _active_turns (identity-checked so we never pop a newer turn's slot),
         and grace-keep it for a slightly-late FE reconnect."""
         nonlocal cont, cont_state, watcher_failed, watcher_cancelled, watch_error_kind
+        nonlocal steering_deferred_result
         b = cont
         state = cont_state
         cont = None
         cont_state = None
+        steering_deferred_result = None
         if b is None:
             return
+        # Close steering admission first; any command the CLI never settled
+        # becomes review-only instead of losing its owner with this broadcast.
+        b.result_forwarded = True
+        await _cancel_outstanding_steering_commands(b)
         # Shutdown marks every active broadcast before cancelling its watcher.
         # Treat that as cancellation even when the finally block is the caller;
         # a streamed prefix is not a truthful completed Agent reply.
@@ -16398,6 +16416,18 @@ async def _watch_inflight_tasks_owned(
                         })
                     continue
 
+                if isinstance(msg, CommandLifecycleMessage):
+                    # Native steering ACKs for a command sent into the open
+                    # continuation. A terminal ACK may release a deferred Result.
+                    if cont is None:
+                        continue
+                    terminal = await _settle_steering_lifecycle(cont, msg)
+                    if (not terminal or cont.steering_commands
+                            or steering_deferred_result is None):
+                        continue
+                    msg = steering_deferred_result
+                    steering_deferred_result = None
+
                 if _is_cli_initiated_prompt(msg):
                     # The CLI dequeued its own prompt (a task notification it
                     # is now answering, or our explicit resume): its main loop
@@ -16553,6 +16583,13 @@ async def _watch_inflight_tasks_owned(
                             "background_tasks_pending": len(pending),
                         })})
                 elif isinstance(msg, ResultMessage):
+                    if cont is not None:
+                        # A command written just before this Result may still
+                        # be folded in or run next: keep the turn open.
+                        await _await_steering_write_stability(cont)
+                        if cont.steering_commands:
+                            steering_deferred_result = msg
+                            continue
                     # End of the CLI's auto-continue reaction — close the
                     # continuation. If tasks remain in flight, keep reading for
                     # their (later) notifications; otherwise we're done.

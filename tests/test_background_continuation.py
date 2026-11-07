@@ -666,3 +666,66 @@ def test_turn_gates_never_consult_background_work(stream_env):
     admit = inspect.getsource(chat._admit_turn)
     for signal in background_signals:
         assert signal not in admit, ("_admit_turn", signal)
+
+
+@pytest.mark.asyncio
+async def test_adjust_steers_into_the_clis_own_reaction_and_defers_its_result(
+    stream_env, monkeypatch,
+):
+    """2026-11-07: while the CLI reacted to a task notification for 15+ min,
+    "尽快调整" fell back to FIFO because continuations were not steerable, so
+    the user's correction waited for the whole reaction."""
+    chat = stream_env
+    sid = "steer-into-continuation"
+    monkeypatch.setattr(chat, "_CONTINUATION_GRACE", 1)
+    monkeypatch.setattr(chat, "_CONTINUATION_TIMEOUT", 2)
+    sid = chat.sess.create_session()["id"]
+
+    class SteerableClient(QueueClient):
+        def __init__(self):
+            super().__init__()
+            self.steering = []
+
+        async def query_steering(self, text, *, session_id, command_uuid):
+            self.steering.append((text, command_uuid))
+
+    monkeypatch.setattr(chat, "MuseLabSDKClient", SteerableClient)
+    client = SteerableClient()
+    client.messages.put_nowait(notification(sid))
+    client.messages.put_nowait(_cli_notification_prompt(sid))
+    stream, watcher = start_watcher(chat, sid, client)
+    try:
+        await wait_until(lambda: sid in chat._active_turns)
+        cont = chat._active_turns[sid]
+        assert cont.is_continuation and cont.runtime_client is client
+        response = await chat.enqueue_api(sid, chat.QueueEnqueueReq(
+            text="use four routes", delivery="adjust", active_turn_id=cont.turn_id,
+        ), chat.BackgroundTasks())
+        assert response["effective_delivery"] == "adjust"
+        assert [text for text, _ in client.steering] == ["use four routes"]
+        command_uuid = client.steering[0][1]
+
+        # The reaction ends before the CLI settles the command: stay open.
+        client.messages.put_nowait(assistant())
+        client.messages.put_nowait(result(sid))
+        await asyncio.sleep(0.1)
+        assert chat._active_turns.get(sid) is cont
+        assert not watcher.done()
+
+        for state in ("started", "completed"):
+            client.messages.put_nowait(chat.CommandLifecycleMessage(
+                command_uuid=command_uuid, state=state, session_id=sid,
+                uuid="life-" + state))
+        await asyncio.wait_for(watcher, 2)
+        assert sid not in chat._active_turns
+        assert chat.sess.get_queue(sid)["items"] == []
+        steering = [json.loads(e["data"])["state"] for e in cont.events
+                    if e["event"] == "queue_steering"]
+        assert "started" in steering and "completed" in steering
+        assert json.loads(cont.events[-1]["data"])["status"] == "completed"
+    finally:
+        if not watcher.done():
+            watcher.cancel()
+            with suppress(asyncio.CancelledError):
+                await watcher
+        await stream.aclose()
