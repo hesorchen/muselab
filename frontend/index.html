@@ -2033,16 +2033,6 @@
         <div class="chat-body" x-ref="chatBody"
              :inert="transcriptLoadingVisible()"
              @scroll="onChatScroll()" @wheel.passive="_userScrollIntent($event)" @touchstart.passive="_chatTouchStart($event)" @touchmove.passive="_userScrollIntent($event)" @pointerdown.passive="_userScrollIntent($event)" @pointerup.window="_chatPointerScroll = null" @pointercancel.window="_chatPointerScroll = null" @keydown="_userScrollIntent($event)" @click="onChatClick($event)">
-          <div x-show="transcriptLoadFailed()"
-               class="chat-load-error"
-               :class="{ 'has-resident': activeSession.messages.length }"
-               role="alert">
-            <svg aria-hidden="true"><use href="#i-alert-circle"/></svg>
-            <strong x-text="t('chat.load_failed')"></strong>
-            <button type="button" class="btn-secondary"
-                    @click="retryTranscriptLoad()"
-                    x-text="t('chat.load_retry')"></button>
-          </div>
           <div x-show="transcriptEmptyReady()"
                class="brand-empty chat-empty">
             <span class="muse-mascot lg" :class="{'greet': mascotGreet}" @click="cycleMascot()">
@@ -3323,7 +3313,7 @@
           <div x-ref="chatBottom" class="chat-bottom-anchor" aria-hidden="true"></div>
         </div>
         <div class="chat-transcript-loading-overlay"
-             x-show="!transcriptLoadFailed() && transcriptLoadingVisible()"
+             x-show="transcriptLoadingVisible()"
              x-cloak
              role="status"
              aria-live="polite"

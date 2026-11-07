@@ -68,8 +68,6 @@ window.MUSELAB_STRINGS = {
     "chat.startup_runtime": "正在启动运行环境",
     "chat.startup_tools": "正在准备工具",
     "chat.startup_context": "正在准备会话",
-    "chat.load_failed": "会话加载失败",
-    "chat.load_retry": "重试",
     "chat.no_session": "还没选会话，点左下「+ 新会话」开始",
     "chat.attach_files": "已附带文件（点 × 移除）",
     // preview empty state
@@ -496,8 +494,6 @@ window.MUSELAB_STRINGS = {
     "chat.startup_runtime": "Starting runtime",
     "chat.startup_tools": "Preparing tools",
     "chat.startup_context": "Preparing conversation",
-    "chat.load_failed": "Conversation failed to load",
-    "chat.load_retry": "Retry",
     "chat.no_session": "No session selected — click \"+ New\" at bottom-left",
     "chat.attach_files": "Attached files (× to remove)",
     "empty.preview_tagline": "MuseLab · Local Agent Workbench",

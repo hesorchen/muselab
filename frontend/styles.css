@@ -4878,38 +4878,6 @@ html[data-theme="light"] .msg.user .bubble:not(.is-scheduled-trigger) { color: v
   pointer-events: auto;
   background: var(--c-bg-1);
 }
-.chat-load-error {
-  flex: 1 0 auto;
-  min-height: 180px;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 10px;
-  color: var(--c-fg-2);
-  text-align: center;
-}
-.chat-load-error > svg {
-  width: 26px;
-  height: 26px;
-  color: var(--c-danger);
-}
-.chat-load-error strong { color: var(--c-fg-0); }
-.chat-load-error.has-resident {
-  position: sticky;
-  top: 0;
-  z-index: 3;
-  flex: 0 0 auto;
-  min-height: 0;
-  flex-direction: row;
-  padding: 10px 12px;
-  border: 1px solid var(--c-danger);
-  border-radius: var(--r-md);
-  background: var(--c-bg-1);
-  box-shadow: var(--shadow-sm);
-}
-.chat-load-error.has-resident > svg { width: 18px; height: 18px; }
-.chat-load-error.has-resident .btn-secondary { margin-left: auto; }
 /* Never remove canonical messages from layout while a cold load settles.
    The old display:none gate left only turn separators / virtual spacers visible
    whenever messagesReady missed a callback, producing a full-height blank chat

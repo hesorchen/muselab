@@ -4081,8 +4081,9 @@ def test_transcript_failure_keeps_resident_content_and_live_owner_cancels_shield
         payload,
     )
     assert result == {"loaded": False, "phase": "error"}
-    expect(page.locator(".chat-load-error")).to_be_visible()
-    expect(page.locator(".chat-load-error")).to_contain_text("Conversation failed to load")
+    # A failed load is silent: no banner, resident content stays visible.
+    expect(page.locator(".chat-load-error")).to_have_count(0)
+    expect(page.get_by_text("Conversation failed to load")).to_have_count(0)
     expect(page.locator(".msg-pane:visible")).to_contain_text(marker)
     page.wait_for_function(
         "() => !document.querySelector('#app')._x_dataStack[0].transcriptLoadingVisible()"
