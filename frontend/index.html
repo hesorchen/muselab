@@ -3272,15 +3272,13 @@
                "Muse is thinking" bubble. It disappears as soon as any muse-side
                block arrives, whereupon that block's own footer takes over. -->
           <!-- Auto-compact has its distinct 📦 placeholder and wins this slot.
-               A continuation waiting for background settlement is deliberately
-               quiet until its reaction stream actually starts. -->
-          <div x-show="activeSession.streaming && (!activeSession.messages.length
+               Visibility follows the single live source, _paneMainLoopLive. -->
+          <div x-show="_paneMainLoopLive(activeSession) && (!activeSession.messages.length
                                        || activeSession.messages[activeSession.messages.length-1].role === 'user')
                        && (!activeSession.messages.length
                          || !activeSession.messages[activeSession.messages.length-1]._admissionPending)
                        && !activeSession._queueAdmission
-                       && !activeSession.compacting
-                       && !activeSession._continuationAwaitingReaction"
+                       && !activeSession.compacting"
                class="turn-footer turn-pending-footer"
                x-cloak>
             <span class="turn-status running">
