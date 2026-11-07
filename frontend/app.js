@@ -4940,6 +4940,11 @@ function portal() {
 
       const ownerTurnId = String((ownerUser && ownerUser._turnId) || "");
       const activeTurnId = String(pane.activeTurnId || "");
+      // The CLI's own reaction (a continuation) has its own turn id but
+      // renders under the user turn it continues: that segment is live too.
+      if (ownerTurnId && ownerTurnId === String(pane.parentTurnId || "")) {
+        return true;
+      }
       if (ownerTurnId && activeTurnId) return ownerTurnId === activeTurnId;
 
       // Before the first turn metadata event arrives, the newest user boundary
@@ -9721,13 +9726,15 @@ function portal() {
       const turnId = activeTurnId === undefined
         ? String((st && st.activeTurnId) || "")
         : String(activeTurnId || "");
-      // Native SDK steering is bound to one immutable foreground turn and is
+      // Native SDK steering is bound to one immutable main-loop turn and is
       // text-only (the server turns attachments into on-disk paths in the
-      // steering text).  Every state that is already known to be ineligible
-      // should advertise ordinary FIFO immediately instead of briefly
-      // promising an adjustment that the queue endpoint must downgrade.
+      // steering text).  The CLI's own reaction to a task notification is such
+      // a turn too, and background tasks never make a turn ineligible.  Every
+      // state that is already known to be ineligible should advertise ordinary
+      // FIFO immediately instead of briefly promising an adjustment that the
+      // queue endpoint must downgrade.
       if (!st || !turnId || st.compacting
-          || (!st.streaming && (st.backgroundActive || st._draining)) || st.parentTurnId
+          || (!st.streaming && (st.backgroundActive || st._draining))
           || !this._pendingQueueAllowsAdjustment(st, turnId)) {
         return "queue";
       }
@@ -9759,8 +9766,7 @@ function portal() {
       // returns immediately without an extra request.
       if (!st || this.tabState[sid] !== st
           || this._normalizeBusySendMode(this.busySendMode) !== "adjust"
-          || !st.streaming || st.compacting
-          || st.backgroundActive || st._draining || st.parentTurnId
+          || !st.streaming || st.compacting || st._draining
           || !this._pendingQueueAllowsAdjustment(st)) {
         return "";
       }

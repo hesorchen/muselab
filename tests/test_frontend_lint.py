@@ -5939,7 +5939,11 @@ def test_busy_send_mode_uses_authoritative_delivery_and_steering_state():
     delivery = app[delivery_start:delivery_end]
     assert 'this.busySendMode) !== "adjust"' in delivery
     assert "!turnId || st.compacting" in delivery
-    assert "st.backgroundActive || st._draining || st.parentTurnId" in delivery
+    # The CLI's own continuation is a steerable main-loop turn, and a running
+    # background task never makes the live turn ineligible for adjustment.
+    assert "(!st.streaming && (st.backgroundActive || st._draining))" in delivery
+    assert "st.parentTurnId" not in delivery
+    assert "|| !st.streaming || st.compacting || st._draining" in delivery
     assert "!this._pendingQueueAllowsAdjustment(st, turnId)" in delivery
     assert "!this._pendingQueueAllowsAdjustment(st)" in delivery
     assert 'delivery === "adjust" && active && !!targetTurnId' in delivery
