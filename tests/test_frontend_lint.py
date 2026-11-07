@@ -2700,7 +2700,6 @@ def test_background_task_gap_rolls_foreground_onto_detached_successor():
     assert "st.sessionSync.backgroundTicksLeft = 1810" in poller
     assert 'this._requestSessionSync(sid, "background_continuation"' in poller
     assert "_stopTimer();" in app
-    assert "_continuationAwaitingReaction: false" in app
     # The turn footer must key off a REAL streaming turn. It used to also
     # suppress itself on backgroundActive, which hid the completion timestamp
     # of every turn that finished while a background task was still pending.
@@ -3717,19 +3716,16 @@ def test_done_immediately_stamps_tool_tail_and_quietly_adopts_fork_boundary():
     assert '@click.stop="forkConversation(tid, turnForkMessageId(paneMsgs, i))"' in html
 
 
-def test_background_settlement_pauses_footer_until_reaction_starts():
+def test_background_settlement_never_pauses_the_live_footer():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     send_start = app.index("async send(opts = {})")
     send = app[send_start:app.index("async stop()", send_start)]
 
-    assert "_setContinuationAwaitingReaction(true)" in send
-    assert "_setContinuationAwaitingReaction(false)" in send
     assert "background_tasks_pending" in send
-    assert "_continuationAwaitingReaction: false" in app
-    status_start = app.index("turnFooterStatus(m, pane) {")
-    status_end = app.index("turnStatusLabel(status)", status_start)
-    status = app[status_start:status_end]
-    assert "if (pane && pane._continuationAwaitingReaction) return \"\";" in status
+    # A continuation stream exists only while the CLI main loop runs it, so a
+    # settled task never puts the live footer into a quiet wait (2026-11-08).
+    assert "_continuationAwaitingReaction" not in app
+    assert "_setContinuationAwaitingReaction" not in send
 
 
 def test_terminal_event_immediately_settles_tab_activity_snapshot():
@@ -5303,36 +5299,31 @@ def test_running_state_is_rendered_once_in_the_turn_separator():
 
 
 def test_running_turn_footer_is_owned_by_active_user_boundary():
-    """A newer stream must not relabel an unannotated historical tail."""
+    """Live status has one source and belongs only to the conversation tail.
+
+    Per-message turn inference (owner user row, turn ids, parent ids, ts)
+    missed CLI reactions, chained reactions and history reloads one by one
+    (#334, #335, 2026-11-08). A historical tail can never be relabelled live.
+    """
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
 
-    helper_start = app.index("_turnMessageBelongsToActiveTurn(m, pane) {")
-    helper_end = app.index("\n    turnFooterStatus(m, pane) {", helper_start)
-    helper = app[helper_start:helper_end]
-
-    status_start = helper_end + 1
-    status_end = app.index("\n    turnStatusLabel(status)", status_start)
-    status = app[status_start:status_end]
+    assert "_turnMessageBelongsToActiveTurn" not in app
+    live_start = app.index("    _paneMainLoopLive(pane) {")
+    live_end = app.index("\n    turnStatusLabel(status)", live_start)
+    live = app[live_start:live_end]
+    assert "this.isTabStreaming(sid)" in live
+    assert "pane.compacting" in live
+    assert "rows[rows.length - 1] === m" in live
+    status = live[live.index("turnFooterStatus(m, pane) {"):]
+    assert 'this._paneMainLoopLive(pane) || stored === "running"' in status
+    assert status.index("this._isPaneTail(m, pane)") < status.index(
+        'if (stored && stored !== "running") return stored;')
+    assert "parentTurnId" not in live and "activeTurnId" not in live
 
     model_start = app.index("turnFooterModel(m, pane, sid) {")
     model_end = app.index("\n    // True when index", model_start)
     model = app[model_start:model_end]
-
-    assert "pane.messages.indexOf(m)" in helper
-    assert 'pane.messages[k].role === "user"' in helper
-    assert "ownerUser._turnId" in helper
-    assert "pane.activeTurnId" in helper
-    assert "ownerTurnId === activeTurnId" in helper
-    assert helper.index("for (let k = index + 1") < helper.index(
-        "if (ownerTurnId && activeTurnId)")
-    # A tail window that starts inside a long turn has no resident user row;
-    # only unloaded earlier history may stand in for that boundary.
-    assert "pane.messageRange && pane.messageRange.offset" in helper
-    assert helper.index("if (!(offset > 0)) return false;") < helper.index(
-        "for (let k = index + 1")
-    assert "this._turnMessageBelongsToActiveTurn(m, pane)" in status
-    assert "pane && pane.streaming && m && !m.ts" not in status
-    assert "this._turnMessageBelongsToActiveTurn(m, pane)" in model
+    assert "this._isPaneTail(m, pane) && this._paneMainLoopLive(pane)" in model
     assert "|| (pane && pane.streamingModel)" not in model
 
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
@@ -5543,7 +5534,7 @@ def test_pre_response_state_uses_the_same_turn_separator_not_a_left_bubble():
     pending = html[html.rfind("<div", 0, pending_start):html.index("</div>", pending_start)]
     assert "activeSession.messages[activeSession.messages.length-1].role === 'user'" in pending
     assert "!activeSession.compacting" in pending
-    assert "!activeSession._continuationAwaitingReaction" in pending
+    assert "_paneMainLoopLive(activeSession)" in pending
     assert 'class="msg assistant"' not in pending
     assert "assistant-avatar" not in pending
     assert 'class="turn-running-dots"' in pending
@@ -5634,8 +5625,7 @@ def test_auto_compact_drives_the_same_ui_as_a_manual_one():
     # Auto-compact fires while the last msg is still the user's, which also
     # qualifies the pre-response separator. Its explicit exclusion keeps the 📦
     # maintenance placeholder as the only visible status.
-    assert ("&& !activeSession.compacting\n"
-            "                       && !activeSession._continuationAwaitingReaction\"") in html
+    assert '&& !activeSession.compacting"' in html
     assert 'x-show="activeSession.compacting" class="msg assistant compact-pending"' in html
 
 

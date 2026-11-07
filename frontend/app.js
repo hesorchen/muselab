@@ -4907,72 +4907,37 @@ function portal() {
       if (d.getFullYear() === now.getFullYear()) return `${M}-${D} ${hh}:${mm}`;
       return `${d.getFullYear()}-${M}-${D} ${hh}:${mm}`;
     },
-    _turnMessageBelongsToActiveTurn(m, pane) {
-      if (!m || !pane || !pane.streaming || !Array.isArray(pane.messages)) {
-        return false;
-      }
-      const index = pane.messages.indexOf(m);
-      if (index < 0) return false;
-
-      let ownerUser = null;
-      for (let k = index; k >= 0; k -= 1) {
-        if (pane.messages[k] && pane.messages[k].role === "user") {
-          ownerUser = pane.messages[k];
-          break;
-        }
-      }
-      if (!ownerUser) {
-        // A long turn can outgrow the history tail loaded after a refresh: the
-        // resident window then starts inside the turn and its user boundary is
-        // still on the server. Only that case may continue to the newest-
-        // segment check below; a fully resident pane without a user has no turn.
-        const offset = Number(pane.messageRange && pane.messageRange.offset);
-        if (!(offset > 0)) return false;
-      }
-
-      // A native steering bubble divides the visible assistant/tool stream,
-      // but it is still part of this same logical turn. Pane-level live state
-      // belongs only to the newest user-delimited segment; otherwise both the
-      // pre-adjustment and post-adjustment tails render as Running.
-      for (let k = index + 1; k < pane.messages.length; k += 1) {
-        if (pane.messages[k] && pane.messages[k].role === "user") return false;
-      }
-
-      const ownerTurnId = String((ownerUser && ownerUser._turnId) || "");
-      const activeTurnId = String(pane.activeTurnId || "");
-      // The CLI's own reaction (a continuation) has its own turn id and may
-      // chain: a reaction can start background work whose reaction is parented
-      // on the previous reaction, not on the user turn. It always renders as
-      // the newest user-delimited segment, which the loop above has already
-      // established for `m`, so any live continuation owns that segment.
-      if (String(pane.parentTurnId || "")) return true;
-      if (ownerTurnId && activeTurnId) return ownerTurnId === activeTurnId;
-
-      // Before the first turn metadata event arrives, the newest user boundary
-      // is the only reply run that can own the pane-level live state.
-      return true;
+    // Live turn status has exactly one source: the backend says the CLI main
+    // loop is busy for this session (an attached stream, or the server's
+    // `turn_active` flag for a turn another device or the CLI itself
+    // started). It always belongs to the conversation tail, whichever prompt
+    // started it: a user turn, queued input, the CLI's own reaction to a task
+    // notification, or a chain of such reactions. Message segmentation, turn
+    // ids and history reloads therefore cannot hide or misplace it.
+    _paneMainLoopLive(pane) {
+      if (!pane || pane.compacting) return false;
+      const sid = pane._sid;
+      return sid ? this.isTabStreaming(sid) : !!pane.streaming;
+    },
+    _isPaneTail(m, pane) {
+      const rows = pane && pane.messages;
+      return !!(m && Array.isArray(rows) && rows.length
+        && rows[rows.length - 1] === m);
     },
     turnFooterStatus(m, pane) {
       const stored = String((m && m.turn_status)
         || (m && m._interrupted ? "cancelled" : "")
         || (m && m._failed ? "failed" : ""));
-      if (stored) return stored;
-      // A continuation can pause after its main response while background work
-      // settles. Do not present that quiet handoff as a newly running turn; the
-      // live footer appears when the reaction stream actually starts.
-      if (pane && pane._continuationAwaitingReaction) return "";
-      // Fresh live bubbles are created before the terminal done payload can
-      // stamp turn_status. Only the active user-delimited turn may borrow the
-      // pane-level live state; an older tail can also lack ts while canonical
-      // reconciliation is still adopting its completed metadata.
-      if (m && !m.ts && this._turnMessageBelongsToActiveTurn(m, pane)) {
-        return "running";
+      if (this._isPaneTail(m, pane)) {
+        // The history snapshot marks the tail "running" from the same backend
+        // main-loop state (its active turn); a terminal transition reloads it.
+        if (this._paneMainLoopLive(pane) || stored === "running") return "running";
       }
-      // Compatibility for cached/front-end-injected records created before
-      // turn_status became part of the footer contract.  Their terminal `ts`
-      // is already durable proof that the turn closed; keep the footer and
-      // point-fork action available until the next canonical reload enriches
-      // the record with an explicit status.
+      // Every other row shows only its recorded outcome: an older row can
+      // never be live, whatever a snapshot once stored on it.
+      if (stored && stored !== "running") return stored;
+      // Cached/front-end-injected records predating turn_status: their
+      // terminal `ts` is already durable proof that the turn closed.
       if (m && m.ts) return "completed";
       return "";
     },
@@ -5119,7 +5084,7 @@ function portal() {
     turnFooterModel(m, pane, sid) {
       const stored = String((m && m.model) || "");
       if (stored) return stored;
-      if (this._turnMessageBelongsToActiveTurn(m, pane)) {
+      if (this._isPaneTail(m, pane) && this._paneMainLoopLive(pane)) {
         const live = String((pane && pane.streamingModel) || "");
         if (live) return live;
       }
@@ -9098,7 +9063,6 @@ function portal() {
         // A background task can settle before Claude starts its automatic
         // follow-up reaction. Keep the transport attached, but suppress the
         // generic running footer during that idle protocol gap.
-        _continuationAwaitingReaction: false,
         // Exact backend turn currently owned by this tab. Session id is not
         // sufficient: a reconnect for turn A must never attach to newer B.
         activeTurnId: "",
@@ -13934,7 +13898,6 @@ function portal() {
       st.streamPhase = "";
       st.backgroundActive = false;
       st.backgroundTaskCount = 0;
-      st._continuationAwaitingReaction = false;
       st._draining = false;
       // NOTE — do NOT reset _reconnectAttempts here. Retiring a stream means
       // "give up on this transport and reconcile from canonical history", not
@@ -35316,7 +35279,6 @@ function portal() {
       if (!isReconnect || !streamState.streamPhase) {
         streamState.streamPhase = "connecting";
       }
-      streamState._continuationAwaitingReaction = false;
       // A live turn renders directly into its pane; historical chunk readiness
       // must never hide the user's bubble or the streamed reply.
       streamState.messagesReady = true;
@@ -35403,7 +35365,6 @@ function portal() {
         streamState.streaming = false;
         streamState._streamOwnerToken = "";
         streamState.streamPhase = "";
-        streamState._continuationAwaitingReaction = false;
         streamState._runningTurnStartHint = 0;
         streamState.es = null;
         streamState._streamStartController = null;
@@ -35944,29 +35905,6 @@ function portal() {
         thinkingBubble = null;
         thinkingAcc = "";
       };
-      const _setContinuationAwaitingReaction = (waiting) => {
-        if (!isContinuation) return;
-        const next = !!waiting;
-        if (streamState._continuationAwaitingReaction === next) return;
-        streamState._continuationAwaitingReaction = next;
-        if (next) {
-          if (streamState._streamTimer) {
-            clearInterval(streamState._streamTimer);
-            streamState._streamTimer = null;
-          }
-          streamState._streamStartedAt = 0;
-          streamState._runningTurnStartHint = 0;
-          streamState.streamElapsed = 0;
-          return;
-        }
-        if (!streamState.streaming || streamState._streamTimer) return;
-        streamState._streamStartedAt = Date.now();
-        streamState._streamTimer = setInterval(() => {
-          const elapsed = Math.max(
-            0, (Date.now() - streamState._streamStartedAt) / 1000);
-          streamState.streamElapsed = elapsed;
-        }, 1000);
-      };
 
       // Exposed on streamState so the global selectionchange guard can publish
       // the latest plain snapshot after the user releases a selection. Rich HTML
@@ -36064,7 +36002,6 @@ function portal() {
       es.addEventListener("text", ev => {
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
-        _setContinuationAwaitingReaction(false);
         closeThinking();
         if (!openAsst()) return;
         acc += d.text;
@@ -36080,7 +36017,6 @@ function portal() {
       es.addEventListener("thinking", ev => {
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
-        _setContinuationAwaitingReaction(false);
         closeAsst();
         // Keep one thinking row per contiguous reasoning segment, but publish
         // token-rate text only for the visible tab. Background streams retain
@@ -36099,7 +36035,6 @@ function portal() {
       es.addEventListener("tool_use", ev => {
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
-        _setContinuationAwaitingReaction(false);
         closeAsst();
         closeThinking();
         // `id` is the SDK's toolu_xxx tool_use_id. Critical for
@@ -36140,7 +36075,6 @@ function portal() {
       es.addEventListener("tool_result", ev => {
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
-        _setContinuationAwaitingReaction(false);
         // `text` (up to 50KB) drives the "expand" affordance and per-tool
         // rich renderers (Bash terminal / Read with gutter / WebFetch card).
         // `tool_name` lets the FE pick a renderer without scanning backwards
@@ -36163,14 +36097,12 @@ function portal() {
       es.addEventListener("subagent_delta", ev => {
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
-        _setContinuationAwaitingReaction(false);
         this._applySubagentDelta(streamSid, streamState, d);
         _scrollIfActive();
       });
       es.addEventListener("subagent_block", ev => {
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
-        _setContinuationAwaitingReaction(false);
         this._applySubagentBlock(streamSid, streamState, d);
         _scrollIfActive();
       });
@@ -36195,7 +36127,6 @@ function portal() {
       es.addEventListener("task_started", ev => {
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
-        _setContinuationAwaitingReaction(false);
         applyTaskStatus(d.tool_use_id, {
           task_id: d.task_id,
           state: "running",
@@ -36242,9 +36173,8 @@ function portal() {
             remaining,
           );
         }
-        if (isContinuation && (!Number.isFinite(remaining) || remaining <= 0)) {
-          _setContinuationAwaitingReaction(true);
-        }
+        // A continuation stream exists only while the CLI main loop runs it,
+        // so a settled task never puts the live footer into a quiet wait.
         // A task notification only updates its existing card. User-visible
         // completion feedback is the durable Agent continuation bubble; its
         // revision adoption owns the off-screen unread dot exactly once.
@@ -36549,7 +36479,6 @@ function portal() {
         streamState.streaming = false;
         streamState._streamOwnerToken = "";
         streamState.streamPhase = "";
-        streamState._continuationAwaitingReaction = false;
         streamState._runningTurnStartHint = 0;
         streamState.es = null;
         if (streamState._flushLivePresentation === flushLivePresentation) {

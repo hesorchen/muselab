@@ -123,9 +123,9 @@ def test_concurrent_streams_bound_footer_work_and_keep_live_status(
     _app_eval(
         page,
         """
-        const original = app._turnMessageBelongsToActiveTurn;
+        const original = app._paneMainLoopLive;
         window.__footerOwnershipCalls = 0;
-        app._turnMessageBelongsToActiveTurn = function(...args) {
+        app._paneMainLoopLive = function(...args) {
           window.__footerOwnershipCalls += 1;
           return original.apply(this, args);
         };
@@ -177,15 +177,16 @@ def test_concurrent_streams_bound_footer_work_and_keep_live_status(
     _assert_no_browser_errors(page, errors)
 
 
-@pytest.mark.parametrize("offset,running", [(300, True), (0, False)])
+@pytest.mark.parametrize("offset,running", [(300, True), (0, True)])
 def test_live_footer_survives_a_tail_window_without_the_turn_user(
     page, backend_url, auth_token, offset, running,
 ):
     """A refresh mid-way through a long turn loads only the history tail.
 
     2026-10-31: the turn had over 400 rows, so the reloaded window had no user
-    boundary and every live row lost its Running footer.  Only an unloaded
-    earlier history may stand in for that boundary.
+    boundary and every live row lost its Running footer.  Since 2026-11-08 the
+    live footer belongs to the tail whenever the main loop is busy, with or
+    without a resident user row (a CLI-started turn may have none at all).
     """
     errors = _capture_browser_errors(page)
     page.set_viewport_size({"width": 1440, "height": 900})
