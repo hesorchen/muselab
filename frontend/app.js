@@ -12324,10 +12324,6 @@ function portal() {
           && Array.isArray(st.messages) && st.messages.length > 0)
       );
     },
-    transcriptLoadFailed() {
-      const st = this.activeSessionPane();
-      return !!st && st.transcriptLoadPhase === "error";
-    },
     transcriptEmptyReady() {
       const st = this.activeSessionPane();
       return !!st
@@ -12420,9 +12416,12 @@ function portal() {
     },
     _failTranscriptLoad(token) {
       if (!this._ownsTranscriptLoad(token)) return false;
-      // The phase is the visual transaction authority. Clear the legacy loading
-      // gates too so an overlapping history attempt cannot leave the opaque
-      // shield above the resident-content error banner.
+      // A failed foreground load is not surfaced: most "failures" are a newer
+      // load superseding this one or the tail-follow step being interrupted,
+      // while resident content stays current (2026-11-08, user decision). The
+      // phase only lifts the opaque loading shield; the next sync, poll or tab
+      // activation reloads an unloaded pane. Clear the legacy loading gates
+      // too so an overlapping history attempt cannot leave the shield up.
       token.state.messagesLoading = false;
       token.state.messagesReady = true;
       token.state.transcriptLoadPhase = "error";
@@ -12436,15 +12435,6 @@ function portal() {
       st.transcriptLoadGeneration =
         (Number(st.transcriptLoadGeneration) || 0) + 1;
       st.transcriptLoadPhase = "idle";
-    },
-    async retryTranscriptLoad() {
-      const sid = this.currentId;
-      const st = sid && this.tabState[sid];
-      if (!sid || !st || st.streaming || st.es
-          || ["fetching", "mounting", "settling"]
-            .includes(st.transcriptLoadPhase)) return false;
-      if (!st.messages.length) st._loaded = false;
-      return await this._ensureSessionLoaded(sid);
     },
     _setActiveSessionPaneField(field, value) {
       const st = this.paneState(this.currentId);

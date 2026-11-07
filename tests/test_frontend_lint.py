@@ -6285,17 +6285,20 @@ def test_transcript_loading_overlay_has_generation_owned_visual_contract():
     body_end = transcript.index("</div>", transcript.index('<div class="chat-body"'))
     overlay_at = transcript.index('class="chat-transcript-loading-overlay"')
     assert overlay_at > body_end
-    assert 'x-show="!transcriptLoadFailed() && transcriptLoadingVisible()"' in transcript
+    assert 'x-show="transcriptLoadingVisible()"' in transcript
     assert "x-transition:" not in transcript
     assert 'x-show="transcriptEmptyReady()"' in transcript
-    assert 'x-show="transcriptLoadFailed()"' in transcript
-    assert "transcriptLoadFailed() && !activeSession.messages.length" not in transcript
+    # The "会话加载失败" banner was removed on 2026-11-08: nearly every hit was a
+    # superseded load or an interrupted tail-follow while content stayed current.
+    assert "transcriptLoadFailed" not in transcript
+    assert "chat-load-error" not in transcript
+    assert "retryTranscriptLoad" not in app
     assert "st._loaded === true" in helpers
     assert 'st.transcriptLoadPhase === "idle"' in helpers
     assert "msgs-hidden" not in transcript
 
     overlay_start = css.index(".chat-transcript-loading-overlay {")
-    overlay_end = css.index(".chat-load-error {", overlay_start)
+    overlay_end = css.index("}", overlay_start)
     overlay = css[overlay_start:overlay_end]
     assert "position: absolute" in overlay
     assert "inset: 0" in overlay
@@ -6312,8 +6315,10 @@ def test_transcript_loading_overlay_has_generation_owned_visual_contract():
     assert "@keyframes chat-muse-dot" not in css
     assert ':inert="transcriptLoadingVisible()"' in transcript
 
-    for key in ("chat.loading_session", "chat.load_failed", "chat.load_retry"):
-        assert i18n.count(f'"{key}"') == 2
+    assert i18n.count('"chat.loading_session"') == 2
+    for key in ("chat.load_failed", "chat.load_retry"):
+        assert f'"{key}"' not in i18n
+    assert ".chat-load-error" not in css
 
 
 def test_message_outline_is_a_focus_managed_keyboard_dialog():
