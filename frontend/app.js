@@ -4940,11 +4940,12 @@ function portal() {
 
       const ownerTurnId = String((ownerUser && ownerUser._turnId) || "");
       const activeTurnId = String(pane.activeTurnId || "");
-      // The CLI's own reaction (a continuation) has its own turn id but
-      // renders under the user turn it continues: that segment is live too.
-      if (ownerTurnId && ownerTurnId === String(pane.parentTurnId || "")) {
-        return true;
-      }
+      // The CLI's own reaction (a continuation) has its own turn id and may
+      // chain: a reaction can start background work whose reaction is parented
+      // on the previous reaction, not on the user turn. It always renders as
+      // the newest user-delimited segment, which the loop above has already
+      // established for `m`, so any live continuation owns that segment.
+      if (String(pane.parentTurnId || "")) return true;
       if (ownerTurnId && activeTurnId) return ownerTurnId === activeTurnId;
 
       // Before the first turn metadata event arrives, the newest user boundary
