@@ -391,6 +391,52 @@ def test_authenticated_history_endpoint_uses_sdk_projection(
     assert calls == [(session["id"], str(sess.session_workspace(session["id"])))]
 
 
+def test_large_history_is_encoded_and_gzipped_off_loop(
+    app_module, client, auth, monkeypatch,
+):
+    """A tens-of-MB body must not be serialized or compressed on the loop."""
+    import gzip
+    import json
+
+    from backend import chat as chat_mod
+    from backend import sessions as sess
+
+    session = sess.create_session("large subagent history")
+    text = "子任务输出 " * 4000
+    expected = [{"agent_id": "agent-a", "blocks": [{"text": text}]}]
+    monkeypatch.setattr(
+        chat_mod.chat_subagents, "load_subagent_threads",
+        lambda session_id, directory=None: expected)
+    on_loop = []
+    original = chat_mod._encode_json_body
+
+    def encode(payload, gzip_ok):
+        try:
+            asyncio.get_running_loop()
+            on_loop.append(True)
+        except RuntimeError:
+            on_loop.append(False)
+        return original(payload, gzip_ok)
+
+    monkeypatch.setattr(chat_mod, "_encode_json_body", encode)
+
+    path = f"/api/chat/sessions/{session['id']}/subagents"
+    with client.stream(
+        "GET", path, headers={**auth, "Accept-Encoding": "gzip"},
+    ) as response:
+        assert response.status_code == 200
+        assert response.headers["content-encoding"] == "gzip"
+        compressed = b"".join(response.iter_raw())
+    body = gzip.decompress(compressed)
+    # Compressed exactly once: the middleware passed the encoded body through.
+    assert json.loads(body) == {"session_id": session["id"], "threads": expected}
+    assert on_loop == [False]
+
+    plain = client.get(path, headers={**auth, "Accept-Encoding": "identity"})
+    assert "content-encoding" not in plain.headers
+    assert plain.json()["threads"] == expected
+
+
 def test_concurrent_history_reads_share_snapshot_then_refresh(
     app_module, monkeypatch,
 ):
@@ -428,9 +474,9 @@ def test_concurrent_history_reads_share_snapshot_then_refresh(
             return result
 
         monkeypatch.setattr(chat_mod.obs, "to_thread_io", observed)
-        first = asyncio.create_task(chat_mod.get_session_subagents_api(sid))
+        first = asyncio.create_task(chat_mod._session_subagents_payload(sid))
         await asyncio.wait_for(history_started.wait(), 5)
-        second = asyncio.create_task(chat_mod.get_session_subagents_api(sid))
+        second = asyncio.create_task(chat_mod._session_subagents_payload(sid))
         await asyncio.wait_for(both_workspace_reads.wait(), 5)
         release_history.set()
         first_result, second_result = await asyncio.gather(first, second)
@@ -438,7 +484,7 @@ def test_concurrent_history_reads_share_snapshot_then_refresh(
         assert len(load_calls) == 1
 
         version[0] = 2
-        refreshed = await chat_mod.get_session_subagents_api(sid)
+        refreshed = await chat_mod._session_subagents_payload(sid)
         assert refreshed["threads"][0]["message_count"] == 2
         assert len(load_calls) == 2
 
