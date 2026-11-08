@@ -7160,12 +7160,50 @@ class _TurnResponseBoundary:
 _SUBAGENT_HISTORY_READS = SharedCalls()
 
 
+def _encode_json_body(payload: Any, gzip_ok: bool) -> tuple[bytes, bool]:
+    """Serialize like FastAPI's JSONResponse, gzipping when the client accepts.
+
+    Runs in a worker thread: Subagent histories reach tens of MB, and encoding
+    or compressing them on the event loop stalled every request for seconds.
+    """
+    from fastapi.encoders import jsonable_encoder
+    # The shaped threads are plain JSON values; only odd leaves need FastAPI's
+    # encoder, so it runs per leaf instead of walking the whole payload.
+    body = json.dumps(
+        payload, ensure_ascii=False, allow_nan=False, indent=None,
+        separators=(",", ":"), default=jsonable_encoder,
+    ).encode("utf-8")
+    if not gzip_ok or len(body) < 1024:
+        return body, False
+    import gzip
+    return gzip.compress(body, compresslevel=6), True
+
+
 @router.get(
     "/sessions/{sid}/subagents",
     dependencies=[Depends(require_token)],
 )
-async def get_session_subagents_api(sid: str) -> dict:
+async def get_session_subagents_api(sid: str, request: Request) -> Response:
     """Return the SDK-owned nested transcript for every Subagent.
+
+    The body is encoded off-loop and sent pre-compressed, so GZipMiddleware
+    passes it through instead of compressing on the event loop.
+    """
+    payload = await _session_subagents_payload(sid)
+    gzip_ok = "gzip" in request.headers.get("accept-encoding", "")
+    body, gzipped = await obs.to_thread_io(
+        "chat.subagents_encode", sid, _encode_json_body, payload, gzip_ok,
+    )
+    headers = {"Vary": "Accept-Encoding"}
+    if gzipped:
+        headers["Content-Encoding"] = "gzip"
+    return Response(
+        content=body, media_type="application/json", headers=headers,
+    )
+
+
+async def _session_subagents_payload(sid: str) -> dict:
+    """Read the SDK-owned nested transcript for every Subagent.
 
     The top-level SDK APIs are the source of truth.  MuseLab only shapes their
     records for rendering and never scans Claude's private files directly.

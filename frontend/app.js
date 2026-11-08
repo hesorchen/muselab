@@ -15984,6 +15984,31 @@ function portal() {
       if (index >= 0) thread.blocks.splice(index, 1, finalBlock);
       else thread.blocks.push(finalBlock);
     },
+    // Quiet history reloads follow every session revision, and background task
+    // progress bumps it every few seconds. Refetching every Subagent transcript
+    // each time moved ~20 MB per reload, so a quiet reload refetches at once
+    // only when the Agent cards changed (new card, task state, or result) and
+    // otherwise on a bounded cadence. Live SSE frames keep timelines current
+    // in between; the cadence only converges them to the SDK transcript.
+    _hydrateSubagentsAfterQuietLoad(sid, st) {
+      const results = new Set();
+      for (const m of st.messages || []) {
+        if (m && m.role === "tool_result") results.add(String(m.id || ""));
+      }
+      let key = "";
+      let running = false;
+      for (const m of st.messages || []) {
+        if (!m || m.role !== "tool_use" || !["Agent", "Task"].includes(m.name)) continue;
+        const state = String((m.task_status && m.task_status.state) || "");
+        const id = String(m.id || "");
+        if (state === "running" || (!state && !results.has(id))) running = true;
+        key += `${id}:${state}:${results.has(id) ? 1 : 0};`;
+      }
+      const changed = !st.subagentsLoaded || key !== st._subagentCardsKey;
+      const minIntervalMs = changed ? 0 : (running ? 30_000 : 300_000);
+      void Promise.resolve(this.hydrateSubagents(sid, st, { quiet: true, minIntervalMs }))
+        .then(ok => { if (ok && this.tabState[sid] === st) st._subagentCardsKey = key; });
+    },
     async hydrateSubagents(sid, expectedState = null, opts = {}) {
       const state = expectedState || this._ensureTabState(sid);
       if (!sid || this.tabState[sid] !== state || state.subagentsLoading) return false;
@@ -19877,7 +19902,8 @@ function portal() {
         // Nested history is independent of the parent transcript. Paint the
         // conversation first, then hydrate Subagent cards without extending
         // the session-load critical path.
-        void this.hydrateSubagents(sid, st, { quiet: true });
+        if (quiet) this._hydrateSubagentsAfterQuietLoad(sid, st);
+        else void this.hydrateSubagents(sid, st, { quiet: true });
         void this.hydrateHookTraces(sid, st);
         if (quiet && sid === this.currentId) {
           const domConverged = await this._ensureTranscriptDomConverged(sid, st, {
