@@ -4924,6 +4924,16 @@ function portal() {
       return !!(m && Array.isArray(rows) && rows.length
         && rows[rows.length - 1] === m);
     },
+    // Whether the tail row mounts its own turn footer (mirrors the row-footer
+    // x-if in index.html). Exactly one place shows the live status: that row,
+    // or else the pane-level pending footer. A user tail carrying a status
+    // flag hosts a row footer, so the pending footer must not repeat it.
+    _paneTailHostsFooter(pane) {
+      const rows = pane && pane.messages;
+      const tail = Array.isArray(rows) && rows.length ? rows[rows.length - 1] : null;
+      return !!(tail && (tail.role !== "user"
+        || tail.turn_status || tail._interrupted || tail._failed));
+    },
     turnFooterStatus(m, pane) {
       const stored = String((m && m.turn_status)
         || (m && m._interrupted ? "cancelled" : "")

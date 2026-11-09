@@ -3262,9 +3262,9 @@
                "Muse is thinking" bubble. It disappears as soon as any muse-side
                block arrives, whereupon that block's own footer takes over. -->
           <!-- Auto-compact has its distinct 📦 placeholder and wins this slot.
-               Visibility follows the single live source, _paneMainLoopLive. -->
-          <div x-show="_paneMainLoopLive(activeSession) && (!activeSession.messages.length
-                                       || activeSession.messages[activeSession.messages.length-1].role === 'user')
+               Visibility follows the single live source, _paneMainLoopLive,
+               and yields to a tail row that already hosts its own footer. -->
+          <div x-show="_paneMainLoopLive(activeSession) && !_paneTailHostsFooter(activeSession)
                        && (!activeSession.messages.length
                          || !activeSession.messages[activeSession.messages.length-1]._admissionPending)
                        && !activeSession._queueAdmission

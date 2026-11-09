@@ -5532,7 +5532,14 @@ def test_pre_response_state_uses_the_same_turn_separator_not_a_left_bubble():
     assert 'class="turn-footer turn-pending-footer"' in html
     pending_start = html.index('class="turn-footer turn-pending-footer"')
     pending = html[html.rfind("<div", 0, pending_start):html.index("</div>", pending_start)]
-    assert "activeSession.messages[activeSession.messages.length-1].role === 'user'" in pending
+    # One live footer: the pane-level copy yields to a tail row that hosts one.
+    assert "!_paneTailHostsFooter(activeSession)" in pending
+    assert "role === 'user'" not in pending
+    app_js = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    hosts = app_js[app_js.index("    _paneTailHostsFooter(pane) {"):]
+    hosts = hosts[:hosts.index("\n    },")]
+    for flag in ('tail.role !== "user"', "tail.turn_status", "tail._interrupted", "tail._failed"):
+        assert flag in hosts
     assert "!activeSession.compacting" in pending
     assert "_paneMainLoopLive(activeSession)" in pending
     assert 'class="msg assistant"' not in pending
