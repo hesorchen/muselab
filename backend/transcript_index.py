@@ -21,7 +21,7 @@ from . import transcript_index_store as store
 
 # Increment whenever persisted descriptor semantics (bubble expansion, preview,
 # tool/task metadata) change, not only when the JSON container shape changes.
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 _TRANSCRIPT_TYPES = {"user", "assistant", "progress", "system", "attachment"}
 _PREFIX_GUARD_BYTES = 1024 * 1024
 
