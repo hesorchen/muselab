@@ -4496,16 +4496,9 @@ pre.text {
 .msg.ask_user_question, .msg.permission_request,
 .msg.assistant-turn { align-items: flex-start; }
 
-/* Avatar + bubble side-by-side. user is right-aligned with avatar on the
-   right; assistant is left-aligned with avatar on the left. Tool/thinking
-   bubbles intentionally don't get an avatar (less visual noise for the
-   procedural blocks). */
 /* === Bubble alignment design ===
-   Row fills chat-body 100% so the avatar pins to the chat edge
-   (user avatar right, muse avatar left). Bubble hugs its content
-   with max-width capped at "row - avatar - gap" so the longest
-   message lands exactly at the same edge as the avatar from the
-   OTHER side — true wechat mirror layout. */
+   Rows carry no avatars. The row fills chat-body; muse-side blocks span
+   it and the user bubble hugs its content at the right edge. */
 .msg-row {
   display: flex; align-items: flex-start; gap: var(--sp-2);
   width: 100%;
@@ -4563,111 +4556,18 @@ pre.text {
 .assistant-turn .turn-block .thinking {
   margin-left: 0;
 }
-.msg-avatar {
-  flex-shrink: 0;
-  width: 32px; height: 32px;
-  border-radius: 50%;
-  display: inline-flex; align-items: center; justify-content: center;
-  user-select: none;
-  overflow: hidden;
-  background: var(--c-bg-2);
-  border: 1px solid var(--c-border);
-}
-.msg-avatar svg { width: 22px; height: 22px; }
-.assistant-avatar { color: var(--c-accent); }
-
-/* ===== "Muse is writing" — streaming avatar effect =====
-   Triple-layer animation on the avatar of the currently-streaming msg:
-     1. conic-gradient halo rotating around the avatar (the "spinner")
-     2. accent-color box-shadow pulsing in/out (the "breathing")
-     3. inner SVG icon scaling subtly (the "alive" feel)
-   The .msg.msg-streaming class on the outer .msg wrapper overrides the
-   adjacent-selector rule that would otherwise hide this avatar
-   (because turn-last is not turn-first in source order). */
-@keyframes avatar-spin {
-  to { transform: rotate(360deg); }
-}
-@keyframes avatar-breathe {
-  0%, 100% {
-    box-shadow: 0 0 0 0 rgba(96, 147, 255, 0.0),
-                0 0 10px 0 var(--c-accent-soft);
-  }
-  50% {
-    box-shadow: 0 0 0 4px rgba(96, 147, 255, 0.18),
-                0 0 16px 2px var(--c-accent-soft);
-  }
-}
-@keyframes avatar-breathe-svg {
-  0%, 100% { transform: scale(1); }
-  50%      { transform: scale(1.1); }
-}
-.assistant-avatar.is-streaming-avatar {
-  position: relative;
-  background: var(--c-accent-soft);
-  animation: avatar-breathe 2.4s ease-in-out infinite;
-  border-color: var(--c-accent);
-}
-/* Conic-gradient halo behind the avatar, rotating slowly. ::before sits
-   slightly outside the avatar circle (negative offsets) so the halo
-   reads as a ring of light rather than tinting the icon itself. */
-.assistant-avatar.is-streaming-avatar::before {
-  content: "";
-  position: absolute;
-  inset: -3px;
-  border-radius: 50%;
-  background: conic-gradient(
-    from 0deg,
-    var(--c-accent) 0%,
-    transparent 30%,
-    transparent 70%,
-    var(--c-accent) 100%
-  );
-  animation: avatar-spin 2.4s linear infinite;
-  z-index: -1;
-  opacity: 0.85;
-}
-/* svg inside streaming avatar — stack above the ::before halo */
-.assistant-avatar.is-streaming-avatar svg {
-  animation: avatar-breathe-svg 2.4s ease-in-out infinite;
-  position: relative;
-}
-@media (prefers-reduced-motion: reduce) {
-  .assistant-avatar.is-streaming-avatar,
-  .assistant-avatar.is-streaming-avatar::before,
-  .assistant-avatar.is-streaming-avatar svg {
-    animation: none;
-  }
-}
-.user-avatar {
-  background: var(--c-btn-primary-bg); color: var(--c-on-accent); border: none;
-  font-weight: var(--fw-semibold); font-size: var(--fs-base);
-  letter-spacing: 0;
-}
-/* WeChat-style edge alignment.
-   Each block (bubble / thinking / tool / tool_result / todo-card /
-   subagent-card / plan-card / ask-card / perm-card) renders inside
-   its own .msg-row alongside the avatar. We force every non-avatar
-   direct child of an assistant-side .msg-row to:
-     - take all remaining row width  (flex: 1 1 auto)
-     - allow truncation of long inner text   (min-width: 0)
-     - never overflow the row's max-width    (max-width: 100%)
-   That makes the LEFT edge (right of avatar) and the RIGHT edge
-   (at the row's max-width cap) line up across all heterogeneous
-   block types. Without min-width: 0 the default flex `min-content`
-   sizing lets a long thinking-preview nowrap line punch through
-   the row and overflow the viewport — observed on mobile. */
-/* Common: reserve BOTH its own avatar slot AND the opposing avatar's
-   slot. That way a bubble's far edge stops at exactly where the OTHER
-   party's avatar would end. No bubble ever visually intrudes into the
-   "column" the other party's avatar would occupy. Slot = avatar 32 +
-   gap 8 = 40 on desktop; ×2 = 80 reserved. */
-.msg:not(.user) .msg-row > :not(.msg-avatar),
+/* Edge alignment without avatars. Every muse-side block spans the full
+   row (min-width: 0 so a long nowrap preview cannot punch through the
+   viewport). The user bubble is capped at 85% so the two sides stay
+   distinguishable. */
+.msg:not(.user) .msg-row > *,
 .msg.user .msg-row .bubble {
   flex: 0 0 auto;
-  max-width: calc(100% - 80px);
+  max-width: 100%;
   min-width: 0;
   box-sizing: border-box;
 }
+.msg.user .msg-row .bubble { max-width: 85%; }
 /* User bubble: WeChat / iMessage style — short messages hug content
    (right-anchored), long messages cap at max-width. fit-content keeps
    one-line replies visually compact instead of stretching to a slab. */
@@ -4682,7 +4582,7 @@ pre.text {
    vertically) where varied content widths would otherwise produce a
    jagged left column. User explicitly preferred this over fit-content
    (2026-05-21). */
-.msg:not(.user) .msg-row > :not(.msg-avatar) {
+.msg:not(.user) .msg-row > * {
   width: 100%;
 }
 /* Muse bubble stays hug-content too (inherited from the shared rule
@@ -4696,19 +4596,7 @@ pre.text {
 .bubble pre, .bubble code { max-width: 100%; }
 .bubble pre { overflow-x: auto; }
 @media (max-width: 480px) {
-  .msg-avatar { width: 26px; height: 26px; }
-  .msg-avatar svg { width: 18px; height: 18px; }
-  .user-avatar { font-size: var(--fs-sm); }
-  /* Mobile bubble cap — same principle as desktop, but with mobile's
-     smaller avatar (26 + 8 gap = 34 each side, × 2 = 68 reserved).
-     The bubble's far edge lands at exactly where the opposing avatar
-     would end, leaving a clean "WeChat-style" two-column-with-gutter
-     layout. See desktop block above for full rationale. */
   .msg.user .msg-row { max-width: 100%; }
-  .msg:not(.user) .msg-row > :not(.msg-avatar),
-  .msg.user .msg-row .bubble {
-    max-width: calc(100% - 68px);
-  }
   /* Modest chat-body horizontal padding on mobile — small inset from
      the screen edge so avatars don't sit flush against the device
      bezel. 16px is the smallest value where there's a visible gap;
@@ -4771,12 +4659,6 @@ pre.text {
   background: color-mix(in srgb, var(--c-warn) 14%, var(--c-bg-1));
   color: var(--c-fg-0);
   border: 1px solid color-mix(in srgb, var(--c-warn) 42%, var(--c-border));
-}
-.scheduled-trigger-avatar {
-  background: color-mix(in srgb, var(--c-warn) 22%, var(--c-bg-1));
-  color: var(--c-warn);
-  border: 1px solid color-mix(in srgb, var(--c-warn) 45%, transparent);
-  font-size: var(--fs-sm);
 }
 .scheduled-trigger-label {
   margin-bottom: 4px;
@@ -5315,11 +5197,7 @@ pre.has-copy-btn .code-copy-btn.copied {
   margin: 0.8em 0;
 }
 
-/* `margin-left: 40px` fake-gutter is no longer needed: every assistant-
-   side block now lives inside its own .msg-row with a real .msg-avatar
-   (visibility-hidden on all but the first in a run via the adjacent
-   selector at end-of-file). The avatar element itself occupies the
-   left gutter so contents align naturally. */
+/* Muse-side blocks need no left gutter: rows carry no avatars. */
 
 .tool {
   display: flex; flex-wrap: wrap; gap: var(--sp-2); align-items: baseline;
@@ -5612,11 +5490,11 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
    message stream.
    ========================================================================== */
 .diff-strip {
-  margin: 4px 0 0 36px;       /* aligns under tool bubble, past avatar */
+  margin: 4px 0 0;
   background: var(--c-bg-2);
   border-radius: var(--r-sm);
   padding: 4px 8px;
-  max-width: calc(100% - 60px);
+  max-width: 100%;
 }
 .diff-strip-head {
   display: flex; align-items: center; gap: 6px;
@@ -10878,35 +10756,6 @@ html[data-theme="dark"] .bubble :not(pre) > code:not(.has-file-link) * {
 }
 
 /* ==========================================================================
-   "Avatar per turn" visual: every assistant-side msg renders its own
-   .msg-row + .msg-avatar in the template (kept reactive-friendly), but
-   visually we hide the avatar on all-but-the-first in a run of
-   non-user / non-compact msgs. Result: one avatar per logical "turn"
-   without grouping in JS (which broke streaming reactivity).
-
-   The avatar still occupies its 32px width slot via `visibility:hidden`
-   so blocks stay aligned. Also kill the streaming-breathe animation on
-   the hidden ones — animating an invisible element wastes paint cycles
-   and could leak through if a child uses currentColor.
-   ========================================================================== */
-/* A durable runtime-continuation is a new assistant turn even though it has no
-   user row before it.  Its stable history key is already exposed as
-   data-message-key, so keep that turn's avatar visible without adding another
-   reactive class binding to the large message template. */
-.msg:not(.user):not(.compact) +
-.msg:not(.user):not(.compact):not([data-message-key*="runtime-continuation:"]) .msg-avatar {
-  visibility: hidden;
-  animation: none;
-  border-color: transparent;
-  background: transparent;
-  box-shadow: none;
-}
-.msg:not(.user):not(.compact) +
-.msg:not(.user):not(.compact):not([data-message-key*="runtime-continuation:"]) .msg-avatar svg {
-  animation: none;
-}
-
-/* ==========================================================================
    iOS auto-zoom defeat — MUST stay at end of file.
 
    Why end-of-file: per-element rules like `.chat-input-textarea
@@ -11310,7 +11159,7 @@ html[data-theme="dark"] .bubble :not(pre) > code:not(.has-file-link) * {
   align-items: center;
   gap: var(--sp-2);
   padding: 6px 14px;
-  margin: 0 0 0 38px;  /* indent under assistant avatar column */
+  margin: 0;
   font-size: var(--fs-sm);
   line-height: 1.4;
   color: var(--c-fg-3);
@@ -11592,7 +11441,7 @@ html[data-theme="dark"] .bubble :not(pre) > code:not(.has-file-link) * {
   /* No bottom margin — chat-body's `gap: var(--sp-2)` provides separation
      to the next .msg. Adding bottom margin here used to double-count and
      created visible blank space below collapsed strips (2026-05-28). */
-  margin: 8px 0 0 38px;
+  margin: 8px 0 0;
   border: 1px solid var(--c-border);
   border-radius: var(--r-md);
   overflow: hidden;
@@ -11851,7 +11700,7 @@ html[data-theme="eyecare"] .tool-error-hint {
   padding: 4px 14px;
   font-size: var(--fs-sm);
   line-height: 1.35;
-  margin-left: 38px;
+  margin-left: 0;
 }
 /* Adjacent task-log msgs fuse seamlessly — drop internal borders so
    the run reads as one panel. The :first-of-run / :last-of-run
@@ -11879,7 +11728,7 @@ html[data-theme="eyecare"] .tool-error-hint {
   padding: 5px 14px !important;
   font-size: var(--fs-sm);
   line-height: 1.35;
-  margin: 0 0 0 38px !important;
+  margin: 0 !important;
 }
 
 /* ============================================================
