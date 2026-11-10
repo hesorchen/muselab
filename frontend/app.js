@@ -19379,12 +19379,24 @@ function portal() {
       const token = sid === this.currentId && !quiet && !st.streaming && !st.es
         ? this._beginTranscriptLoad(sid, st, "fetching") : null;
       let loaded = false;
-      try {
-        loaded = await this._reloadSessionCoalesced(
-          sid, quiet ? canonicalLoadOptions : {},
-        );
-      } catch (_) {
-        loaded = false;
+      // A snapshot read while the runtime changed is rejected as unstable. That
+      // is transient, but an empty pane has no other owner that will reload it:
+      // once the live turn re-attaches, history installs are deferred until the
+      // turn ends and the reader sees only the current turn. Retry briefly.
+      for (let attempt = 0; attempt < 4; attempt++) {
+        st._lastHistoryCancel = "";
+        try {
+          loaded = await this._reloadSessionCoalesced(
+            sid, quiet ? canonicalLoadOptions : {},
+          );
+        } catch (_) {
+          loaded = false;
+        }
+        if (loaded || st._loaded || st.streaming || st.es
+            || this.tabState[sid] !== st
+            || st._lastHistoryCancel !== "unstable_snapshot") break;
+        await new Promise(resolve => setTimeout(resolve, 250 * (attempt + 1)));
+        if (this.tabState[sid] !== st || st._loaded) break;
       }
       if (!token) {
         if (loaded && st.transcriptLoadPhase === "error") {
@@ -20077,6 +20089,7 @@ function portal() {
         }
         historyPerf.total_ms = Math.round(perfNow() - historyPerfStarted);
         historyPerf.foreground = sid === this.currentId;
+        if (this.tabState[sid] === st) st._lastHistoryCancel = historyPerf.cancel_reason;
         this._reportHistoryLoadPerf(historyPerf);
         // Re-check live: only clear the skeleton if this sid is STILL the
         // active tab. If the user switched away mid-load, the now-active tab
