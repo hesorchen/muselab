@@ -290,6 +290,13 @@ def raw_msg_from_entry(
             }
     elif record_type not in {"user", "assistant"} or not message_uuid:
         return None
+    elif (record_type == "user" and entry.get("isMeta") is True
+            and entry.get("sourceToolUseID")):
+        # Content a tool injected into the model context (a Skill body, for
+        # example) is persisted as a meta user record tied to that tool call.
+        # It is not something the person typed; normal order already skips
+        # meta records, and full order must not turn it into a user bubble.
+        return None
 
     origin = entry.get("origin")
     if not isinstance(origin, dict) and isinstance(message, dict):

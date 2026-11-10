@@ -591,6 +591,44 @@ def test_task_notification_attachment_is_hidden_and_final_reply_survives(
     assert tool_card["task_status"]["summary"] == "monitor-ok"
 
 
+def test_tool_injected_meta_record_never_renders_as_user_bubble(
+    client, auth, app_module, tmp_path,
+):
+    """A Skill body is model context tied to its tool call, not a user prompt."""
+    from backend import chat as chat_mod
+
+    skill_body = "Base directory for this skill: /skills/sample\n\n# sample"
+    entries = [
+        _entry("u1", "user", "analyze the experiment"),
+        _entry("a1", "assistant", [{
+            "type": "tool_use", "id": "toolu_skill", "name": "Skill",
+            "input": {"skill": "sample"},
+        }], "u1"),
+        _entry("tr1", "user", [{
+            "type": "tool_result", "tool_use_id": "toolu_skill",
+            "content": "Launching skill: sample",
+        }], "a1"),
+        _entry("meta1", "user", [{"type": "text", "text": skill_body}], "tr1",
+               isMeta=True, sourceToolUseID="toolu_skill"),
+        _entry("a2", "assistant", "analysis done", "meta1"),
+    ]
+    sid, _ = _make_endpoint_session(
+        client, auth, chat_mod, tmp_path, entries)
+
+    for params in ({"tail": 50}, {"tail": 50, "full": 1}):
+        response = client.get(
+            f"/api/chat/sessions/{sid}", headers=auth, params=params)
+        assert response.status_code == 200, response.text
+        messages = response.json()["messages"]
+        assert not any(
+            "Base directory for this skill" in (message.get("text") or "")
+            for message in messages
+        ), params
+        assert [m["role"] for m in messages if m["role"] == "user"] == ["user"]
+        assert messages[-1]["text"] == "analysis done"
+    assert "meta1" not in [msg.uuid for msg in chat_mod._full_session_msgs(sid)]
+
+
 def test_window_endpoint_interleaves_cancelled_snapshot_at_original_anchor(
     client, auth, app_module, tmp_path,
 ):
