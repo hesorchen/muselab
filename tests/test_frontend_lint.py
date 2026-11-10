@@ -2910,10 +2910,9 @@ def test_runtime_continuation_history_identity_footer_and_fork_guards():
     # Runtime continuations have no preceding user row, but are still a new
     # assistant turn. Their stable data-message-key exempts them from the
     # adjacent non-user rule that hides avatars inside one ordinary turn.
-    avatar_boundary = (
-        ':not([data-message-key*="runtime-continuation:"]) .msg-avatar'
-    )
-    assert css.count(avatar_boundary) == 2
+    # Transcript rows carry no avatars, so no per-turn avatar boundary rule.
+    assert ".msg-avatar" not in css
+    assert "msg-avatar" not in html
 
 
 def test_fifo_admission_projects_after_durable_queue_without_transcript_flash():
@@ -6511,7 +6510,8 @@ def test_sdk_scheduled_tasks_have_live_stream_and_amber_session_state():
     assert 'es.addEventListener("scheduled_tasks"' in app
     assert "isTabScheduledActive" in app
     assert "scheduled_active" in app
-    assert "scheduled-trigger-avatar" in html
+    assert "is-scheduled-trigger" in html
+    assert "scheduled-trigger-label" in html
     assert "定时任务待命或执行中" in html
     assert "SDK 原生任务" in html
     assert "openNativeScheduledTasks(tid, $event)" in html

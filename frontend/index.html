@@ -2106,11 +2106,9 @@
                reliably on this flat messages x-for. The "group into
                assistant turns" experiment broke streaming reactivity
                (text chunks stopped triggering re-render unless the
-               user switched tabs), so we render each msg standalone
-               and use CSS adjacent selectors at the end of styles.css
-               to hide the avatar on all but the FIRST assistant-side
-               msg in a run — visually the same "one avatar per turn"
-               result without a derived data structure. -->
+               user switched tabs), so we render each msg standalone.
+               Rows carry no avatars: the turn footer marks turn
+               boundaries, and both sides use the full row width. -->
           <!-- Keep a bounded set of recent transcript panes mounted as an LRU DOM
                cache. Each pane exposes only its messageRange window; hidden panes
                retain keyed state but remain out of layout. -->
@@ -2185,9 +2183,6 @@
               <template x-if="m.role === 'user' && !m._is_compact_summary">
                 <div>
                   <div class="msg-row">
-                    <span class="msg-avatar user-avatar"
-                          :class="{ 'scheduled-trigger-avatar': m._scheduledTrigger }"
-                          x-text="m._scheduledTrigger ? '⏱' : userAvatarText()"></span>
                     <div class="bubble user-bubble"
                          :class="{ 'is-queueing': m._optimisticQueue, 'is-scheduled-trigger': m._scheduledTrigger }"
                          @click="onUserBubbleClick(m)">
@@ -2337,16 +2332,10 @@
                 </template>
               </template>
 
-              <!-- assistant text bubble — has avatar; subsequent
-                   non-user msgs in the same run hide theirs via CSS. -->
+              <!-- assistant text bubble -->
               <template x-if="m.role === 'assistant' && !m._is_compact_summary">
                 <div class="asst-msg-wrap">
                   <div class="msg-row">
-                    <span class="msg-avatar assistant-avatar"
-                          :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i, paneMsgs, pane && pane.streaming) }"
-                          :title="mascotLabel()">
-                      <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
-                    </span>
                     <div class="bubble"
                          :class="{ 'is-streaming-bubble': pane && pane.streaming && i === paneMsgs.length - 1 }"
                          x-init="observeAssistantBody($el, m, tid)">
@@ -2386,16 +2375,10 @@
                 </div>
               </template>
 
-              <!-- thinking — wrap in msg-row + spacer avatar so the
-                   CSS-hidden avatar still occupies the same 32px gutter
-                   and the block lines up with assistant text blocks. -->
+              <!-- thinking — wrapped in msg-row so the block lines up
+                   with assistant text blocks. -->
               <template x-if="m.role === 'thinking'">
                 <div class="msg-row">
-                  <span class="msg-avatar assistant-avatar"
-                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i, paneMsgs, pane && pane.streaming) }"
-                        :title="mascotLabel()">
-                    <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
-                  </span>
                   <div :class="thinkingClass(i, m, pane, paneMsgs)">
                     <div class="thinking-head"
                          @click.stop="toggleMsgExpanded(m, i)"
@@ -2423,11 +2406,6 @@
               <!-- TodoWrite -->
               <template x-if="m.role === 'tool_use' && m.name === 'TodoWrite'">
                 <div class="msg-row">
-                  <span class="msg-avatar assistant-avatar"
-                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i, paneMsgs, pane && pane.streaming) }"
-                        :title="mascotLabel()">
-                    <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
-                  </span>
                   <div class="todo-card">
                     <div class="todo-card-head">
                       <span class="todo-card-icon"><svg><use href="#i-check-circle"/></svg></span>
@@ -2455,11 +2433,6 @@
               <!-- Task subagent ("Agent" is the SDK's current tool name, "Task" the legacy one) -->
               <template x-if="m.role === 'tool_use' && (m.name === 'Task' || m.name === 'Agent')">
                 <div class="msg-row">
-                  <span class="msg-avatar assistant-avatar"
-                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i, paneMsgs, pane && pane.streaming) }"
-                        :title="mascotLabel()">
-                    <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
-                  </span>
                   <div class="subagent-card">
                     <div class="subagent-head">
                       <span class="subagent-icon"><svg><use href="#i-tool"/></svg></span>
@@ -2542,11 +2515,6 @@
               <!-- ExitPlanMode -->
               <template x-if="m.role === 'tool_use' && m.name === 'ExitPlanMode' && !m._approvalSuperseded">
                 <div class="msg-row">
-                  <span class="msg-avatar assistant-avatar"
-                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i, paneMsgs, pane && pane.streaming) }"
-                        :title="mascotLabel()">
-                    <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
-                  </span>
                   <div class="plan-card">
                     <div class="plan-head">
                       <span class="plan-icon"><svg><use href="#i-check-circle"/></svg></span>
@@ -2576,11 +2544,6 @@
               <!-- default tool bubble -->
               <template x-if="m.role === 'tool_use' && m.name !== 'TodoWrite' && m.name !== 'Task' && m.name !== 'Agent' && m.name !== 'ExitPlanMode' && !isTaskTool(m) && !conciseHidesToolUse(m)">
                 <div class="msg-row">
-                  <span class="msg-avatar assistant-avatar"
-                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i, paneMsgs, pane && pane.streaming) }"
-                        :title="mascotLabel()">
-                    <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
-                  </span>
                   <div class="tool"
                        :class="{ 'tool-mcp': m.name && m.name.startsWith('mcp__'), 'tool-skill': m.name === 'Skill' }">
                     <!-- MCP enhanced: emoji per known server + server · tool layout -->
@@ -2709,11 +2672,6 @@
                    what broke + the errorFixHint banner. -->
               <template x-if="m.role === 'tool_result' && !shouldHideToolResult(m)">
                 <div class="msg-row">
-                  <span class="msg-avatar assistant-avatar"
-                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i, paneMsgs, pane && pane.streaming) }"
-                        :title="mascotLabel()">
-                    <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
-                  </span>
                   <div :class="toolResultClass(i, m, pane, paneMsgs)">
                     <div class="tool-result-head"
                          @click.stop="toggleMsgExpanded(m, i)"
@@ -2869,11 +2827,6 @@
               <!-- ask_user_question -->
               <template x-if="m.role === 'ask_user_question'">
                 <div class="msg-row">
-                  <span class="msg-avatar assistant-avatar"
-                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i, paneMsgs, pane && pane.streaming) }"
-                        :title="mascotLabel()">
-                    <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
-                  </span>
                   <div class="ask-question">
                     <div class="ask-header">
                       <span class="ask-title" x-text="t('ask.title')"></span>
@@ -2973,11 +2926,6 @@
                    transitions, not a generic tool allow/always decision. -->
               <template x-if="m.role === 'permission_request' && isExitPlanPermission(m)">
                 <div class="msg-row">
-                  <span class="msg-avatar assistant-avatar"
-                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i, paneMsgs, pane && pane.streaming) }"
-                        :title="mascotLabel()">
-                    <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
-                  </span>
                   <div class="plan-card plan-approval-card"
                        :class="{
                          resolved: m.resolved,
@@ -3048,11 +2996,6 @@
               <!-- Generic permission_request -->
               <template x-if="m.role === 'permission_request' && !isExitPlanPermission(m)">
                 <div class="msg-row">
-                  <span class="msg-avatar assistant-avatar"
-                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i, paneMsgs, pane && pane.streaming) }"
-                        :title="mascotLabel()">
-                    <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
-                  </span>
                   <div class="perm-request" :class="{ resolved: m.resolved }">
                     <!-- Compact tool card: tool name + decision tag on top
                          line (mirrors Read/Grep/Edit tool bubble layout),
@@ -3297,9 +3240,6 @@
                loadSession completing — can be ~20-60s on a long session. -->
           <div x-show="activeSession.compacting" class="msg assistant compact-pending">
             <div class="msg-row">
-              <span class="msg-avatar assistant-avatar is-streaming-avatar" :title="mascotLabel()">
-                <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
-              </span>
               <div class="bubble pending">
                 <span class="compact-pending-icon"><svg><use href="#i-package"/></svg></span>
                 <span class="thinking-dots"><span></span><span></span><span></span></span>

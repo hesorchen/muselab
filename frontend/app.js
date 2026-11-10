@@ -3472,38 +3472,6 @@ function portal() {
     },
     mascot() { return this.MASCOTS[this.mascotIdx]; },
     mascotHref() { return "#m-" + this.mascot().id; },
-    // Short label shown inside the user-side message avatar. muselab has no
-    // identity layer (single-user, token-auth), so we just stamp "我" / "U"
-    // by language. Cheap, requires no extra SVG asset.
-    userAvatarText() { return this.lang === "zh" ? "我" : "U"; },
-    // 是否给第 i 条消息的头像加流式动效。
-    // 之前的内联条件 `streaming && (i===0 || messages[i-1].role==='user')`
-    // 命中的是「每一个 assistant 轮次的首条」——历史里每个轮次都满足，
-    // 于是流式时所有轮次的头像一起动。正确语义是「仅当前（最新）轮」：
-    // 既是轮首（前一条是 user 或开头），又是最后一轮（自此往后不再有 user）。
-    isStreamingTurnAvatar(i, msgs = this.activeSessionPane().messages, streaming = this.activeSessionPane().streaming) {
-      if (!streaming) return false;
-      if (!msgs || !msgs.length) return false;
-      // 最新轮的轮首 = 最后一个 user 之后紧邻的第一条 assistant。这等价于旧
-      // 实现「轮首(前一条是 user 或 i===0) + 其后无 user + 非 user」三条件的
-      // 唯一解 i = lastUserIdx+1（若该位置越界或仍是 user 则无）。旧实现对
-      // 每条消息都 O(n) 向后扫，而本绑定出现 9 处 × 每条 assistant × 每个
-      // 常驻 pane——发送时翻转 streaming 会让它们全部重算，移动端弱 CPU 上
-      // 凑成可感卡顿。这里按 (数组引用, 长度) memo：一次 Alpine flush 内只算
-      // 一次 lastUser，后续 i 全部 O(1) 命中。语义与旧实现严格一致。
-      if (this._stAvatarArr !== msgs || this._stAvatarLen !== msgs.length) {
-        let lastUser = -1;
-        for (let k = msgs.length - 1; k >= 0; k--) {
-          if (msgs[k] && msgs[k].role === "user") { lastUser = k; break; }
-        }
-        let start = lastUser + 1;
-        if (start >= msgs.length || (msgs[start] && msgs[start].role === "user")) start = -1;
-        this._stAvatarArr = msgs;       // 运行时缓存（_ 前缀，不进 Alpine 响应式）
-        this._stAvatarLen = msgs.length;
-        this._stAvatarStart = start;
-      }
-      return i === this._stAvatarStart;
-    },
     // 显示文案：英文界面 "Muse · Urania · Astronomy"；中文界面 "Muse · 乌拉尼亚 · 天文"（保留希腊名作 hint）
     mascotLabel() {
       const m = this.mascot();
@@ -21569,11 +21537,16 @@ function portal() {
           }
         }
         if (this.tabState[sid] !== st) return;
+        // Rendering yields. A completion can retire the live pane and install
+        // canonical history meanwhile; that replacement owns the range, so a
+        // stale batch must not shift it back and drop the newly reachable tail.
+        if (batch.length && (st.messages[nextStart] !== batch[0]
+            || st.messages[range.visibleStart - 1] !== batch[batch.length - 1])) return;
         const scrollEl = sid === this.currentId ? this._chatBodyElement() : null;
         const anchor = this._captureViewportMessageAnchor(scrollEl, sid);
         this._shiftMessageVirtualWindow(st, batch.length);
         range.visibleStart = nextStart;
-        if (liveWindow) {
+        if (liveWindow && this._isLiveMessagePane(st)) {
           range.visibleEnd = Math.min(
             previousEnd, nextStart + this._liveMessageDomCap());
         }
@@ -34270,6 +34243,13 @@ function portal() {
         // Returning through a real downward gesture resumes a paused live tail.
         // Layout scrolls and explicitly paged historical windows keep their range.
         if (movedTowardLatest && this._resumePausedChatTail(st, el)) return;
+        // Moving UP into the bottom edge is the browser clamping scrollTop
+        // while content transiently shrinks (a history install swaps rows).
+        // That is not the reader returning, so a paused reader stays paused.
+        if (st && st.atBottom === false && movedTowardEarlier) {
+          st.scrollTop = el.scrollTop;
+          return;
+        }
         if (st) {
           st.atBottom = !this.hasLaterMessages(this.currentId);
           if (st.atBottom) st._pausedTailKey = "";
@@ -34319,6 +34299,12 @@ function portal() {
         // scrolled to the end of, the viewport.
         if (this._messageRangeHasLater(st) && this._chatNearLaterEdge(body)) {
           void this._revealLaterHistory(this.currentId);
+        } else if (st.atBottom === false && body && !this._messageRangeHasLater(st)
+            && body.scrollHeight - body.scrollTop - body.clientHeight < 2) {
+          // A reader already at the physical bottom resumes follow with a
+          // downward gesture, which itself produces no scroll event.
+          st.atBottom = true;
+          st._pausedTailKey = "";
         }
         return;
       }
