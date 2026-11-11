@@ -2439,7 +2439,7 @@ def test_task_rows_force_targeted_session_lookup_and_activate_the_linked_workspa
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
 
-    deep_start = app.index("async _openSessionFromDeeplink(id, workspace = \"\")")
+    deep_start = app.index("async _openSessionFromDeeplink(id, workspace = \"\", options = {})")
     deep_end = app.index("\n    // Close a tab.", deep_start)
     deep = app[deep_start:deep_end]
     assert "this.sessionWorkspaces.some(w => w.path === workspace)" in deep
@@ -4000,7 +4000,7 @@ def test_tab_selection_and_layout_changes_share_one_tail_follow_controller():
     assert "if (!this.isAwayFromLatest(sid))" in capture
     # An unmounted pane (workspace switch) must keep the anchor taken earlier.
     assert "if (anchor) st._readingAnchor = anchor;" in capture
-    deeplink_start = app.index("    async _openSessionFromDeeplink(id, workspace = \"\") {")
+    deeplink_start = app.index("    async _openSessionFromDeeplink(id, workspace = \"\", options = {}) {")
     deeplink = app[deeplink_start:app.index("    // Close a tab.", deeplink_start)]
     assert "this.activateTab(id, { keepPosition: true })" in deeplink
     assert "this._scrollChatTailNow(target, stCur)" not in switch
