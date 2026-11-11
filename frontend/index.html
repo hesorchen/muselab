@@ -6066,7 +6066,7 @@
               x-text="settingsFooterNote()"></span>
         <button @click="closeSettings()" class="btn-ghost" x-text="lang==='zh'?'关闭':'Close'"></button>
         <button x-show="settings.activePage === 'provider' || settings.activePage === 'defaults'"
-                :disabled="settings.saving || settings.loading || !!settings.error || !settingsPendingCount()"
+                :disabled="settings.saving || settings.loading || !!settings.error || (!settingsPendingCount() && !settings.savesInFlight)"
                 @click="saveSettings()" class="btn-primary"
                 x-text="settings.saving ? (lang==='zh'?'保存中…':'Saving…') : t('btn.save')"></button>
         <button x-show="settings.activePage === 'memory_engine'"

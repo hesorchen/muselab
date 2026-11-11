@@ -6722,7 +6722,7 @@ def test_settings_save_states_scope_and_disables_without_drafts():
     foot = html[html.index('class="modal-foot settings-foot"'):]
     foot = foot[:foot.index("</div>")]
     assert 'x-text="settingsFooterNote()"' in foot
-    assert '!!settings.error || !settingsPendingCount()"' in foot
+    assert '!!settings.error || (!settingsPendingCount() && !settings.savesInFlight)"' in foot
     # Memory Save also re-probes the provider, so it stays usable when clean.
     assert '!settings.memory.configLoaded"' in foot
     assert "dirtyCount(names) {" in drafts

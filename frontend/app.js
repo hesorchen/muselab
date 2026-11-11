@@ -1407,6 +1407,10 @@ function portal() {
       providerNew: { show: false, base_url: "", prefix: "", models: "", api_key: "" },
       // Provider page: keyless catalog providers stay folded behind one button.
       showKeylessProviders: false,
+      // Saves whose response has not arrived yet, across close/reopen. A clean
+      // reopened form still allows Save while one is outstanding, since the
+      // held request may yet fail.
+      savesInFlight: 0,
       skills: [],         // discovered skill list (read-only browse)
       skillFilter: "",    // free-text filter (name / description / source)
       probeResults: {},   // env_key -> {ok, text} from last "Test" click
@@ -23869,6 +23873,7 @@ function portal() {
       this._settingsSaveSequence = owner.id;
       this._settingsSaveOwner = owner.id;
       this.settings.saving = true;
+      this.settings.savesInFlight = (this.settings.savesInFlight || 0) + 1;
       try {
         return await this._saveSettingsDraft(owner);
       } catch (error) {
@@ -23884,6 +23889,7 @@ function portal() {
         }
         return false;
       } finally {
+        this.settings.savesInFlight = Math.max(0, (this.settings.savesInFlight || 0) - 1);
         if (this._settingsSaveOwner === owner.id) {
           this._settingsSaveOwner = null;
           this.settings.saving = false;
