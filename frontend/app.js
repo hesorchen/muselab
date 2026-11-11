@@ -2473,7 +2473,8 @@ function portal() {
         if (url.searchParams.get("activity") !== "1") return;
         await this.openActivityCenter();
         url.searchParams.delete("activity");
-        history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
+        // Keep the session-history entry state recorded on this same entry.
+        history.replaceState(history.state, "", `${url.pathname}${url.search}${url.hash}`);
       } catch (_) { /* malformed URL or unavailable browser API — ignore */ }
     },
 
@@ -2482,6 +2483,54 @@ function portal() {
         const sid = new URL(location.href).searchParams.get("session");
         if (sid) await this._openSessionFromDeeplink(sid);
       } catch (_) { /* malformed URL or unavailable browser API — ignore */ }
+      this._armSessionHistory();
+    },
+
+    // Browser Back/Forward walk the sessions the user switched between. Each
+    // switch adds a `?session=` entry; a redirect, fork or close retires the
+    // previous id, so the same tab replaces its entry instead of adding one.
+    _armSessionHistory() {
+      if (this._sessionHistoryArmed) return;
+      this._sessionHistoryArmed = true;
+      this._recordSessionHistory(this.currentId, true);
+      window.addEventListener("popstate", ev => this._onSessionHistoryPop(ev));
+      this.$watch("currentId", (sid, previous) => {
+        if (!sid || sid === previous) return;
+        if (this._sessionHistoryPopTarget === sid) {
+          this._sessionHistoryPopTarget = "";
+          this._recordSessionHistory(sid, true);
+          return;
+        }
+        const retired = !!previous && !this.openTabIds.includes(previous);
+        this._recordSessionHistory(sid, retired);
+      });
+    },
+    _recordSessionHistory(sid, replace) {
+      if (!sid) return;
+      try {
+        const state = history.state;
+        if (!replace && state && state.muselabSession === sid) return;
+        const url = new URL(location.href);
+        url.searchParams.set("session", sid);
+        const entry = { muselabSession: sid,
+                        muselabWorkspace: this.currentWorkspacePath() || "" };
+        const href = `${url.pathname}${url.search}${url.hash}`;
+        if (replace) history.replaceState(entry, "", href);
+        else history.pushState(entry, "", href);
+      } catch (_) { /* unavailable browser API — navigation still works */ }
+    },
+    async _onSessionHistoryPop(ev) {
+      const state = ev && ev.state;
+      const sid = state && state.muselabSession;
+      if (!sid || sid === this.currentId) return;
+      this._sessionHistoryPopTarget = sid;
+      const opened = await this._openSessionFromDeeplink(
+        sid, state.muselabWorkspace || "");
+      if (opened) return;
+      // A deleted session cannot be reopened: keep the entry on the session
+      // that is actually shown so the URL never names a missing one.
+      this._sessionHistoryPopTarget = "";
+      this._recordSessionHistory(this.currentId, true);
     },
 
     // First-load splash + initial fetch sequence. Sets appReady=true once
