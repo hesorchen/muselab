@@ -37,6 +37,25 @@ export function createSettingsDraftGuard(app) {
       return names.some(key => baseline.has(key)
         && signature(current[key], key) !== signature(baseline.get(key), key));
     },
+    // Number of changed fields across the named drafts, for "N unsaved" copy.
+    // Typed API keys count one per non-empty key; object drafts count one per
+    // changed top-level field; anything else counts as one change.
+    dirtyCount(names) {
+      const current = values();
+      let count = 0;
+      for (const key of names) {
+        if (!baseline.has(key) || !(key in current) || !guard.dirty(key)) continue;
+        const now = current[key], before = baseline.get(key);
+        if (key === "keys") {
+          count += Object.values(now || {}).filter(item => String(item || "").trim()).length || 1;
+        } else if (now && before && typeof now === "object" && !Array.isArray(now)) {
+          const fields = new Set([...Object.keys(now), ...Object.keys(before)]);
+          count += [...fields].filter(field => !["open", "show"].includes(field)
+            && JSON.stringify(clean(now[field])) !== JSON.stringify(clean(before[field]))).length || 1;
+        } else count += 1;
+      }
+      return count;
+    },
     discard() {
       const simple = {context: "contextDraft", defaults: "draftDefaults", keys: "draftKeys", newProvider: "providerNew", mcp: "mcpDraft"};
       for (const [key, value] of baseline) {

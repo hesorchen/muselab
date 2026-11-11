@@ -4832,29 +4832,164 @@
 
         <div class="settings-section" data-page="provider"
              x-show="settings.activePage === 'provider'">
-          <details class="settings-advanced" data-testid="context-limits-settings">
-            <summary x-text="lang==='zh'?'上下文窗口预算':'Context window budget'"></summary>
-            <p class="settings-hint" x-text="lang==='zh'?'单模型设置优先于 Provider 默认值；留空恢复自动。部署环境变量优先。此设置影响用量显示与 MuseLab 压缩判断，不会扩大模型或 CLI 实际支持的窗口。':'Model overrides take precedence over provider defaults; leave blank for automatic. Deployment environment overrides take priority. This changes usage display and MuseLab compaction decisions, not model or CLI capacity.'"></p>
-            <div class="settings-row"><label for="context-provider">Provider</label>
-              <select id="context-provider" class="settings-input" x-model="settings.contextDraft.provider" @change="settings.contextDraft.model=''; contextDraftChanged()" :disabled="settings.contextSaving">
-                <template x-for="group in settings.contextGroups" :key="group.id"><option :value="group.id" x-text="group.display"></option></template>
-              </select></div>
-            <div class="settings-row"><label for="context-model" x-text="lang==='zh'?'模型':'Model'"></label>
-              <select id="context-model" class="settings-input" x-model="settings.contextDraft.model" @change="contextDraftChanged()" :disabled="settings.contextSaving">
-                <option value="" x-text="lang==='zh'?'Provider 默认值':'Provider default'"></option>
-                <template x-for="model in contextModels()" :key="model"><option :value="model" x-text="model"></option></template>
-              </select></div>
-            <div class="settings-row"><label for="context-tokens" x-text="lang==='zh'?'有效上下文（tokens）':'Effective context (tokens)'"></label>
-              <input id="context-tokens" class="settings-input" type="number" min="1024" max="10000000" step="1" placeholder="Auto" aria-describedby="context-tokens-hint" x-model="settings.contextDraft.tokens" :disabled="settings.contextSaving" /></div>
-            <p id="context-tokens-hint" class="settings-hint" x-text="lang==='zh'?'单位：token。例如 200K 填 200000，300K 填 300000；留空使用 Auto。':'Unit: tokens. For example, enter 200000 for 200K or 300000 for 300K; leave blank for Auto.'"></p>
-            <div class="settings-inline-error" role="alert" x-show="settings.contextError" x-text="settings.contextError"></div>
-            <button class="btn-primary sm" @click="saveContextLimit()" :disabled="settings.contextSaving" x-text="lang==='zh'?'保存上下文预算':'Save context budget'"></button>
-          </details>
           <div class="settings-section-title">
             <span x-text="t('set.sec.provider')"></span>
             <span class="settings-save-mode live" x-text="t('set.mode.live')"></span>
           </div>
+          <p class="settings-hint settings-page-lead"
+             x-text="lang==='zh' ? '开关、测试和修改都在各自这一行保存，立即生效。' : 'Toggle, test and edit save on their own row and apply immediately.'"></p>
 
+          <!-- DUCC is configured by the local ducc CLI (auth, proxy, signed
+               headers), so /api/settings has no row for it. Show it first,
+               read-only, from the model catalog the picker already loaded. -->
+          <div class="provider-list" x-show="settingsDuccModelCount() > 0">
+            <div class="settings-row provider-row provider-ducc">
+              <label>
+                <span>DUCC</span>
+                <span class="provider-meta-tag" x-text="lang==='zh' ? '内置' : 'built-in'"></span>
+              </label>
+              <div class="settings-input-wrap provider-actions">
+                <span class="settings-badge ok provider-status" x-text="lang==='zh' ? '可用' : 'Ready'"></span>
+              </div>
+              <div class="provider-desc"
+                   x-text="lang==='zh'
+                     ? '由本机 ducc 提供认证和代理，无需 API Key · ' + settingsDuccModelCount() + ' 个模型'
+                     : 'Authenticated by the local ducc CLI, no API key needed · ' + settingsDuccModelCount() + ' models'"></div>
+            </div>
+          </div>
+
+          <div class="provider-list" x-show="settings.showKeylessProviders || settingsProviderRows().some(p => !_settingsKeylessBuiltin(p))">
+          <template x-for="(p, idx) in settingsProviderRows()" :key="p.id || idx">
+            <div class="settings-row provider-row" x-data="{ editing: false }"
+                 x-show="!_settingsKeylessBuiltin(p) || settings.showKeylessProviders || settings.providerDrafts[p.id]?.open">
+
+              <!-- ===== Third-party editable provider (full editor) ===== -->
+              <template x-if="p.editable">
+                <div>
+                  <label>
+                    <span x-text="localizeProviderDisplay(p.display)"></span>
+                    <span x-show="p.is_builtin && p.is_overridden" class="provider-meta-tag edited"
+                          x-text="lang==='zh' ? '已改' : 'edited'"></span>
+                    <span x-show="!p.is_builtin" class="provider-meta-tag custom"
+                          x-text="lang==='zh' ? '自定义' : 'custom'"></span>
+                  </label>
+                  <div class="settings-input-wrap provider-actions">
+                    <label class="switch sm" :title="p.disabled ? (lang==='zh' ? '关掉 → 不出现在模型菜单' : 'Off → hidden from model picker') : (lang==='zh' ? '开启 → 出现在模型菜单' : 'On → shown in model picker')">
+                      <input type="checkbox" :checked="!p.disabled"
+                             :aria-label="(lang==='zh' ? '显示模型：' : 'Show models: ') + localizeProviderDisplay(p.display)"
+                             @change="toggleProvider(p.id, !$event.target.checked)" />
+                      <span class="switch-slider"></span>
+                    </label>
+                    <span x-show="p.configured" class="settings-badge ok provider-status" x-text="t('set.key_set')"></span>
+                    <span x-show="!p.configured" class="settings-badge provider-status" x-text="lang==='zh' ? '未配置' : 'No key'"></span>
+                    <button x-show="p.configured" class="btn-ghost sm provider-probe"
+                            @click="probeProvider(p.env_key, p.probe_model)" :title="t('set.probe_tip')"
+                            x-text="t('set.probe')"></button>
+                    <button class="btn-ghost sm provider-edit"
+                            @click="toggleProviderEditor(p)"
+                            x-text="settings.providerDrafts[p.id]?.open ? t('btn.cancel') : t('set.key_edit')"></button>
+                  </div>
+
+                  <!-- Expanded editor: endpoint / prefix / models / api-key -->
+                  <div x-show="settings.providerDrafts[p.id]?.open" class="provider-editor">
+                    <div class="settings-row">
+                      <label x-text="t('set.prov.endpoint')"></label>
+                      <input class="settings-input mono" x-model="_providerDraftField(p.id, 'base_url').value"
+                             :placeholder="t('set.prov.endpoint_ph')" />
+                    </div>
+                    <div class="settings-row">
+                      <label x-text="t('set.prov.prefix')"></label>
+                      <input class="settings-input mono" x-model="_providerDraftField(p.id, 'prefix').value"
+                             :placeholder="t('set.prov.prefix_ph')" />
+                    </div>
+                    <div class="settings-row">
+                      <label x-text="t('set.prov.models')"></label>
+                      <textarea class="settings-input mono" rows="4"
+                                x-model="_providerDraftField(p.id, 'models').value"
+                                :placeholder="t('set.prov.models_ph')"></textarea>
+                    </div>
+                    <div class="settings-row">
+                      <label x-text="t('set.prov.apikey')"></label>
+                      <input type="password" class="settings-input"
+                             x-model="_providerDraftField(p.id, 'api_key').value"
+                             :placeholder="p.configured ? t('set.key_edit_placeholder') : t('set.placeholder_key')" />
+                    </div>
+                    <div class="settings-hint" x-text="t('set.prov.hint')"></div>
+                    <div class="settings-row provider-editor-actions">
+                      <button class="btn-primary sm" @click="saveProvider(p)" x-text="t('btn.save')"></button>
+                      <button class="btn-ghost sm" @click="toggleProviderEditor(p)" x-text="t('btn.cancel')"></button>
+                      <button x-show="p.is_builtin && p.is_overridden" class="btn-ghost sm"
+                              @click="restoreProvider(p)" x-text="t('set.prov.restore')"></button>
+                      <button class="btn-ghost sm danger" @click="deleteProvider(p)"
+                              x-text="p.is_builtin ? t('set.prov.hide') : t('set.prov.delete')"></button>
+                    </div>
+                  </div>
+
+                  <div x-show="settings.probeResults[p.probe_model]"
+                       class="probe-result"
+                       :class="{ ok: settings.probeResults[p.probe_model]?.ok,
+                                  err: !settings.probeResults[p.probe_model]?.ok }">
+                    <svg class="probe-result-icon ok" x-show="settings.probeResults[p.probe_model]?.ok"><use href="#i-check-circle"/></svg>
+                    <svg class="probe-result-icon err" x-show="!settings.probeResults[p.probe_model]?.ok"><use href="#i-alert-circle"/></svg>
+                    <span x-text="settings.probeResults[p.probe_model]?.text"></span>
+                  </div>
+                </div>
+              </template>
+
+            </div>
+          </template>
+          </div>
+          <div class="provider-list-actions">
+            <button type="button" class="btn-ghost sm settings-fold-btn" x-show="settingsKeylessProviderCount()"
+                    :aria-expanded="settings.showKeylessProviders ? 'true' : 'false'"
+                    @click="settings.showKeylessProviders = !settings.showKeylessProviders"
+                    x-text="settings.showKeylessProviders
+                      ? (lang==='zh' ? '收起未配置的内置 Provider' : 'Hide providers without a key')
+                      : (lang==='zh' ? '显示未配置的 Provider（' + settingsKeylessProviderCount() + '）' : 'Show providers without a key (' + settingsKeylessProviderCount() + ')')"></button>
+          </div>
+
+          <!-- Add a brand-new provider from scratch -->
+          <div class="settings-row mcp-add-row provider-add-row">
+            <button class="btn-ghost sm settings-add-btn" @click="settings.providerNew.show = !settings.providerNew.show">
+              <svg x-show="!settings.providerNew.show" aria-hidden="true"><use href="#i-plus"/></svg>
+              <span x-text="settings.providerNew.show ? t('btn.cancel') : t('set.prov.add')"></span>
+            </button>
+          </div>
+          <div x-show="settings.providerNew.show" class="provider-editor">
+            <div class="settings-row">
+              <label x-text="t('set.prov.endpoint')"></label>
+              <input class="settings-input mono" x-model="settings.providerNew.base_url"
+                     :placeholder="t('set.prov.endpoint_ph')" />
+            </div>
+            <div class="settings-row">
+              <label x-text="t('set.prov.prefix')"></label>
+              <input class="settings-input mono" x-model="settings.providerNew.prefix"
+                     :placeholder="t('set.prov.prefix_ph')" />
+            </div>
+            <div class="settings-row">
+              <label x-text="t('set.prov.models')"></label>
+              <textarea class="settings-input mono" rows="4"
+                        x-model="settings.providerNew.models"
+                        :placeholder="t('set.prov.models_ph')"></textarea>
+            </div>
+            <div class="settings-row">
+              <label x-text="t('set.prov.apikey')"></label>
+              <input type="password" class="settings-input"
+                     x-model="settings.providerNew.api_key"
+                     :placeholder="t('set.placeholder_key')" />
+            </div>
+            <div class="settings-hint" x-text="t('set.prov.hint')"></div>
+            <div class="settings-row">
+              <button class="btn-primary sm" @click="addProviderFromDraft()" x-text="t('set.prov.add')"></button>
+            </div>
+          </div>
+
+          <details class="settings-advanced settings-fold claude-fold" :open="settingsClaudeActive()">
+            <summary>
+              <span x-text="lang==='zh' ? 'Claude 官方（Pro/Max 订阅或 API Key）' : 'Claude (Pro/Max subscription or API key)'"></span>
+              <span class="settings-badge ok" x-show="settingsClaudeActive()" x-text="t('claude_auth.status_connected')"></span>
+              <span class="settings-badge" x-show="claudeAuth.loaded && !settingsClaudeActive()" x-text="t('claude_auth.status_disconnected')"></span>
+            </summary>
           <!-- Claude Auth — first-class OAuth provider, no API key field.
                Distinct UX from the generic provider rows: shows identity
                (email/plan/expiry) when connected, Connect button when not. -->
@@ -4933,7 +5068,7 @@
           </div>
 
           <div class="settings-hint" x-text="lang==='zh' ? '填入新值并保存即可生效；留空表示不修改。' : 'Enter new value and save to apply; leave blank to keep existing.'"></div>
-          <template x-for="(p, idx) in settings.providers" :key="p.id || idx">
+          <template x-for="(p, idx) in settings.providers.filter(p => !p.editable)" :key="p.id || idx">
             <div class="settings-row provider-row" x-data="{ editing: false }">
 
               <!-- ===== Anthropic / non-editable: simple api-key row ===== -->
@@ -5009,115 +5144,29 @@
                 </div>
               </template>
 
-              <!-- ===== Third-party editable provider (full editor) ===== -->
-              <template x-if="p.editable">
-                <div>
-                  <label>
-                    <span x-text="localizeProviderDisplay(p.display)"></span>
-                    <span x-show="p.is_builtin && p.is_overridden" class="provider-meta-tag edited"
-                          x-text="lang==='zh' ? '已改' : 'edited'"></span>
-                    <span x-show="!p.is_builtin" class="provider-meta-tag custom"
-                          x-text="lang==='zh' ? '自定义' : 'custom'"></span>
-                  </label>
-                  <div class="settings-input-wrap">
-                    <label class="switch sm" :title="p.disabled ? (lang==='zh' ? '关掉 → 不出现在模型菜单' : 'Off → hidden from model picker') : (lang==='zh' ? '开启 → 出现在模型菜单' : 'On → shown in model picker')">
-                      <input type="checkbox" :checked="!p.disabled"
-                             :aria-label="(lang==='zh' ? '显示模型：' : 'Show models: ') + localizeProviderDisplay(p.display)"
-                             @change="toggleProvider(p.id, !$event.target.checked)" />
-                      <span class="switch-slider"></span>
-                    </label>
-                    <span x-show="p.configured" class="settings-badge ok" x-text="t('set.key_set')"></span>
-                    <span x-show="!p.configured" class="settings-badge" x-text="lang==='zh' ? '未配置' : 'No key'"></span>
-                    <button x-show="p.configured" class="btn-ghost sm"
-                            @click="probeProvider(p.env_key, p.probe_model)" :title="t('set.probe_tip')"
-                            x-text="t('set.probe')"></button>
-                    <button class="btn-ghost sm"
-                            @click="toggleProviderEditor(p)"
-                            x-text="settings.providerDrafts[p.id]?.open ? t('btn.cancel') : t('set.key_edit')"></button>
-                  </div>
-
-                  <!-- Expanded editor: endpoint / prefix / models / api-key -->
-                  <div x-show="settings.providerDrafts[p.id]?.open" class="provider-editor">
-                    <div class="settings-row">
-                      <label x-text="t('set.prov.endpoint')"></label>
-                      <input class="settings-input mono" x-model="_providerDraftField(p.id, 'base_url').value"
-                             :placeholder="t('set.prov.endpoint_ph')" />
-                    </div>
-                    <div class="settings-row">
-                      <label x-text="t('set.prov.prefix')"></label>
-                      <input class="settings-input mono" x-model="_providerDraftField(p.id, 'prefix').value"
-                             :placeholder="t('set.prov.prefix_ph')" />
-                    </div>
-                    <div class="settings-row">
-                      <label x-text="t('set.prov.models')"></label>
-                      <textarea class="settings-input mono" rows="4"
-                                x-model="_providerDraftField(p.id, 'models').value"
-                                :placeholder="t('set.prov.models_ph')"></textarea>
-                    </div>
-                    <div class="settings-row">
-                      <label x-text="t('set.prov.apikey')"></label>
-                      <input type="password" class="settings-input"
-                             x-model="_providerDraftField(p.id, 'api_key').value"
-                             :placeholder="p.configured ? t('set.key_edit_placeholder') : t('set.placeholder_key')" />
-                    </div>
-                    <div class="settings-hint" x-text="t('set.prov.hint')"></div>
-                    <div class="settings-row provider-editor-actions">
-                      <button class="btn-primary sm" @click="saveProvider(p)" x-text="t('btn.save')"></button>
-                      <button class="btn-ghost sm" @click="toggleProviderEditor(p)" x-text="t('btn.cancel')"></button>
-                      <button x-show="p.is_builtin && p.is_overridden" class="btn-ghost sm"
-                              @click="restoreProvider(p)" x-text="t('set.prov.restore')"></button>
-                      <button class="btn-ghost sm danger" @click="deleteProvider(p)"
-                              x-text="p.is_builtin ? t('set.prov.hide') : t('set.prov.delete')"></button>
-                    </div>
-                  </div>
-
-                  <div x-show="settings.probeResults[p.probe_model]"
-                       class="probe-result"
-                       :class="{ ok: settings.probeResults[p.probe_model]?.ok,
-                                  err: !settings.probeResults[p.probe_model]?.ok }">
-                    <svg class="probe-result-icon ok" x-show="settings.probeResults[p.probe_model]?.ok"><use href="#i-check-circle"/></svg>
-                    <svg class="probe-result-icon err" x-show="!settings.probeResults[p.probe_model]?.ok"><use href="#i-alert-circle"/></svg>
-                    <span x-text="settings.probeResults[p.probe_model]?.text"></span>
-                  </div>
-                </div>
-              </template>
 
             </div>
           </template>
+          </details>
 
-          <!-- Add a brand-new provider from scratch -->
-          <div class="settings-row mcp-add-row">
-            <button class="btn-ghost sm" @click="settings.providerNew.show = !settings.providerNew.show"
-                    x-text="settings.providerNew.show ? t('btn.cancel') : t('set.prov.add')"></button>
-          </div>
-          <div x-show="settings.providerNew.show" class="provider-editor">
-            <div class="settings-row">
-              <label x-text="t('set.prov.endpoint')"></label>
-              <input class="settings-input mono" x-model="settings.providerNew.base_url"
-                     :placeholder="t('set.prov.endpoint_ph')" />
-            </div>
-            <div class="settings-row">
-              <label x-text="t('set.prov.prefix')"></label>
-              <input class="settings-input mono" x-model="settings.providerNew.prefix"
-                     :placeholder="t('set.prov.prefix_ph')" />
-            </div>
-            <div class="settings-row">
-              <label x-text="t('set.prov.models')"></label>
-              <textarea class="settings-input mono" rows="4"
-                        x-model="settings.providerNew.models"
-                        :placeholder="t('set.prov.models_ph')"></textarea>
-            </div>
-            <div class="settings-row">
-              <label x-text="t('set.prov.apikey')"></label>
-              <input type="password" class="settings-input"
-                     x-model="settings.providerNew.api_key"
-                     :placeholder="t('set.placeholder_key')" />
-            </div>
-            <div class="settings-hint" x-text="t('set.prov.hint')"></div>
-            <div class="settings-row">
-              <button class="btn-primary sm" @click="addProviderFromDraft()" x-text="t('set.prov.add')"></button>
-            </div>
-          </div>
+          <details class="settings-advanced" data-testid="context-limits-settings">
+            <summary x-text="lang==='zh'?'高级：上下文窗口预算':'Advanced: context window budget'"></summary>
+            <p class="settings-hint" x-text="lang==='zh'?'单模型设置优先于 Provider 默认值；留空恢复自动。部署环境变量优先。此设置影响用量显示与 MuseLab 压缩判断，不会扩大模型或 CLI 实际支持的窗口。':'Model overrides take precedence over provider defaults; leave blank for automatic. Deployment environment overrides take priority. This changes usage display and MuseLab compaction decisions, not model or CLI capacity.'"></p>
+            <div class="settings-row"><label for="context-provider">Provider</label>
+              <select id="context-provider" class="settings-input" x-model="settings.contextDraft.provider" @change="settings.contextDraft.model=''; contextDraftChanged()" :disabled="settings.contextSaving">
+                <template x-for="group in settings.contextGroups" :key="group.id"><option :value="group.id" x-text="group.display"></option></template>
+              </select></div>
+            <div class="settings-row"><label for="context-model" x-text="lang==='zh'?'模型':'Model'"></label>
+              <select id="context-model" class="settings-input" x-model="settings.contextDraft.model" @change="contextDraftChanged()" :disabled="settings.contextSaving">
+                <option value="" x-text="lang==='zh'?'Provider 默认值':'Provider default'"></option>
+                <template x-for="model in contextModels()" :key="model"><option :value="model" x-text="model"></option></template>
+              </select></div>
+            <div class="settings-row"><label for="context-tokens" x-text="lang==='zh'?'有效上下文（tokens）':'Effective context (tokens)'"></label>
+              <input id="context-tokens" class="settings-input" type="number" min="1024" max="10000000" step="1" placeholder="Auto" aria-describedby="context-tokens-hint" x-model="settings.contextDraft.tokens" :disabled="settings.contextSaving" /></div>
+            <p id="context-tokens-hint" class="settings-hint" x-text="lang==='zh'?'单位：token。例如 200K 填 200000，300K 填 300000；留空使用 Auto。':'Unit: tokens. For example, enter 200000 for 200K or 300000 for 300K; leave blank for Auto.'"></p>
+            <div class="settings-inline-error" role="alert" x-show="settings.contextError" x-text="settings.contextError"></div>
+            <button class="btn-primary sm" @click="saveContextLimit()" :disabled="settings.contextSaving" x-text="lang==='zh'?'保存上下文预算':'Save context budget'"></button>
+          </details>
         </div>
 
         <div class="settings-section" data-page="appearance"
@@ -6007,11 +6056,17 @@
         </div><!-- /.settings-content -->
 
       </div>
-      <div class="modal-foot">
-        <button x-show="settings.surface!=='memory'" @click="logout()" class="btn-ghost" style="margin-right:auto;color:var(--c-danger)" x-text="t('btn.logout')"></button>
+      <div class="modal-foot settings-foot">
+        <button x-show="settings.surface!=='memory'" @click="logout()" class="btn-ghost danger settings-logout" x-text="t('btn.logout')"></button>
+        <!-- Save semantics, stated where the Save button lives: live pages say
+             so; Save pages count the drafts that button would submit. -->
+        <span class="settings-foot-note" role="status" aria-live="polite"
+              x-show="settings.surface!=='memory' && settings.activePage"
+              :class="{ pending: settingsPendingCount() > 0 }"
+              x-text="settingsFooterNote()"></span>
         <button @click="closeSettings()" class="btn-ghost" x-text="lang==='zh'?'关闭':'Close'"></button>
         <button x-show="settings.activePage === 'provider' || settings.activePage === 'defaults'"
-                :disabled="settings.saving || settings.loading || !!settings.error"
+                :disabled="settings.saving || settings.loading || !!settings.error || (!settingsPendingCount() && !settings.savesInFlight)"
                 @click="saveSettings()" class="btn-primary"
                 x-text="settings.saving ? (lang==='zh'?'保存中…':'Saving…') : t('btn.save')"></button>
         <button x-show="settings.activePage === 'memory_engine'"

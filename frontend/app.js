@@ -1405,6 +1405,12 @@ function portal() {
       providerDrafts: {},
       // "Add a brand-new provider" form (id minted server-side on save).
       providerNew: { show: false, base_url: "", prefix: "", models: "", api_key: "" },
+      // Provider page: keyless catalog providers stay folded behind one button.
+      showKeylessProviders: false,
+      // Saves whose response has not arrived yet, across close/reopen. A clean
+      // reopened form still allows Save while one is outstanding, since the
+      // held request may yet fail.
+      savesInFlight: 0,
       skills: [],         // discovered skill list (read-only browse)
       skillFilter: "",    // free-text filter (name / description / source)
       probeResults: {},   // env_key -> {ok, text} from last "Test" click
@@ -21930,6 +21936,63 @@ function portal() {
         ["cost", zh ? "用量看板" : "Usage", "dollar"],
       ];
     },
+    // Drafts the bottom Save button of the active page submits. Provider and
+    // Conversations share saveSettings (defaults + typed keys + an open Claude
+    // model-list edit); Memory engine has its own Save. Other pages save live.
+    settingsPendingCount(page = this.settings.activePage) {
+      const guard = this._settingsDraftGuard;
+      if (!guard) return 0;
+      let names = [];
+      if (page === "memory_engine") names = ["memory"];
+      else if (page === "provider" || page === "defaults") {
+        names = ["defaults", "keys"];
+        const claude = (this.settings.providers || []).find(p => p.models_editable);
+        if (claude && this.settings.providerDrafts[claude.id]?.open) names.push(`provider:${claude.id}`);
+      }
+      // A module cached from an older build may lack dirtyCount; fall back to
+      // counting dirty drafts so Save never looks disabled with real drafts.
+      if (typeof guard.dirtyCount !== "function") return names.filter(n => guard.dirty(n)).length;
+      return guard.dirtyCount(names);
+    },
+    settingsFooterNote() {
+      const zh = this.lang === "zh";
+      const page = this.settings.activePage;
+      if (!["provider", "defaults", "memory_engine"].includes(page)) {
+        return zh ? "本页修改即时生效" : "Changes on this page apply immediately";
+      }
+      const n = this.settingsPendingCount(page);
+      if (n > 0) return zh ? `有 ${n} 项未保存` : `${n} unsaved change${n === 1 ? "" : "s"}`;
+      if (page === "memory_engine") {
+        return zh ? "没有未保存的修改；保存会重新检测连接" : "No unsaved changes; Save re-checks the connection";
+      }
+      return page === "provider"
+        ? (zh ? "Provider 行内修改即时生效；底部保存只提交新填的 API Key" : "Provider rows save on their own; Save submits newly typed API keys")
+        : (zh ? "没有未保存的修改" : "No unsaved changes");
+    },
+    // DUCC is configured by the local ducc CLI, not /api/settings. Show it on
+    // the provider page from the model catalog the picker already loaded.
+    settingsDuccModelCount() {
+      return (this.availableModels || []).filter(m => m && m.group === "DUCC").length;
+    },
+    // Editable providers in use first (configured, then user-added ones still
+    // missing a key), then built-in catalog entries nobody has set up yet.
+    // Catalog order is kept inside each group.
+    _settingsKeylessBuiltin(p) { return !p.configured && !!p.is_builtin; },
+    settingsProviderRows() {
+      const rows = (this.settings.providers || []).filter(p => p.editable);
+      return [
+        ...rows.filter(p => p.configured),
+        ...rows.filter(p => !p.configured && !p.is_builtin),
+        ...rows.filter(p => this._settingsKeylessBuiltin(p)),
+      ];
+    },
+    settingsKeylessProviderCount() {
+      return this.settingsProviderRows().filter(p => this._settingsKeylessBuiltin(p)).length;
+    },
+    settingsClaudeActive() {
+      if (this.claudeAuth && this.claudeAuth.logged_in) return true;
+      return (this.settings.providers || []).some(p => !p.editable && p.configured);
+    },
     settingsPageMatches(page) {
       const selected = this.settings.activePage;
       return selected === page
@@ -23863,6 +23926,7 @@ function portal() {
       this._settingsSaveSequence = owner.id;
       this._settingsSaveOwner = owner.id;
       this.settings.saving = true;
+      this.settings.savesInFlight = (this.settings.savesInFlight || 0) + 1;
       try {
         return await this._saveSettingsDraft(owner);
       } catch (error) {
@@ -23878,6 +23942,7 @@ function portal() {
         }
         return false;
       } finally {
+        this.settings.savesInFlight = Math.max(0, (this.settings.savesInFlight || 0) - 1);
         if (this._settingsSaveOwner === owner.id) {
           this._settingsSaveOwner = null;
           this.settings.saving = false;
