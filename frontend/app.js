@@ -2481,7 +2481,11 @@ function portal() {
     async _openStartupSessionDeeplink() {
       try {
         const sid = new URL(location.href).searchParams.get("session");
-        if (sid) await this._openSessionFromDeeplink(sid);
+        // A reload keeps the entry this app wrote: reopen that session but
+        // keep the mobile pane the user was on. A fresh deep link (push
+        // notification, shared URL) still reveals the chat.
+        const reload = !!history.state && history.state.muselabSession === sid;
+        if (sid) await this._openSessionFromDeeplink(sid, "", { reveal: !reload });
       } catch (_) { /* malformed URL or unavailable browser API — ignore */ }
       this._armSessionHistory();
     },
@@ -15364,7 +15368,7 @@ function portal() {
     // (?session=… on cold start, or a SW postMessage on an already-open
     // tab). Guard against stale/deleted ids so a tapped-but-since-deleted
     // notification doesn't push a phantom tab.
-    async _openSessionFromDeeplink(id, workspace = "") {
+    async _openSessionFromDeeplink(id, workspace = "", options = {}) {
       if (!id) return false;
       try {
         // Activity rows carry the owning workspace even when their session is
@@ -15393,7 +15397,7 @@ function portal() {
         // mobile and clear a stale unread dot in that case.
         const st = this.tabState && this.tabState[id];
         if (st && st.unread) st.unread = false;
-        if (this._isMobileLayout()) this.setMobileTab("chat");
+        if (options.reveal !== false && this._isMobileLayout()) this.setMobileTab("chat");
         return true;
       } catch (_) { return false; }
     },
