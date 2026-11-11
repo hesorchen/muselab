@@ -2479,15 +2479,68 @@ function portal() {
         if (url.searchParams.get("activity") !== "1") return;
         await this.openActivityCenter();
         url.searchParams.delete("activity");
-        history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
+        // Keep the session-history entry state recorded on this same entry.
+        history.replaceState(history.state, "", `${url.pathname}${url.search}${url.hash}`);
       } catch (_) { /* malformed URL or unavailable browser API — ignore */ }
     },
 
     async _openStartupSessionDeeplink() {
       try {
         const sid = new URL(location.href).searchParams.get("session");
-        if (sid) await this._openSessionFromDeeplink(sid);
+        // A reload keeps the entry this app wrote: reopen that session but
+        // keep the mobile pane the user was on. A fresh deep link (push
+        // notification, shared URL) still reveals the chat.
+        const reload = !!history.state && history.state.muselabSession === sid;
+        if (sid) await this._openSessionFromDeeplink(sid, "", { reveal: !reload });
       } catch (_) { /* malformed URL or unavailable browser API — ignore */ }
+      this._armSessionHistory();
+    },
+
+    // Browser Back/Forward walk the sessions the user switched between. Each
+    // switch adds a `?session=` entry; a redirect, fork or close retires the
+    // previous id, so the same tab replaces its entry instead of adding one.
+    _armSessionHistory() {
+      if (this._sessionHistoryArmed) return;
+      this._sessionHistoryArmed = true;
+      this._recordSessionHistory(this.currentId, true);
+      window.addEventListener("popstate", ev => this._onSessionHistoryPop(ev));
+      this.$watch("currentId", (sid, previous) => {
+        if (!sid || sid === previous) return;
+        if (this._sessionHistoryPopTarget === sid) {
+          this._sessionHistoryPopTarget = "";
+          this._recordSessionHistory(sid, true);
+          return;
+        }
+        const retired = !!previous && !this.openTabIds.includes(previous);
+        this._recordSessionHistory(sid, retired);
+      });
+    },
+    _recordSessionHistory(sid, replace) {
+      if (!sid) return;
+      try {
+        const state = history.state;
+        if (!replace && state && state.muselabSession === sid) return;
+        const url = new URL(location.href);
+        url.searchParams.set("session", sid);
+        const entry = { muselabSession: sid,
+                        muselabWorkspace: this.currentWorkspacePath() || "" };
+        const href = `${url.pathname}${url.search}${url.hash}`;
+        if (replace) history.replaceState(entry, "", href);
+        else history.pushState(entry, "", href);
+      } catch (_) { /* unavailable browser API — navigation still works */ }
+    },
+    async _onSessionHistoryPop(ev) {
+      const state = ev && ev.state;
+      const sid = state && state.muselabSession;
+      if (!sid || sid === this.currentId) return;
+      this._sessionHistoryPopTarget = sid;
+      const opened = await this._openSessionFromDeeplink(
+        sid, state.muselabWorkspace || "");
+      if (opened) return;
+      // A deleted session cannot be reopened: keep the entry on the session
+      // that is actually shown so the URL never names a missing one.
+      this._sessionHistoryPopTarget = "";
+      this._recordSessionHistory(this.currentId, true);
     },
 
     // First-load splash + initial fetch sequence. Sets appReady=true once
@@ -15321,7 +15374,7 @@ function portal() {
     // (?session=… on cold start, or a SW postMessage on an already-open
     // tab). Guard against stale/deleted ids so a tapped-but-since-deleted
     // notification doesn't push a phantom tab.
-    async _openSessionFromDeeplink(id, workspace = "") {
+    async _openSessionFromDeeplink(id, workspace = "", options = {}) {
       if (!id) return false;
       try {
         // Activity rows carry the owning workspace even when their session is
@@ -15350,7 +15403,7 @@ function portal() {
         // mobile and clear a stale unread dot in that case.
         const st = this.tabState && this.tabState[id];
         if (st && st.unread) st.unread = false;
-        if (this._isMobileLayout()) this.setMobileTab("chat");
+        if (options.reveal !== false && this._isMobileLayout()) this.setMobileTab("chat");
         return true;
       } catch (_) { return false; }
     },
