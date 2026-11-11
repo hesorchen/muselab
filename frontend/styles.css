@@ -12567,3 +12567,201 @@ html[data-theme="eyecare"] .hljs-symbol { color: #9a3e00; }
 /* Native schedules retain their state after a runtime disconnect. */
 .sched-native-state { font-size: 12px; color: var(--text-secondary, #666); margin: 4px 0; }
 .sched-native-outcome { font-size: 12px; color: var(--text-secondary, #666); overflow-wrap: anywhere; margin-top: 6px; }
+
+/* ==========================================================================
+   Settings surface (2026-11 refresh). One row grammar for every page:
+   name (+ one-line description below it) on the left, the control in a
+   fixed right-hand column; each section is a card; buttons always look like
+   buttons. Scoped to the settings surface; the Memory Center keeps its own
+   layout. Kept last in the file so it wins over the older scattered rules.
+   ========================================================================== */
+.settings-modal:not(.is-memory-center) .settings-section {
+  background: var(--c-bg-2);
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-lg);
+  padding: 14px 16px 12px;
+  margin-bottom: 14px;
+}
+.settings-modal:not(.is-memory-center) .settings-section[data-page="memory"] { background: none; border: 0; padding: 0; }
+.settings-modal .settings-section-title {
+  font-size: var(--fs-base); font-weight: var(--fw-semibold);
+  color: var(--c-fg-0); letter-spacing: 0; text-transform: none;
+  border-bottom: 0; padding-bottom: 0; margin-bottom: 10px;
+}
+.settings-modal .settings-section-title::before { display: none; }
+.settings-modal .settings-save-mode { font-size: var(--fs-xs); padding: 1px 8px; }
+.settings-modal .settings-page-lead { margin: -4px 0 12px; }
+
+/* Buttons: a quiet bordered button instead of bare text. */
+.settings-modal:not(.is-memory-center) button.btn-ghost {
+  background: var(--c-bg-1);
+  border-color: var(--c-border-strong);
+  color: var(--c-fg-1);
+}
+.settings-modal:not(.is-memory-center) button.btn-ghost:hover:not(:disabled) {
+  background: var(--c-bg-3); border-color: var(--c-bg-5); color: var(--c-fg-0);
+}
+.settings-modal:not(.is-memory-center) button.btn-ghost.danger {
+  color: var(--c-danger); border-color: color-mix(in srgb, var(--c-danger) 40%, transparent);
+}
+.settings-modal:not(.is-memory-center) button.btn-ghost.danger:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--c-danger) 10%, transparent); color: var(--c-danger);
+}
+.settings-modal button.btn-ghost.sm, .settings-modal button.btn-primary.sm { height: 28px; padding: 0 10px; }
+.settings-modal button:disabled { opacity: 0.55; cursor: not-allowed; }
+.settings-modal .settings-add-btn svg {
+  width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 2;
+}
+
+/* Folded groups (unused auth methods, advanced knobs). */
+.settings-modal .settings-advanced {
+  background: var(--c-bg-1); border-radius: var(--r-md); padding: 10px 12px; margin: 12px 0 0;
+}
+.settings-modal .settings-advanced > summary {
+  display: flex; align-items: center; gap: 8px;
+  color: var(--c-fg-1); font-weight: var(--fw-medium); list-style-position: inside;
+}
+.settings-modal .settings-advanced > summary::-webkit-details-marker { display: none; }
+.settings-modal .settings-advanced > summary::before {
+  content: ""; flex: 0 0 auto; width: 6px; height: 6px;
+  border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor;
+  transform: rotate(-45deg); margin: 0 4px 0 2px; transition: transform var(--t-fast);
+}
+.settings-modal .settings-advanced[open] > summary::before { transform: rotate(45deg); }
+.settings-modal .settings-advanced[open] > summary { margin-bottom: 10px; }
+.settings-modal .claude-fold .claude-auth-card { background: var(--c-bg-2); }
+
+/* Provider list: one bordered list, fixed action columns. */
+.settings-modal .provider-list {
+  border: 1px solid var(--c-border); border-radius: var(--r-md);
+  background: var(--c-bg-1); margin-bottom: 8px;
+}
+.settings-modal .provider-list > .provider-row,
+.settings-modal .provider-list > template + .provider-row { margin: 0; }
+.settings-modal .provider-list .provider-row {
+  grid-template-columns: minmax(0, 1fr) auto; row-gap: 4px;
+  padding: 9px 12px; min-height: 0;
+  border-top: 1px solid var(--c-border);
+}
+.settings-modal .provider-list .provider-row:first-of-type { border-top: 0; }
+.settings-modal .provider-list .provider-row > div > label,
+.settings-modal .provider-list .provider-row > label {
+  display: flex; align-items: center; gap: 0; min-width: 0;
+  font-size: var(--fs-sm); font-weight: var(--fw-medium); color: var(--c-fg-0);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.settings-modal .provider-actions {
+  display: grid; grid-template-columns: 34px 64px 56px 56px;
+  align-items: center; justify-items: start; gap: 8px;
+}
+.settings-modal .provider-actions > .switch { grid-column: 1; }
+.settings-modal .provider-actions > .provider-status { grid-column: 2; }
+.settings-modal .provider-actions > .provider-probe { grid-column: 3; }
+.settings-modal .provider-actions > .provider-edit { grid-column: 4; }
+.settings-modal .provider-actions > button { width: 100%; padding: 0 6px; }
+.settings-modal .provider-ducc .provider-actions { grid-column: 2; grid-row: 1 / span 2; }
+.settings-modal .provider-ducc > label { grid-column: 1; grid-row: 1; }
+.settings-modal .provider-ducc .provider-desc {
+  grid-column: 1; grid-row: 2; font-size: var(--fs-xs); color: var(--c-fg-3); line-height: 1.45;
+}
+.settings-modal .provider-list .provider-editor,
+.settings-modal .provider-list .probe-result { grid-column: 1 / -1; }
+.settings-modal .provider-list .provider-editor { background: var(--c-bg-2); }
+.settings-modal .provider-list-actions { display: flex; gap: 8px; margin: 0 0 8px; }
+.settings-modal .provider-add-row { display: flex; margin: 0 0 4px; }
+.settings-modal .claude-fold .provider-row { padding: 4px 0; }
+/* Provider editor: label and field on one line; the action row is a plain
+   left-aligned button group (the shared .settings-row grid used to stretch
+   Cancel across the field column and push Delete onto its own line). */
+.settings-modal .provider-editor .settings-row { align-items: center; min-height: 0; }
+/* .modal-body input adds a 12px top margin meant for stacked dialogs; in a
+   settings row it pushes the field below its label. */
+.settings-modal .settings-row > input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="color"]) {
+  margin-top: 0;
+}
+/* Desktop only: phones keep their 16px fields so iOS does not zoom on focus. */
+@media (min-width: 721px) {
+  .settings-modal .settings-row > input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="color"]) {
+    height: 32px; font-size: var(--fs-sm);
+  }
+}
+.settings-modal .provider-editor .settings-row:has(> textarea) { align-items: start; }
+.settings-modal .provider-editor .settings-row:has(> textarea) > label { padding-top: 6px; }
+.settings-modal .provider-editor .settings-row.provider-editor-actions {
+  display: flex; flex-wrap: wrap; gap: var(--sp-2); justify-content: flex-start;
+}
+.settings-modal .provider-editor .provider-editor-actions .danger { margin-left: auto; }
+
+/* Footer: logout | save-state note | Close | Save. */
+.settings-modal .settings-foot { align-items: center; gap: 8px; }
+.settings-modal .settings-foot .settings-logout { margin-right: auto; }
+.settings-modal .settings-foot-note {
+  font-size: var(--fs-xs); color: var(--c-fg-3); margin-right: 4px;
+}
+.settings-modal .settings-foot-note.pending { color: var(--c-accent-fg); font-weight: var(--fw-medium); }
+
+@media (min-width: 721px) {
+  .settings-modal { width: 940px; }
+  .settings-modal-body { gap: var(--sp-4); }
+
+  /* Compact left rail: ~36px rows, Memory Center pinned to the bottom as a
+     secondary link because it opens a different surface. */
+  .settings-modal .settings-menu {
+    flex: 0 0 196px; display: flex; flex-direction: column; gap: 2px;
+    background: transparent; border: 0; border-radius: 0; padding: 0;
+  }
+  .settings-modal .settings-menu-item {
+    min-height: 36px; padding: 7px 10px; gap: 10px;
+    border: 0; border-radius: var(--r-md);
+    font-size: var(--fs-sm); line-height: 1.3;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .settings-modal .settings-menu-title { overflow: hidden; text-overflow: ellipsis; }
+  .settings-modal .settings-menu-icon { display: inline-flex; align-items: center; }
+  .settings-modal .settings-menu-icon svg { width: 16px; height: 16px; }
+  .settings-modal .settings-menu-item.active { box-shadow: none; font-weight: var(--fw-medium); }
+  .settings-modal .settings-menu-extra {
+    margin-top: auto; padding-top: 8px; border-top: 1px solid var(--c-border);
+  }
+  .settings-modal .settings-menu-extra .settings-menu-item { color: var(--c-fg-2); font-size: var(--fs-xs); }
+
+  /* Row grammar: name column + fixed 320px control column, controls flush
+     right so every page reads as one aligned column. */
+  .settings-modal:not(.is-memory-center) .settings-section > .settings-row,
+  .settings-modal:not(.is-memory-center) .settings-section .settings-advanced > .settings-row {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 320px);
+    column-gap: 16px; margin-bottom: 0; padding: 7px 0; min-height: 44px;
+  }
+  .settings-modal:not(.is-memory-center) .settings-section > .settings-row > :nth-child(2) {
+    justify-self: end; max-width: 100%;
+  }
+  .settings-modal:not(.is-memory-center) .settings-section > .settings-row > .settings-input-wrap,
+  .settings-modal:not(.is-memory-center) .settings-section > .settings-row > .settings-input,
+  .settings-modal:not(.is-memory-center) .settings-section > .settings-row > select {
+    width: 100%; justify-content: flex-end;
+  }
+  .settings-modal:not(.is-memory-center) .settings-section > .settings-row label { white-space: normal; }
+  /* A hint right after a row is that row's description: keep it under the
+     name, out of the control column. */
+  .settings-modal:not(.is-memory-center) .settings-section > .settings-row + .settings-hint {
+    margin: -4px 0 8px; padding-right: 336px;
+  }
+  .settings-modal:not(.is-memory-center) .settings-section > .settings-row + .settings-row,
+  .settings-modal:not(.is-memory-center) .settings-section > .settings-hint + .settings-row {
+    border-top: 1px solid var(--c-border);
+  }
+  .settings-modal .claude-fold .provider-row { grid-template-columns: 200px minmax(0, 1fr); }
+}
+
+@media (max-width: 720px) {
+  .settings-modal:not(.is-memory-center) .settings-section { padding: 12px; }
+  .settings-modal .settings-menu-extra .settings-menu-item { color: var(--c-fg-2); }
+  .settings-modal .provider-list .provider-row { grid-template-columns: 1fr; }
+  .settings-modal .provider-ducc .provider-actions,
+  .settings-modal .provider-ducc .provider-desc,
+  .settings-modal .provider-ducc > label { grid-column: 1; grid-row: auto; }
+  .settings-modal .provider-actions { grid-template-columns: 34px 72px 1fr 1fr; width: 100%; }
+  .settings-modal .provider-ducc .provider-actions { display: flex; }
+  .settings-modal .settings-foot .settings-foot-note { order: -1; flex: 1 1 100%; margin: 0; }
+  .settings-modal .settings-foot .settings-logout { margin-right: 0; }
+}

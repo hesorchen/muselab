@@ -6711,3 +6711,25 @@ def test_tool_row_wraps_task_pill_instead_of_squeezing_it():
     assert "min-width: min(16em, 100%)" in pill
     assert ".tool:has(> .tool-task) > .tool-task { order: 1; margin-left: 0; }" in pill
     assert ".tool:has(> .tool-task) > .tool-arg { order: 2; flex: 1 1 100%; }" in pill
+
+
+def test_settings_save_states_scope_and_disables_without_drafts():
+    """The settings footer says what Save submits, and Save is disabled
+    when the page it belongs to has nothing pending (live pages say so)."""
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    drafts = (FRONTEND / "modules" / "settings-drafts.mjs").read_text(encoding="utf-8")
+    foot = html[html.index('class="modal-foot settings-foot"'):]
+    foot = foot[:foot.index("</div>")]
+    assert 'x-text="settingsFooterNote()"' in foot
+    assert '!!settings.error || !settingsPendingCount()"' in foot
+    # Memory Save also re-probes the provider, so it stays usable when clean.
+    assert '!settings.memory.configLoaded"' in foot
+    assert "dirtyCount(names) {" in drafts
+    assert "settingsPendingCount(page = this.settings.activePage) {" in app
+    # Provider page: DUCC row, keyless built-ins folded, Claude + context folded.
+    section = html[html.index('data-page="provider"'):html.index('data-page="appearance"')]
+    assert 'class="settings-row provider-row provider-ducc"' in section
+    assert "settingsProviderRows()" in section and "settings.showKeylessProviders" in section
+    assert section.index("provider-ducc") < section.index("claude-fold") < section.index(
+        'data-testid="context-limits-settings"')
