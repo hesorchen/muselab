@@ -12608,6 +12608,22 @@ html[data-theme="eyecare"] .hljs-symbol { color: #9a3e00; }
   background: color-mix(in srgb, var(--c-danger) 10%, transparent); color: var(--c-danger);
 }
 .settings-modal button.btn-ghost.sm, .settings-modal button.btn-primary.sm { height: 28px; padding: 0 10px; }
+/* Segmented pickers (language, theme, eye-care level) are not bordered
+   buttons: the bordered-button rule above outranks their own rules and
+   hid which segment is selected. Restore their segment look here. */
+.settings-modal:not(.is-memory-center) :is(.lang-picker, .theme-picker, .eyecare-level-picker) button.btn-ghost {
+  background: transparent; border: 0; color: var(--c-fg-3);
+}
+.settings-modal:not(.is-memory-center) :is(.lang-picker, .theme-picker, .eyecare-level-picker) button.btn-ghost.active {
+  background: var(--c-btn-primary-bg); color: var(--c-on-accent);
+}
+.settings-modal:not(.is-memory-center) :is(.lang-picker, .theme-picker, .eyecare-level-picker) button.btn-ghost:hover:not(.active) {
+  background: var(--c-bg-2); color: var(--c-fg-0);
+}
+/* Memory job rows: the base .settings-hint pulls itself 8px up to tuck under
+   a settings row, which made "Attempts" overlap the job title. */
+.settings-modal .memory-card > .settings-hint { margin: 2px 0 4px; }
+.settings-modal .memory-card > time { font-size: var(--fs-xs); color: var(--c-fg-3); }
 .settings-modal button:disabled { opacity: 0.55; cursor: not-allowed; }
 .settings-modal .settings-add-btn svg {
   width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 2;
@@ -12741,6 +12757,9 @@ html[data-theme="eyecare"] .hljs-symbol { color: #9a3e00; }
     width: 100%; justify-content: flex-end;
   }
   .settings-modal:not(.is-memory-center) .settings-section > .settings-row label { white-space: normal; }
+  /* A control with a hint under it: the control joins the right-hand column
+     like every other row (the eye-care picker used to sit left of it). */
+  .settings-modal:not(.is-memory-center) .settings-section > .settings-row > .settings-row-col { align-items: flex-end; }
   /* A hint right after a row is that row's description: keep it under the
      name, out of the control column. */
   .settings-modal:not(.is-memory-center) .settings-section > .settings-row + .settings-hint {
