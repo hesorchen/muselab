@@ -1055,6 +1055,12 @@ class _TurnSubscriber:
         return True
 
     def resync(self, reason: str, **details) -> None:
+        # The client falls back to canonical history after this; recording it
+        # lets a frozen live view be traced to its cause.
+        try:
+            obs.perf_event("chat.stream_resync", reason=str(reason)[:40])
+        except Exception:
+            pass
         self._resync_payload = {
             "reason": reason,
             "retryable": True,
@@ -7197,13 +7203,7 @@ async def get_session_subagents_api(
     The body is encoded off-loop and sent pre-compressed, so GZipMiddleware
     passes it through instead of compressing on the event loop.
     """
-    payload = await _session_subagents_payload(sid)
-    if parent:
-        payload["threads"] = chat_subagents.subagent_subtree(
-            payload["threads"], parent)
-    if view == "summary":
-        payload["threads"] = chat_subagents.summarize_subagent_threads(
-            payload["threads"])
+    payload = await _session_subagents_payload(sid, view=view, parent=parent)
     gzip_ok = "gzip" in request.headers.get("accept-encoding", "")
     body, gzipped = await obs.to_thread_io(
         "chat.subagents_encode", sid, _encode_json_body, payload, gzip_ok,
@@ -7216,7 +7216,9 @@ async def get_session_subagents_api(
     )
 
 
-async def _session_subagents_payload(sid: str) -> dict:
+async def _session_subagents_payload(
+    sid: str, view: str = "full", parent: str = "",
+) -> dict:
     """Read the SDK-owned nested transcript for every Subagent.
 
     The top-level SDK APIs are the source of truth.  MuseLab only shapes their
@@ -7238,12 +7240,9 @@ async def _session_subagents_payload(sid: str) -> dict:
     )
     model = str(meta.get("model") or "")
 
-    def _load() -> list[dict[str, Any]]:
+    def _load(reader) -> list[dict[str, Any]]:
         with _session_config_dir(model, sid=sid):
-            own = chat_subagents.load_subagent_threads(
-                sid,
-                directory=str(workspace),
-            )
+            own = reader(sid, str(workspace))
         lineage = sess.runtime_lineage(sid) or [sid]
         ancestors = lineage[:lineage.index(sid)] if sid in lineage else []
         if not ancestors:
@@ -7269,18 +7268,43 @@ async def _session_subagents_payload(sid: str) -> dict:
             if owner_meta is None:
                 continue
             with _session_config_dir(str(owner_meta.get("model") or ""), sid=owner):
-                inherited.extend(chat_subagents.load_subagent_threads(
-                    owner, directory=str(sess.session_workspace(owner)),
-                ))
+                inherited.extend(reader(owner, str(sess.session_workspace(owner))))
         return chat_subagents.inherit_subagent_threads(own, inherited, parents)
+
+    def _summaries(owner: str, directory: str) -> list[dict[str, Any]]:
+        return chat_subagents.load_subagent_summaries(owner, directory=directory)
+
+    def _read() -> list[dict[str, Any]]:
+        if view == "summary":
+            threads = _load(_summaries)
+            return (chat_subagents.subagent_subtree(threads, parent)
+                    if parent else threads)
+        if not parent:
+            return _load(lambda owner, directory: chat_subagents.load_subagent_threads(
+                owner, directory=directory))
+        # One card: locate its subtree from the cached summaries, then read
+        # only those agents' transcripts in full.
+        wanted: dict[str, set[str]] = {}
+        for thread in chat_subagents.subagent_subtree(_load(_summaries), parent):
+            wanted.setdefault(str(thread.get("session_id") or ""), set()).add(
+                str(thread.get("agent_id") or ""))
+
+        def _selected(owner: str, directory: str) -> list[dict[str, Any]]:
+            agents = wanted.get(owner)
+            if not agents:
+                return []
+            return chat_subagents.load_subagent_threads(
+                owner, directory=directory, agent_ids=agents)
+
+        return chat_subagents.subagent_subtree(_load(_selected), parent)
 
     # Several panes can request the same SDK snapshot together. Reading every
     # Subagent transcript once per waiter multiplies I/O during host stalls.
     # Share only overlapping reads; the next request must see late SDK appends.
     threads = await _SUBAGENT_HISTORY_READS.run(
-        (sid, model, str(workspace)),
+        (sid, model, str(workspace), view, parent),
         lambda: obs.to_thread_io(
-            "chat.subagents_history_read", sid, _load),
+            "chat.subagents_history_read", sid, _read),
     )
     return {"session_id": sid, "threads": threads}
 

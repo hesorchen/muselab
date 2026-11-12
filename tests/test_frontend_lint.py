@@ -6753,12 +6753,31 @@ def test_opened_subagent_timeline_loads_bodies_and_keeps_them():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
     assert '@toggle="onSubagentTimelineToggle(tid, pane, m.id, $event.target.open)"' in html
-    assert 'x-show="subagentStubNote(pane, m.id, block)"' in html
+    assert 'x-show="subagentLoadNote(pane, m.id)"' in html
+    # The count comes from summaries, which carry no rows.
+    assert 'x-show="subagentTimelineCount(pane, m.id)"' in html
     merge = app[app.index("    _mergeSubagentThreads(current, fetched) {"):
-                app.index("    // A timeline that is open must show bodies")]
-    # A summary stub never replaces a loaded body.
-    assert "if (fresh.stub && !old.stub) target.blocks.splice(index, 1, old);" in merge
+                app.index("    _subagentSubtreeThreads(state, parentToolUseId) {")]
+    # A summary never replaces a loaded timeline.
+    assert "if (previous && target.summary && !previous.summary) {" in merge
     assert "this._reloadOpenSubagentTimelines(sid, state);" in app
     # A live gap is repaired from that card's full subtree, not a summary.
     assert "void this.hydrateSubagents(sid, state, { quiet: true, parent });" in app
     assert "this._reportSendFailure(streamSid, sendStage, _e, sendStatus, Date.now() - sendStartedAt);" in app
+
+
+def test_background_reads_share_one_connection_slot():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    assert "LOW_PRIORITY_FETCH_SLOTS: 1," in app
+    assert "/subagents?view=summary`,\n          { headers: this.hdr(), lowPriority: true }," in app
+    assert '{ headers: this.hdr(), cache: "no-store", lowPriority: true },' in app
+    assert "{ headers: this.hdr(), signal: opts.signal, lowPriority: !isCurrent }," in app
+
+
+def test_running_turn_reattaches_instead_of_waiting_for_its_end():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    replay = app[app.index("    async _runCanonicalReplaySync(sid, st, options = {}) {"):]
+    assert "waited >= 30_000" in replay and ">= 60_000" in replay
+    assert "reconnect: true," in replay
+    assert html.count('@click.stop="reconnectLivePane(') == 2

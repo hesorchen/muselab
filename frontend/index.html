@@ -2481,12 +2481,12 @@
                       </div>
                     </template>
                     <details class="subagent-timeline"
-                             x-show="subagentTimelineFor(pane, m.id).length"
+                             x-show="subagentTimelineCount(pane, m.id)"
                              @toggle="onSubagentTimelineToggle(tid, pane, m.id, $event.target.open)">
                       <summary>
                         <span x-text="lang==='zh' ? '执行过程' : 'Execution timeline'"></span>
                         <span class="subagent-timeline-count"
-                              x-text="subagentTimelineFor(pane, m.id).length"></span>
+                              x-text="subagentTimelineCount(pane, m.id)"></span>
                       </summary>
                       <div class="subagent-timeline-body">
                         <template x-for="block in subagentTimelineFor(pane, m.id)"
@@ -2505,11 +2505,11 @@
                             <pre class="subagent-timeline-text"
                                  x-show="subagentBlockBody(block)"
                                  x-text="subagentBlockBody(block)"></pre>
-                            <pre class="subagent-timeline-text is-pending"
-                                 x-show="subagentStubNote(pane, m.id, block)"
-                                 x-text="subagentStubNote(pane, m.id, block)"></pre>
                           </div>
                         </template>
+                        <pre class="subagent-timeline-text is-pending"
+                             x-show="subagentLoadNote(pane, m.id)"
+                             x-text="subagentLoadNote(pane, m.id)"></pre>
                       </div>
                     </details>
                   </div>
@@ -3095,6 +3095,13 @@
                                     m, pane, i === paneMsgs.length - 1)
                                   ? t('chat.main_response_completed')
                                   : turnStatusLabel(turnFooterStatus(m, pane))"></span>
+                    <span class="turn-live-recovery"
+                          x-show="turnFooterStatus(m, pane) === 'running' && liveRecoveryLabel(pane)">
+                      <span x-text="'· ' + liveRecoveryLabel(pane)"></span>
+                      <button type="button" class="turn-live-reconnect"
+                              @click.stop="reconnectLivePane(tid)"
+                              x-text="lang==='zh' ? '重新连接' : 'Reconnect'"></button>
+                    </span>
                     <span class="turn-background-running"
                           x-show="turnHasPendingBackground(
                             m, pane, i === paneMsgs.length - 1)"
@@ -3221,6 +3228,12 @@
             <span class="turn-status running">
               <span class="turn-running-dots" aria-hidden="true"><span></span><span></span><span></span></span>
               <span x-text="streamPhaseLabel(activeSession.streamPhase)"></span>
+              <span class="turn-live-recovery" x-show="liveRecoveryLabel(activeSession)">
+                <span x-text="'· ' + liveRecoveryLabel(activeSession)"></span>
+                <button type="button" class="turn-live-reconnect"
+                        @click.stop="reconnectLivePane(currentId)"
+                        x-text="lang==='zh' ? '重新连接' : 'Reconnect'"></button>
+              </span>
             </span>
             <span x-show="activeSession._streamStartedAt"
                   class="msg-ts"

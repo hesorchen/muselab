@@ -1597,6 +1597,36 @@ async def client_send_failure_log(payload: dict = Body(...)) -> dict:
     return {"ok": True}
 
 
+_LIVE_RECOVERY_TRIGGERS = frozenset({
+    "replay_truncated", "bootstrap_overflow", "replay_gap", "live_backlog",
+    "live_barrier_missing", "child_stream_error", "replay_storage_error",
+    "reconnect_budget", "transport_silent", "other",
+})
+
+
+@app.post("/api/log/live-recovery", dependencies=[Depends(require_token)])
+async def client_live_recovery_log(payload: dict = Body(...)) -> dict:
+    """One content-free record each time the browser reattaches a running
+    turn whose live view had stopped updating, and why it had stopped."""
+    sid8 = payload.get("sid8", "none")
+    waited = payload.get("waited_ms", 0)
+    if (any(name not in {"sid8", "trigger", "mode", "waited_ms"} for name in payload)
+            or payload.get("trigger") not in _LIVE_RECOVERY_TRIGGERS
+            or payload.get("mode") not in {"auto", "manual"}
+            or not isinstance(sid8, str) or not re.fullmatch(r"[0-9a-f]{8}|none", sid8)
+            or type(waited) is not int):
+        return JSONResponse(
+            {"ok": False, "error": "invalid_payload"}, status_code=422)
+    try:
+        perf_event(
+            "client.live_recovery", sid8=sid8, trigger=payload["trigger"],
+            mode=payload["mode"], waited_ms=min(100_000_000, max(0, waited)),
+        )
+    except Exception:
+        pass
+    return {"ok": True}
+
+
 @app.post("/api/log/session-rename", dependencies=[Depends(require_token)])
 async def client_session_rename_log(payload: dict = Body(...)) -> dict:
     """Persist one strict, title-free browser session-rename timing summary."""

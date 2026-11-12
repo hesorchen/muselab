@@ -41,17 +41,18 @@ def test_opened_timeline_loads_bodies_and_keeps_them(page, backend_url, auth_tok
         url = route.request.url
         calls.append("parent" if "parent=toolu_card" in url
                      else "summary" if "view=summary" in url else "full")
-        rows = [dict(b) for b in blocks]
-        if "view=summary" in url:
-            rows = [{**{k: v for k, v in b.items() if k != "text"}, "stub": True}
-                    for b in rows]
+        summary = "view=summary" in url
+        thread = {
+            "session_id": sid, "agent_id": "agent-1",
+            "parent_tool_use_id": "toolu_card", "orphaned": False,
+            "message_count": len(blocks),
+            # A summary carries the row count, not the rows.
+            "blocks": [] if summary else [dict(b) for b in blocks],
+        }
+        if summary:
+            thread.update(summary=True, block_count=len(blocks))
         route.fulfill(content_type="application/json", body=json.dumps({
-            "session_id": sid, "threads": [{
-                "session_id": sid, "agent_id": "agent-1",
-                "parent_tool_use_id": "toolu_card", "orphaned": False,
-                "message_count": len(rows), "blocks": rows,
-            }],
-        }))
+            "session_id": sid, "threads": [thread]}))
 
     _route_windowed_session(page, sid, [{
         "role": "tool_use", "name": "Agent", "id": "toolu_card",
@@ -93,16 +94,17 @@ def test_failed_body_load_says_so_and_reopening_retries(page, backend_url, auth_
         if "parent=" in url and state["fail"]:
             route.fulfill(status=500, body="no")
             return
-        stub = "view=summary" in url
+        summary = "view=summary" in url
+        thread = {
+            "session_id": sid, "agent_id": "agent-1",
+            "parent_tool_use_id": "toolu_card", "orphaned": False,
+            "message_count": 1,
+            "blocks": [] if summary else [_block("b1", "assistant", text="LATE_BODY")],
+        }
+        if summary:
+            thread.update(summary=True, block_count=1)
         route.fulfill(content_type="application/json", body=json.dumps({
-            "session_id": sid, "threads": [{
-                "session_id": sid, "agent_id": "agent-1",
-                "parent_tool_use_id": "toolu_card", "orphaned": False,
-                "message_count": 1,
-                "blocks": [_block("b1", "assistant", **({"stub": True} if stub
-                                                       else {"text": "LATE_BODY"}))],
-            }],
-        }))
+            "session_id": sid, "threads": [thread]}))
 
     _route_windowed_session(page, sid, [{
         "role": "tool_use", "name": "Agent", "id": "toolu_card",
