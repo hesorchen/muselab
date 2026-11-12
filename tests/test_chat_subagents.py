@@ -587,3 +587,93 @@ def test_successor_history_refresh_reads_growing_ancestor_transcript(
     second = client.get(url, headers=auth).json()
     assert len(first["threads"][0]["blocks"]) == 1
     assert second["threads"][0]["blocks"] == blocks
+
+
+def _tree_threads(session_id):
+    def block(parent, uuid, role, **extra):
+        return {
+            "session_id": session_id, "parent_tool_use_id": parent,
+            "parent_agent_id": None, "agent_id": None, "message_uuid": uuid,
+            "source_block_index": 0, "block_id": f"{parent}:{uuid}", "role": role,
+            **extra,
+        }
+    return [
+        {"session_id": session_id, "agent_id": "a", "parent_tool_use_id": "toolu_a",
+         "parent_agent_id": None, "orphaned": False, "message_count": 3, "blocks": [
+             block("toolu_a", "m1", "assistant", text="long reply " * 50),
+             block("toolu_a", "m2", "tool_use", name="Agent", id="toolu_child",
+                   summary="nested", input={"prompt": "x" * 500}),
+             block("toolu_a", "m3", "tool_result", id="toolu_child",
+                   text="out " * 200, preview="out", is_error=False),
+         ]},
+        {"session_id": session_id, "agent_id": "c", "parent_tool_use_id": "toolu_child",
+         "parent_agent_id": "a", "orphaned": False, "message_count": 1, "blocks": [
+             block("toolu_child", "m4", "assistant", text="child reply"),
+         ]},
+        {"session_id": session_id, "agent_id": "b", "parent_tool_use_id": "toolu_b",
+         "parent_agent_id": None, "orphaned": False, "message_count": 1, "blocks": [
+             block("toolu_b", "m5", "thinking", text="other card"),
+         ]},
+    ]
+
+
+def test_summary_view_keeps_every_row_without_bodies(
+    app_module, client, auth, monkeypatch,
+):
+    from backend import chat as chat_mod
+    from backend import sessions as sess
+
+    session = sess.create_session("subagent summary")
+    full = _tree_threads(session["id"])
+    monkeypatch.setattr(
+        chat_mod.chat_subagents, "load_subagent_threads",
+        lambda session_id, directory=None: full)
+    path = f"/api/chat/sessions/{session['id']}/subagents"
+
+    summary = client.get(path + "?view=summary", headers=auth).json()["threads"]
+    assert [len(t["blocks"]) for t in summary] == [3, 1, 1]
+    for thread, original in zip(summary, full):
+        assert thread["message_count"] == original["message_count"]
+        for block, source in zip(thread["blocks"], original["blocks"]):
+            assert block["stub"] is True
+            assert block["block_id"] == source["block_id"]
+            assert block["role"] == source["role"]
+            assert not {"text", "preview", "input"} & block.keys()
+    nested = summary[0]["blocks"][1]
+    assert (nested["name"], nested["id"], nested["summary"]) == ("Agent", "toolu_child", "nested")
+    # The default view stays the full transcript.
+    assert client.get(path, headers=auth).json()["threads"] == full
+    assert client.get(path + "?view=bogus", headers=auth).status_code == 422
+
+
+def test_parent_view_returns_one_card_subtree_with_bodies(
+    app_module, client, auth, monkeypatch,
+):
+    from backend import chat as chat_mod
+    from backend import sessions as sess
+
+    session = sess.create_session("subagent subtree")
+    full = _tree_threads(session["id"])
+    monkeypatch.setattr(
+        chat_mod.chat_subagents, "load_subagent_threads",
+        lambda session_id, directory=None: full)
+    path = f"/api/chat/sessions/{session['id']}/subagents"
+
+    subtree = client.get(path + "?parent=toolu_a", headers=auth).json()["threads"]
+    assert [t["agent_id"] for t in subtree] == ["a", "c"]
+    assert subtree == full[:2]
+    leaf = client.get(path + "?parent=toolu_b", headers=auth).json()["threads"]
+    assert leaf == full[2:]
+    assert client.get(path + "?parent=toolu_missing", headers=auth).json()["threads"] == []
+
+
+def test_send_failure_log_accepts_only_closed_fields(client, auth):
+    good = {"sid8": "ebdc72dc", "stage": "mux_open", "error_kind": "mux_unavailable",
+            "http_status": 0, "elapsed_ms": 5012, "mux_connected": False,
+            "asset_version": "1794399292646"}
+    assert client.post("/api/log/send-failure", json=good).status_code == 401
+    assert client.post("/api/log/send-failure", json=good, headers=auth).json() == {"ok": True}
+    for bad in ({**good, "stage": "x"}, {**good, "error_kind": "boom"},
+                {**good, "prompt": "secret"}, {**good, "sid8": "ebdc72dc-full-id"},
+                {**good, "elapsed_ms": "5"}):
+        assert client.post("/api/log/send-failure", json=bad, headers=auth).status_code == 422

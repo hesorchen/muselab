@@ -7183,13 +7183,27 @@ def _encode_json_body(payload: Any, gzip_ok: bool) -> tuple[bytes, bool]:
     "/sessions/{sid}/subagents",
     dependencies=[Depends(require_token)],
 )
-async def get_session_subagents_api(sid: str, request: Request) -> Response:
+async def get_session_subagents_api(
+    sid: str,
+    request: Request,
+    view: str = Query("full", pattern="^(full|summary)$"),
+    parent: str = Query("", max_length=256),
+) -> Response:
     """Return the SDK-owned nested transcript for every Subagent.
 
+    ``view=summary`` drops block bodies (a long session's full timelines
+    reach tens of MB); ``parent`` limits the threads to one Agent card's
+    subtree, which the client loads when that card's timeline is opened.
     The body is encoded off-loop and sent pre-compressed, so GZipMiddleware
     passes it through instead of compressing on the event loop.
     """
     payload = await _session_subagents_payload(sid)
+    if parent:
+        payload["threads"] = chat_subagents.subagent_subtree(
+            payload["threads"], parent)
+    if view == "summary":
+        payload["threads"] = chat_subagents.summarize_subagent_threads(
+            payload["threads"])
     gzip_ok = "gzip" in request.headers.get("accept-encoding", "")
     body, gzipped = await obs.to_thread_io(
         "chat.subagents_encode", sid, _encode_json_body, payload, gzip_ok,

@@ -2481,7 +2481,8 @@
                       </div>
                     </template>
                     <details class="subagent-timeline"
-                             x-show="subagentTimelineFor(pane, m.id).length">
+                             x-show="subagentTimelineFor(pane, m.id).length"
+                             @toggle="onSubagentTimelineToggle(tid, pane, m.id, $event.target.open)">
                       <summary>
                         <span x-text="lang==='zh' ? '执行过程' : 'Execution timeline'"></span>
                         <span class="subagent-timeline-count"
@@ -2504,6 +2505,9 @@
                             <pre class="subagent-timeline-text"
                                  x-show="subagentBlockBody(block)"
                                  x-text="subagentBlockBody(block)"></pre>
+                            <pre class="subagent-timeline-text is-pending"
+                                 x-show="subagentStubNote(pane, m.id, block)"
+                                 x-text="subagentStubNote(pane, m.id, block)"></pre>
                           </div>
                         </template>
                       </div>

@@ -39,7 +39,6 @@ def test_inherited_timeline_updates_without_replacing_active_child(
             }],
         }))
 
-    page.route(f"**/api/chat/sessions/{sid}/subagents", timeline)
     source_status = {
         "active": True, "runtime_background_tasks_pending": 1,
         "runtime_continuation_pending": False, "runtime_ui_revision": "",
@@ -54,6 +53,8 @@ def test_inherited_timeline_updates_without_replacing_active_child(
         "role": "tool_use", "name": "Agent", "id": "inherited-agent-call",
         "uuid": "parent-card", "task": {"description": "Synthetic inherited task"},
     }])
+    # Registered last so it wins over the windowed-session glob.
+    page.route(f"**/api/chat/sessions/{sid}/subagents*", timeline)
     _app_eval(page, """
       app.sessions.find(s => s.id === arg.sid).runtime_predecessor = arg.source;
       await app.loadSession(arg.sid);
