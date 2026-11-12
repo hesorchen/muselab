@@ -1550,6 +1550,53 @@ async def client_chat_render_log(payload: dict = Body(...)) -> dict:
     return {"ok": True}
 
 
+_SEND_FAILURE_STAGES = frozenset({"mux_open", "turn_start", "ticket", "event_source"})
+_SEND_FAILURE_KINDS = frozenset({
+    "mux_unavailable", "timeout", "aborted", "network", "http", "not_accepted",
+    "unknown",
+})
+
+
+@app.post("/api/log/send-failure", dependencies=[Depends(require_token)])
+async def client_send_failure_log(payload: dict = Body(...)) -> dict:
+    """One content-free record per "could not start the stream" failure: the
+    browser step that failed and how, so the server log can explain a toast
+    whose request never reached the server."""
+    allowed_fields = {
+        "sid8", "stage", "error_kind", "http_status", "elapsed_ms",
+        "mux_connected", "asset_version",
+    }
+    sid8 = payload.get("sid8", "none")
+    version = payload.get("asset_version", "")
+    status = payload.get("http_status", 0)
+    elapsed = payload.get("elapsed_ms", 0)
+    if (any(name not in allowed_fields for name in payload)
+            or payload.get("stage") not in _SEND_FAILURE_STAGES
+            or payload.get("error_kind") not in _SEND_FAILURE_KINDS
+            or not isinstance(sid8, str) or not re.fullmatch(r"[0-9a-f]{8}|none", sid8)
+            or not isinstance(version, str)
+            or not re.fullmatch(r"[A-Za-z0-9._-]{0,32}", version)
+            or not isinstance(payload.get("mux_connected", False), bool)
+            or type(status) is not int or type(elapsed) is not int):
+        return JSONResponse(
+            {"ok": False, "error": "invalid_payload"}, status_code=422)
+    try:
+        perf_event(
+            "client.send_failure",
+            sid8=sid8,
+            stage=payload["stage"],
+            error_kind=payload["error_kind"],
+            http_status=min(999, max(0, status)),
+            elapsed_ms=min(100_000_000, max(0, elapsed)),
+            mux_connected=payload.get("mux_connected", False),
+            asset_version=version,
+        )
+    except Exception:
+        # Diagnostics must never affect sending.
+        pass
+    return {"ok": True}
+
+
 @app.post("/api/log/session-rename", dependencies=[Depends(require_token)])
 async def client_session_rename_log(payload: dict = Body(...)) -> dict:
     """Persist one strict, title-free browser session-rename timing summary."""

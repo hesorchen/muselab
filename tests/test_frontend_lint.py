@@ -6430,7 +6430,9 @@ def test_subagent_timeline_uses_separate_sdk_history_and_live_lane():
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
 
     assert '"subagent_delta", "subagent_block"' in app
-    assert "/subagents`" in app
+    # Background refreshes take the summary; an opened card loads its subtree.
+    assert "/subagents?view=summary`" in app
+    assert "/subagents?parent=`" in app
     assert "_applySubagentDelta(streamSid, streamState, d)" in app
     assert "_applySubagentBlock(streamSid, streamState, d)" in app
     assert "subagentTimelineFor(pane, m.id)" in html
@@ -6745,3 +6747,18 @@ def test_settings_segment_pickers_keep_their_selected_segment():
     assert css.index(".settings-modal:not(.is-memory-center) button.btn-ghost {") < css.index(picker)
     assert ".settings-modal .memory-card > .settings-hint { margin: 2px 0 4px; }" in css
     assert "> .settings-row > .settings-row-col { align-items: flex-end; }" in css
+
+
+def test_opened_subagent_timeline_loads_bodies_and_keeps_them():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    assert '@toggle="onSubagentTimelineToggle(tid, pane, m.id, $event.target.open)"' in html
+    assert 'x-show="subagentStubNote(pane, m.id, block)"' in html
+    merge = app[app.index("    _mergeSubagentThreads(current, fetched) {"):
+                app.index("    // A timeline that is open must show bodies")]
+    # A summary stub never replaces a loaded body.
+    assert "if (fresh.stub && !old.stub) target.blocks.splice(index, 1, old);" in merge
+    assert "this._reloadOpenSubagentTimelines(sid, state);" in app
+    # A live gap is repaired from that card's full subtree, not a summary.
+    assert "void this.hydrateSubagents(sid, state, { quiet: true, parent });" in app
+    assert "this._reportSendFailure(streamSid, sendStage, _e, sendStatus, Date.now() - sendStartedAt);" in app

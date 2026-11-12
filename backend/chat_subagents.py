@@ -408,6 +408,56 @@ def load_subagent_threads(
     return threads
 
 
+# Fields a summary block keeps: identity, the row label and the one-line
+# tool summary. Bodies (text, previews, tool input) load when a card opens.
+_SUMMARY_BLOCK_KEYS = frozenset({
+    "session_id", "parent_tool_use_id", "parent_agent_id", "agent_id",
+    "message_uuid", "source_block_index", "block_id", "role",
+    "name", "id", "summary", "is_error",
+})
+
+
+def summarize_subagent_threads(
+    threads: list[SubagentThread],
+) -> list[SubagentThread]:
+    """Every thread and block, without bodies: enough to count rows, nest
+    Agent cards and label each row. Blocks are marked ``stub``."""
+    return [{
+        **thread,
+        "blocks": [
+            {**{key: block[key] for key in _SUMMARY_BLOCK_KEYS if key in block},
+             "stub": True}
+            for block in thread.get("blocks", [])
+        ],
+    } for thread in threads]
+
+
+def subagent_subtree(
+    threads: list[SubagentThread],
+    parent_tool_use_id: str,
+) -> list[SubagentThread]:
+    """Threads under one Agent card, nested Agent cards included."""
+    reachable = {parent_tool_use_id}
+    output: list[SubagentThread] = []
+    pending = [thread for thread in threads if not thread.get("orphaned")]
+    while pending:
+        deferred = []
+        for thread in pending:
+            if thread.get("parent_tool_use_id") not in reachable:
+                deferred.append(thread)
+                continue
+            output.append(thread)
+            for block in thread.get("blocks", []):
+                if (block.get("role") == "tool_use"
+                        and block.get("name") in {"Agent", "Task"}
+                        and block.get("id")):
+                    reachable.add(str(block["id"]))
+        if len(deferred) == len(pending):
+            break
+        pending = deferred
+    return output
+
+
 def inherit_subagent_threads(
     own_threads: list[SubagentThread],
     ancestor_threads: list[SubagentThread],

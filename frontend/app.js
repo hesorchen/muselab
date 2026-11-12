@@ -6571,6 +6571,36 @@ function portal() {
       }
       this.openLightbox(src, im.name);
     },
+    // Content-free record of a failed stream start: the step and the kind
+    // of failure. The toast alone left no server-side trace when the request
+    // never arrived (e.g. the browser connection pool was saturated).
+    _reportSendFailure(sid, stage, error, httpStatus, elapsedMs) {
+      const message = String((error && error.message) || "");
+      let kind = "unknown";
+      if (message === "mux unavailable") kind = "mux_unavailable";
+      else if (message === "request deadline exceeded") kind = "timeout";
+      else if (error && error.name === "AbortError") kind = "aborted";
+      else if (error && error.name === "TypeError") kind = "network";
+      else if (/^(turn start|ticket) \d+$/.test(message)) kind = "http";
+      else if (message === "turn not accepted") kind = "not_accepted";
+      const sid8 = /^[0-9a-f]{8}/.test(String(sid || "")) ? String(sid).slice(0, 8) : "none";
+      const payload = {
+        sid8, stage, error_kind: kind,
+        http_status: Math.max(0, Math.min(999, Math.round(Number(httpStatus) || 0))),
+        elapsed_ms: Math.max(0, Math.min(100_000_000, Math.round(Number(elapsedMs) || 0))),
+        mux_connected: !!this._chatMuxConnected,
+        asset_version: String(document.querySelector(
+          'meta[name="muselab-asset-version"]')?.content || "").slice(0, 32),
+      };
+      try {
+        fetch("/api/log/send-failure", {
+          method: "POST",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+          keepalive: true,
+        }).catch(() => { /* diagnostics must never affect sending */ });
+      } catch (_) { /* diagnostics must never affect sending */ }
+    },
     _abortError(message = "request aborted") {
       const error = new Error(message);
       error.name = "AbortError";
@@ -9056,6 +9086,9 @@ function portal() {
         subagentsLoaded: false,
         subagentsHydratedAt: 0,
         subagentGeneration: 0,
+        // Per Agent card: full-timeline load state, and which timelines are open.
+        subagentFull: {},
+        subagentOpen: {},
         hookTraces: [],
         hookTracesLoading: false,
         hookTracesLoaded: false,
@@ -16006,7 +16039,7 @@ function portal() {
       // from the SDK history instead of guessing a missing prefix.
       if (offset < current.length
           && current.slice(offset, offset + delta.length) === delta) return;
-      void this.hydrateSubagents(sid, state, { quiet: true });
+      void this.hydrateSubagents(sid, state, { quiet: true, parent });
     },
     _applySubagentBlock(sid, state, payload) {
       const d = payload || {};
@@ -16046,8 +16079,13 @@ function portal() {
       void Promise.resolve(this.hydrateSubagents(sid, st, { quiet: true, minIntervalMs }))
         .then(ok => { if (ok && this.tabState[sid] === st) st._subagentCardsKey = key; });
     },
+    // Background refreshes fetch a summary (every row, no bodies); a card's
+    // full timeline loads when it is opened and stays loaded while open. A
+    // long session's full timelines reached tens of MB per refresh.
     async hydrateSubagents(sid, expectedState = null, opts = {}) {
       const state = expectedState || this._ensureTabState(sid);
+      const parent = String(opts.parent || "");
+      if (parent) return await this._hydrateSubagentSubtree(sid, state, parent, opts);
       if (!sid || this.tabState[sid] !== state || state.subagentsLoading) return false;
       const minInterval = Math.max(0, Number(opts.minIntervalMs) || 0);
       if (minInterval && Date.now() - state.subagentsHydratedAt < minInterval) return false;
@@ -16055,7 +16093,7 @@ function portal() {
       state.subagentsLoading = true;
       try {
         const response = await this._fetchWithDeadline(
-          `/api/chat/sessions/${encodeURIComponent(sid)}/subagents`,
+          `/api/chat/sessions/${encodeURIComponent(sid)}/subagents?view=summary`,
           { headers: this.hdr() },
           20_000,
         );
@@ -16063,39 +16101,11 @@ function portal() {
         const payload = await response.json();
         if (this.tabState[sid] !== state
             || generation !== state.subagentGeneration) return false;
-        const incoming = Array.isArray(payload.threads)
-          ? payload.threads.map(thread => ({
-            ...thread,
-            blocks: Array.isArray(thread.blocks)
-              ? thread.blocks.map(block => ({ ...block })) : [],
-          })) : [];
-        // Keep frames received after the history snapshot. Final live blocks
-        // and longer partial prefixes win; the next quiet hydrate converges
-        // them to the SDK transcript once persistence catches up.
-        for (const liveThread of state.subagentThreads || []) {
-          let target = incoming.find(thread =>
-            !thread.orphaned && !liveThread.orphaned
-            && String(thread.parent_tool_use_id || "")
-              === String(liveThread.parent_tool_use_id || "")
-          );
-          if (!target) {
-            incoming.push(liveThread);
-            continue;
-          }
-          for (const liveBlock of liveThread.blocks || []) {
-            const index = target.blocks.findIndex(
-              block => block.block_id === liveBlock.block_id);
-            if (index < 0) target.blocks.push(liveBlock);
-            else if (liveBlock._live && (
-              !liveBlock._livePartial
-              || String(liveBlock.text || "").length
-                > String(target.blocks[index].text || "").length
-            )) target.blocks.splice(index, 1, liveBlock);
-          }
-        }
-        state.subagentThreads = incoming;
+        state.subagentThreads = this._mergeSubagentThreads(
+          state.subagentThreads || [], payload.threads);
         state.subagentsLoaded = true;
         state.subagentsHydratedAt = Date.now();
+        this._reloadOpenSubagentTimelines(sid, state);
         return true;
       } catch (_) {
         if (!opts.quiet) {
@@ -16108,6 +16118,96 @@ function portal() {
             && generation === state.subagentGeneration) {
           state.subagentsLoading = false;
         }
+      }
+    },
+    async _hydrateSubagentSubtree(sid, state, parent, opts = {}) {
+      if (!sid || this.tabState[sid] !== state) return false;
+      if (!state.subagentFull) state.subagentFull = {};
+      if (!state.subagentFull[parent]) {
+        state.subagentFull[parent] = { loading: false, error: false, again: false, generation: 0 };
+      }
+      // Read back through the reactive state so the row placeholders update.
+      const entry = state.subagentFull[parent];
+      if (entry.loading) { entry.again = true; return false; }
+      const generation = ++entry.generation;
+      entry.loading = true;
+      entry.error = false;
+      try {
+        const response = await this._fetchWithDeadline(
+          `/api/chat/sessions/${encodeURIComponent(sid)}/subagents?parent=`
+            + encodeURIComponent(parent),
+          { headers: this.hdr() },
+          20_000,
+        );
+        if (!response.ok) throw new Error("subagents " + response.status);
+        const payload = await response.json();
+        if (this.tabState[sid] !== state || generation !== entry.generation) return false;
+        state.subagentThreads = this._mergeSubagentThreads(
+          state.subagentThreads || [], payload.threads);
+        return true;
+      } catch (_) {
+        if (this.tabState[sid] === state && generation === entry.generation) entry.error = true;
+        if (!opts.quiet) {
+          this.toast(this.lang === "zh"
+            ? "Subagent 执行过程加载失败" : "Failed to load Subagent timeline", "warn");
+        }
+        return false;
+      } finally {
+        if (generation === entry.generation) {
+          entry.loading = false;
+          if (entry.again && this.tabState[sid] === state) {
+            entry.again = false;
+            void this._hydrateSubagentSubtree(sid, state, parent, { quiet: true });
+          }
+        }
+      }
+    },
+    // Merge fetched threads into the pane, as the full refresh always did:
+    // threads and blocks the snapshot lacks are kept, and live frames
+    // received after it win when final or longer. A summary never replaces a
+    // loaded body with its stub.
+    _mergeSubagentThreads(current, fetched) {
+      const same = (a, b) => (String(a.parent_tool_use_id || "") === String(b.parent_tool_use_id || "")
+        && String(a.agent_id || "") === String(b.agent_id || ""))
+        || (!a.orphaned && !b.orphaned
+          && String(a.parent_tool_use_id || "") === String(b.parent_tool_use_id || ""));
+      const incoming = (Array.isArray(fetched) ? fetched : []).map(thread => ({
+        ...thread,
+        blocks: Array.isArray(thread.blocks) ? thread.blocks.map(block => ({ ...block })) : [],
+      }));
+      const kept = [];
+      for (const previous of current || []) {
+        const target = incoming.find(thread => same(thread, previous));
+        if (!target) { kept.push(previous); continue; }
+        for (const old of previous.blocks || []) {
+          const index = target.blocks.findIndex(block => block.block_id === old.block_id);
+          if (index < 0) { target.blocks.push(old); continue; }
+          const fresh = target.blocks[index];
+          if (fresh.stub && !old.stub) target.blocks.splice(index, 1, old);
+          else if (old._live && (!old._livePartial
+            || String(old.text || "").length > String(fresh.text || "").length)) {
+            target.blocks.splice(index, 1, old);
+          }
+        }
+      }
+      return [...incoming, ...kept];
+    },
+    // A timeline that is open must show bodies, including rows that a later
+    // summary added: refetch that card's subtree when it holds stubs.
+    _reloadOpenSubagentTimelines(sid, state) {
+      for (const [parent, open] of Object.entries(state.subagentOpen || {})) {
+        if (!open) continue;
+        if (this.subagentTimelineFor(state, parent).some(block => block.stub)) {
+          void this._hydrateSubagentSubtree(sid, state, parent, { quiet: true });
+        }
+      }
+    },
+    onSubagentTimelineToggle(sid, state, parent, open) {
+      if (!state || !parent) return;
+      if (!state.subagentOpen) state.subagentOpen = {};
+      state.subagentOpen[parent] = !!open;
+      if (open && this.subagentTimelineFor(state, parent).some(block => block.stub)) {
+        void this._hydrateSubagentSubtree(sid, state, parent, { quiet: true });
       }
     },
     subagentTimelineFor(state, parentToolUseId) {
@@ -16147,6 +16247,14 @@ function portal() {
     subagentBlockBody(block) {
       if (!block) return "";
       return String(block.text || block.summary || block.preview || "");
+    },
+    // Body placeholder for a row whose content has not loaded yet.
+    subagentStubNote(state, parent, block) {
+      if (!block || !block.stub || block.summary) return "";
+      const entry = state && state.subagentFull && state.subagentFull[parent];
+      const zh = this.lang === "zh";
+      if (entry && entry.error) return zh ? "加载失败，收起后再展开可重试" : "Failed to load; collapse and reopen to retry";
+      return zh ? "加载中…" : "Loading…";
     },
     _applyHookTrace(sid, state, payload) {
       const trace = payload && typeof payload === "object" ? payload : null;
@@ -35539,6 +35647,10 @@ function portal() {
           mobile: streamMobile,
         }),
       });
+      // Which step of starting the stream is running, for the failure log.
+      let sendStage = "mux_open";
+      let sendStatus = 0;
+      const sendStartedAt = Date.now();
       try {
         const muxReady = await this._ensureChatMux();
         if (muxReady) {
@@ -35554,7 +35666,9 @@ function portal() {
                 mobile: streamMobile,
                 client_message_id: composerSubmitToken,
             }, streamStartController.signal);
+            sendStage = "turn_start";
             let tr = await startTurn();
+            sendStatus = tr.status;
             if (tr.status === 404 || tr.status === 405) {
               this._setChatMuxUnsupported();
               useMux = false;
@@ -35636,7 +35750,9 @@ function portal() {
           throw new Error("mux unavailable");
         }
         if (!useMux) {
+          sendStage = "ticket";
           let tr = await _mintLegacyTicket();
+          sendStatus = tr.status;
           if (tr.status === 404 || tr.status === 405) {
             url = "/api/chat/stream"
               + "?prompt=" + encodeURIComponent(text)
@@ -35654,6 +35770,7 @@ function portal() {
             const td = await tr.json();
             url = "/api/chat/stream?ticket=" + encodeURIComponent(td.ticket);
           }
+          sendStage = "event_source";
           es = new EventSource(url);
         }
       } catch (_e) {
@@ -35678,6 +35795,7 @@ function portal() {
           return false;
         }
         rollbackUnstartedSend();
+        this._reportSendFailure(streamSid, sendStage, _e, sendStatus, Date.now() - sendStartedAt);
         this.toast(this.lang === "zh"
           ? "发送失败：无法建立流式连接，请重试"
           : "Send failed: could not start the stream — please retry",
