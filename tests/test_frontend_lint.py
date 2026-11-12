@@ -6733,3 +6733,15 @@ def test_settings_save_states_scope_and_disables_without_drafts():
     assert "settingsProviderRows()" in section and "settings.showKeylessProviders" in section
     assert section.index("provider-ducc") < section.index("claude-fold") < section.index(
         'data-testid="context-limits-settings"')
+
+
+def test_settings_segment_pickers_keep_their_selected_segment():
+    """The bordered-button rule in the settings dialog must not erase the
+    selected segment of the language/theme/eye-care pickers, and memory job
+    hints must not overlap their title."""
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+    picker = ":is(.lang-picker, .theme-picker, .eyecare-level-picker) button.btn-ghost.active {"
+    assert picker in css
+    assert css.index(".settings-modal:not(.is-memory-center) button.btn-ghost {") < css.index(picker)
+    assert ".settings-modal .memory-card > .settings-hint { margin: 2px 0 4px; }" in css
+    assert "> .settings-row > .settings-row-col { align-items: flex-end; }" in css
