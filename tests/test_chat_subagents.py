@@ -732,3 +732,46 @@ def test_summaries_reread_only_changed_agents(tmp_path, monkeypatch):
     files["a"].with_suffix(".meta.json").write_text("{}")
     cs.load_subagent_summaries("sid")
     assert reads == ["a", "b", "b", "a"]  # a new sidecar is a change too
+
+
+def test_cold_summary_reads_run_one_at_a_time(tmp_path, monkeypatch):
+    """Concurrent cache misses never parse transcripts in parallel, and a
+    request waiting on another's read of the same agent reuses it."""
+    import threading
+    import time
+
+    from backend import chat_subagents as cs
+
+    monkeypatch.setattr(cs, "_SUMMARY_CACHE", cs.OrderedDict())
+    files = []
+    for agent in ("a", "b", "c"):
+        path = tmp_path / f"agent-{agent}.jsonl"
+        path.write_text("{}\n")
+        files.append((agent, path))
+    monkeypatch.setattr(cs, "_agent_files", lambda session_id, directory: files)
+    monkeypatch.setattr(cs, "_agent_metadata_sidecar_path",
+                        lambda path: path.with_suffix(".meta.json"))
+    active, peak, reads = [0], [0], []
+    guard = threading.Lock()
+
+    def one(session_id, agent_id, directory):
+        with guard:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+            reads.append(agent_id)
+        time.sleep(0.05)
+        with guard:
+            active[0] -= 1
+        return {"session_id": session_id, "agent_id": agent_id,
+                "parent_tool_use_id": "toolu_" + agent_id, "parent_agent_id": None,
+                "orphaned": False, "message_count": 1, "blocks": []}
+
+    monkeypatch.setattr(cs, "_load_one_thread", one)
+    workers = [threading.Thread(target=cs.load_subagent_summaries, args=("sid",))
+               for _ in range(4)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join()
+    assert peak[0] == 1
+    assert sorted(reads) == ["a", "b", "c"]  # each agent read once in total

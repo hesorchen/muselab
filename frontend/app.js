@@ -19722,8 +19722,14 @@ function portal() {
       // is transient, but an empty pane has no other owner that will reload it:
       // once the live turn re-attaches, history installs are deferred until the
       // turn ends and the reader sees only the current turn. Retry briefly.
-      for (let attempt = 0; attempt < 4; attempt++) {
+      // A read that timed out or failed on the network leaves an empty pane
+      // with no other owner either: after a restart the server can take
+      // longer than the read deadline for a minute or two, and the pane stayed
+      // on its spinner until the user switched away and back. Keep retrying
+      // while it is on screen, with a capped backoff.
+      for (let attempt = 0, failed = 0; attempt < 4 + failed; attempt++) {
         st._lastHistoryCancel = "";
+        st._lastHistoryStatus = "";
         try {
           loaded = await this._reloadSessionCoalesced(
             sid, quiet ? canonicalLoadOptions : {},
@@ -19732,9 +19738,15 @@ function portal() {
           loaded = false;
         }
         if (loaded || st._loaded || st.streaming || st.es
-            || this.tabState[sid] !== st
-            || st._lastHistoryCancel !== "unstable_snapshot") break;
-        await new Promise(resolve => setTimeout(resolve, 250 * (attempt + 1)));
+            || this.tabState[sid] !== st) break;
+        const readFailed = st._lastHistoryStatus === "error"
+          && sid === this.currentId && !st.messages.length && failed < 12;
+        if (!readFailed && st._lastHistoryCancel !== "unstable_snapshot") break;
+        if (readFailed) failed += 1;
+        const delayMs = readFailed
+          ? Math.min(15_000, 1000 * (2 ** Math.min(failed - 1, 4)))
+          : 250 * (attempt + 1);
+        await new Promise(resolve => setTimeout(resolve, delayMs));
         if (this.tabState[sid] !== st || st._loaded) break;
       }
       if (!token) {
@@ -20429,7 +20441,10 @@ function portal() {
         }
         historyPerf.total_ms = Math.round(perfNow() - historyPerfStarted);
         historyPerf.foreground = sid === this.currentId;
-        if (this.tabState[sid] === st) st._lastHistoryCancel = historyPerf.cancel_reason;
+        if (this.tabState[sid] === st) {
+          st._lastHistoryCancel = historyPerf.cancel_reason;
+          st._lastHistoryStatus = historyPerf.status;
+        }
         this._reportHistoryLoadPerf(historyPerf);
         // Re-check live: only clear the skeleton if this sid is STILL the
         // active tab. If the user switched away mid-load, the now-active tab

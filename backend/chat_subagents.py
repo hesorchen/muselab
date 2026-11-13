@@ -440,6 +440,12 @@ except ImportError:  # pragma: no cover
 _SUMMARY_CACHE_LIMIT = 4096
 _SUMMARY_CACHE: OrderedDict[tuple[str, str, str], tuple[tuple, SubagentThread]] = OrderedDict()
 _SUMMARY_CACHE_LOCK = threading.Lock()
+# Cache misses read and parse whole transcripts. After a restart every open
+# tab asks at once; eight concurrent cold reads took up to 360 s each and
+# starved ordinary history reads (40-66 s) for ten minutes. Misses are read
+# one agent at a time; each finished agent is cached even if its request
+# has already timed out, so the cache warms steadily.
+_SUMMARY_COLD_READ_LOCK = threading.Lock()
 
 
 def _file_signature(path: Any) -> tuple:
@@ -487,17 +493,24 @@ def load_subagent_summaries(
                 _SUMMARY_CACHE.move_to_end(key)
                 output.append(cached[1])
                 continue
-        thread = summarize_subagent_threads(
-            [_load_one_thread(session_id, agent_id, directory)])[0]
-        # A transcript written during the read keeps its new signature out of
-        # the cache, so the next request reads it again.
-        if signature == (_file_signature(path),
-                         _file_signature(_agent_metadata_sidecar_path(path))):
+        with _SUMMARY_COLD_READ_LOCK:
             with _SUMMARY_CACHE_LOCK:
-                _SUMMARY_CACHE[key] = (signature, thread)
-                _SUMMARY_CACHE.move_to_end(key)
-                while len(_SUMMARY_CACHE) > _SUMMARY_CACHE_LIMIT:
-                    _SUMMARY_CACHE.popitem(last=False)
+                cached = _SUMMARY_CACHE.get(key)
+            if cached is not None and cached[0] == signature:
+                output.append(cached[1])
+                continue
+            thread = summarize_subagent_threads(
+                [_load_one_thread(session_id, agent_id, directory)])[0]
+            # A transcript written during the read keeps its new signature out
+            # of the cache, so the next request reads it again. Stored before
+            # the read lock is released so a waiter for this agent reuses it.
+            if signature == (_file_signature(path),
+                             _file_signature(_agent_metadata_sidecar_path(path))):
+                with _SUMMARY_CACHE_LOCK:
+                    _SUMMARY_CACHE[key] = (signature, thread)
+                    _SUMMARY_CACHE.move_to_end(key)
+                    while len(_SUMMARY_CACHE) > _SUMMARY_CACHE_LIMIT:
+                        _SUMMARY_CACHE.popitem(last=False)
         output.append(thread)
     return output
 
