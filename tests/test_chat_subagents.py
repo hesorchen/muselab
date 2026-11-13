@@ -617,6 +617,20 @@ def _tree_threads(session_id):
     ]
 
 
+def _fake_reader(monkeypatch, module, full):
+    """SDK reader stand-in; records the agent filter of each full read."""
+    reads = []
+
+    def load(session_id, directory=None, agent_ids=None):
+        reads.append(None if agent_ids is None else set(agent_ids))
+        return [t for t in full if agent_ids is None or t["agent_id"] in agent_ids]
+
+    monkeypatch.setattr(module, "load_subagent_threads", load)
+    # No SDK file listing: summaries read through the reader above.
+    monkeypatch.setattr(module, "_agent_files", lambda session_id, directory: None)
+    return reads
+
+
 def test_summary_view_keeps_every_row_without_bodies(
     app_module, client, auth, monkeypatch,
 ):
@@ -625,22 +639,24 @@ def test_summary_view_keeps_every_row_without_bodies(
 
     session = sess.create_session("subagent summary")
     full = _tree_threads(session["id"])
-    monkeypatch.setattr(
-        chat_mod.chat_subagents, "load_subagent_threads",
-        lambda session_id, directory=None: full)
+    _fake_reader(monkeypatch, chat_mod.chat_subagents, full)
     path = f"/api/chat/sessions/{session['id']}/subagents"
 
     summary = client.get(path + "?view=summary", headers=auth).json()["threads"]
-    assert [len(t["blocks"]) for t in summary] == [3, 1, 1]
+    assert [t["agent_id"] for t in summary] == ["a", "c", "b"]
     for thread, original in zip(summary, full):
+        assert thread["summary"] is True
+        assert thread["block_count"] == len(original["blocks"])
         assert thread["message_count"] == original["message_count"]
-        for block, source in zip(thread["blocks"], original["blocks"]):
-            assert block["stub"] is True
-            assert block["block_id"] == source["block_id"]
-            assert block["role"] == source["role"]
-            assert not {"text", "preview", "input"} & block.keys()
-    nested = summary[0]["blocks"][1]
-    assert (nested["name"], nested["id"], nested["summary"]) == ("Agent", "toolu_child", "nested")
+        assert thread["parent_tool_use_id"] == original["parent_tool_use_id"]
+    # Only the nested Agent call survives, as a stub without its input.
+    assert summary[0]["blocks"] == [{
+        "block_id": "toolu_a:m2", "role": "tool_use", "name": "Agent",
+        "id": "toolu_child", "summary": "nested", "stub": True}]
+    assert summary[1]["blocks"] == [] and summary[2]["blocks"] == []
+    # The summary still finds a nested card's subtree.
+    nested = client.get(path + "?view=summary&parent=toolu_a", headers=auth).json()["threads"]
+    assert [t["agent_id"] for t in nested] == ["a", "c"]
     # The default view stays the full transcript.
     assert client.get(path, headers=auth).json()["threads"] == full
     assert client.get(path + "?view=bogus", headers=auth).status_code == 422
@@ -654,14 +670,14 @@ def test_parent_view_returns_one_card_subtree_with_bodies(
 
     session = sess.create_session("subagent subtree")
     full = _tree_threads(session["id"])
-    monkeypatch.setattr(
-        chat_mod.chat_subagents, "load_subagent_threads",
-        lambda session_id, directory=None: full)
+    reads = _fake_reader(monkeypatch, chat_mod.chat_subagents, full)
     path = f"/api/chat/sessions/{session['id']}/subagents"
 
     subtree = client.get(path + "?parent=toolu_a", headers=auth).json()["threads"]
     assert [t["agent_id"] for t in subtree] == ["a", "c"]
     assert subtree == full[:2]
+    # Only the card's own agents were read in full.
+    assert reads[-1] == {"a", "c"}
     leaf = client.get(path + "?parent=toolu_b", headers=auth).json()["threads"]
     assert leaf == full[2:]
     assert client.get(path + "?parent=toolu_missing", headers=auth).json()["threads"] == []
@@ -677,3 +693,85 @@ def test_send_failure_log_accepts_only_closed_fields(client, auth):
                 {**good, "prompt": "secret"}, {**good, "sid8": "ebdc72dc-full-id"},
                 {**good, "elapsed_ms": "5"}):
         assert client.post("/api/log/send-failure", json=bad, headers=auth).status_code == 422
+
+
+def test_summaries_reread_only_changed_agents(tmp_path, monkeypatch):
+    """An unchanged transcript reuses its cached summary; a write rereads it."""
+    from backend import chat_subagents as cs
+
+    monkeypatch.setattr(cs, "_SUMMARY_CACHE", cs.OrderedDict())
+    files = {}
+    for agent in ("a", "b"):
+        path = tmp_path / f"agent-{agent}.jsonl"
+        path.write_text("{}\n")
+        files[agent] = path
+    monkeypatch.setattr(cs, "_agent_files",
+                        lambda session_id, directory: list(files.items()))
+    monkeypatch.setattr(cs, "_agent_metadata_sidecar_path",
+                        lambda path: path.with_suffix(".meta.json"))
+    reads = []
+
+    def one(session_id, agent_id, directory):
+        reads.append(agent_id)
+        return {"session_id": session_id, "agent_id": agent_id,
+                "parent_tool_use_id": "toolu_" + agent_id, "parent_agent_id": None,
+                "orphaned": False, "message_count": len(reads),
+                "blocks": [{"block_id": agent_id + str(len(reads)), "role": "assistant",
+                            "text": "body"}]}
+
+    monkeypatch.setattr(cs, "_load_one_thread", one)
+    first = cs.load_subagent_summaries("sid")
+    assert reads == ["a", "b"]
+    assert [(t["summary"], t["block_count"], t["blocks"]) for t in first] == [
+        (True, 1, []), (True, 1, [])]
+    assert cs.load_subagent_summaries("sid") == first
+    assert reads == ["a", "b"]  # nothing changed: no reads
+    files["b"].write_text("{}\n{}\n")
+    cs.load_subagent_summaries("sid")
+    assert reads == ["a", "b", "b"]
+    files["a"].with_suffix(".meta.json").write_text("{}")
+    cs.load_subagent_summaries("sid")
+    assert reads == ["a", "b", "b", "a"]  # a new sidecar is a change too
+
+
+def test_cold_summary_reads_run_one_at_a_time(tmp_path, monkeypatch):
+    """Concurrent cache misses never parse transcripts in parallel, and a
+    request waiting on another's read of the same agent reuses it."""
+    import threading
+    import time
+
+    from backend import chat_subagents as cs
+
+    monkeypatch.setattr(cs, "_SUMMARY_CACHE", cs.OrderedDict())
+    files = []
+    for agent in ("a", "b", "c"):
+        path = tmp_path / f"agent-{agent}.jsonl"
+        path.write_text("{}\n")
+        files.append((agent, path))
+    monkeypatch.setattr(cs, "_agent_files", lambda session_id, directory: files)
+    monkeypatch.setattr(cs, "_agent_metadata_sidecar_path",
+                        lambda path: path.with_suffix(".meta.json"))
+    active, peak, reads = [0], [0], []
+    guard = threading.Lock()
+
+    def one(session_id, agent_id, directory):
+        with guard:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+            reads.append(agent_id)
+        time.sleep(0.05)
+        with guard:
+            active[0] -= 1
+        return {"session_id": session_id, "agent_id": agent_id,
+                "parent_tool_use_id": "toolu_" + agent_id, "parent_agent_id": None,
+                "orphaned": False, "message_count": 1, "blocks": []}
+
+    monkeypatch.setattr(cs, "_load_one_thread", one)
+    workers = [threading.Thread(target=cs.load_subagent_summaries, args=("sid",))
+               for _ in range(4)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join()
+    assert peak[0] == 1
+    assert sorted(reads) == ["a", "b", "c"]  # each agent read once in total

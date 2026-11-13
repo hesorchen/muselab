@@ -11,6 +11,9 @@ ignored; callers must never guess a nearby card.
 """
 from __future__ import annotations
 
+import os
+import threading
+from collections import OrderedDict
 from collections.abc import Mapping, MutableMapping
 from types import SimpleNamespace
 from typing import Any
@@ -351,85 +354,197 @@ def _thread_metadata(
     return next(iter(parent_values)), parent_agent_id, None
 
 
+def _load_one_thread(
+    session_id: str,
+    agent_id: str,
+    directory: str | None,
+) -> SubagentThread:
+    messages = list(get_subagent_messages(
+        session_id,
+        agent_id,
+        directory=directory,
+    ))
+    parent_tool_use_id, parent_agent_id, orphan_reason = _thread_metadata(
+        session_id, messages)
+    orphaned = orphan_reason is not None
+    tool_use_names: dict[str, str] = {}
+    blocks: list[SubagentBlock] = []
+    for message in messages:
+        message_blocks = normalize_subagent_message(
+            message,
+            agent_id=agent_id,
+            tool_use_names=tool_use_names,
+        )
+        if orphaned:
+            # Keep diagnostic history visible to callers, but remove every
+            # attachable identifier and rebuild keys in an orphan namespace.
+            for block in message_blocks:
+                block["parent_tool_use_id"] = None
+                block["parent_agent_id"] = None
+                block["block_id"] = subagent_block_id(
+                    parent_tool_use_id=None,
+                    message_uuid=block["message_uuid"],
+                    source_block_index=block["source_block_index"],
+                    kind=block["role"],
+                    agent_id=agent_id,
+                )
+        blocks.extend(message_blocks)
+    thread: SubagentThread = {
+        "session_id": session_id,
+        "agent_id": agent_id,
+        "parent_tool_use_id": parent_tool_use_id,
+        "parent_agent_id": parent_agent_id,
+        "orphaned": orphaned,
+        "message_count": len(messages),
+        "blocks": blocks,
+    }
+    if orphan_reason is not None:
+        thread["orphan_reason"] = orphan_reason
+    return thread
+
+
 def load_subagent_threads(
     session_id: str,
     directory: str | None = None,
+    agent_ids: set[str] | None = None,
 ) -> list[SubagentThread]:
     """Load every SDK Subagent transcript as deterministic canonical threads.
 
+    ``agent_ids`` limits the read to those agents (an opened card's subtree).
     The caller owns any provider-specific ``CLAUDE_CONFIG_DIR`` context.  This
     function intentionally uses only the SDK's top-level list/get APIs and does
     not inspect transcript or metadata files itself.
     """
-    threads: list[SubagentThread] = []
-    for agent_id in sorted(set(list_subagents(session_id, directory=directory))):
-        messages = list(get_subagent_messages(
-            session_id,
-            agent_id,
-            directory=directory,
-        ))
-        parent_tool_use_id, parent_agent_id, orphan_reason = _thread_metadata(
-            session_id, messages)
-        orphaned = orphan_reason is not None
-        tool_use_names: dict[str, str] = {}
-        blocks: list[SubagentBlock] = []
-        for message in messages:
-            message_blocks = normalize_subagent_message(
-                message,
-                agent_id=agent_id,
-                tool_use_names=tool_use_names,
-            )
-            if orphaned:
-                # Keep diagnostic history visible to callers, but remove every
-                # attachable identifier and rebuild keys in an orphan namespace.
-                for block in message_blocks:
-                    block["parent_tool_use_id"] = None
-                    block["parent_agent_id"] = None
-                    block["block_id"] = subagent_block_id(
-                        parent_tool_use_id=None,
-                        message_uuid=block["message_uuid"],
-                        source_block_index=block["source_block_index"],
-                        kind=block["role"],
-                        agent_id=agent_id,
-                    )
-            blocks.extend(message_blocks)
-        thread: SubagentThread = {
-            "session_id": session_id,
-            "agent_id": agent_id,
-            "parent_tool_use_id": parent_tool_use_id,
-            "parent_agent_id": parent_agent_id,
-            "orphaned": orphaned,
-            "message_count": len(messages),
-            "blocks": blocks,
-        }
-        if orphan_reason is not None:
-            thread["orphan_reason"] = orphan_reason
-        threads.append(thread)
-    return threads
+    return [
+        _load_one_thread(session_id, agent_id, directory)
+        for agent_id in sorted(set(list_subagents(session_id, directory=directory)))
+        if agent_ids is None or agent_id in agent_ids
+    ]
 
 
-# Fields a summary block keeps: identity, the row label and the one-line
-# tool summary. Bodies (text, previews, tool input) load when a card opens.
+# Summary cache. A background refresh used to re-read and re-normalize every
+# Subagent transcript (seconds to over a minute for a long session) even when
+# nothing had changed. Each agent's summary is reused while its transcript and
+# metadata sidecar keep the same size and mtime. Only file metadata is read
+# here; content is still read through the SDK API. If the SDK helpers that
+# locate the files are unavailable, every request reads through the SDK.
+try:  # pragma: no cover - exercised through load_subagent_summaries
+    from claude_agent_sdk._internal.sessions import (  # noqa: PLC2701
+        _agent_metadata_sidecar_path,
+        _collect_agent_files,
+        _resolve_subagents_dir,
+    )
+except ImportError:  # pragma: no cover
+    _resolve_subagents_dir = None
+
+_SUMMARY_CACHE_LIMIT = 4096
+_SUMMARY_CACHE: OrderedDict[tuple[str, str, str], tuple[tuple, SubagentThread]] = OrderedDict()
+_SUMMARY_CACHE_LOCK = threading.Lock()
+# Cache misses read and parse whole transcripts. After a restart every open
+# tab asks at once; eight concurrent cold reads took up to 360 s each and
+# starved ordinary history reads (40-66 s) for ten minutes. Misses are read
+# one agent at a time; each finished agent is cached even if its request
+# has already timed out, so the cache warms steadily.
+_SUMMARY_COLD_READ_LOCK = threading.Lock()
+
+
+def _file_signature(path: Any) -> tuple:
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return (None,)
+    return (stat.st_mtime_ns, stat.st_size)
+
+
+def _agent_files(session_id: str, directory: str | None) -> list[tuple[str, Any]] | None:
+    if _resolve_subagents_dir is None:
+        return None
+    try:
+        base = _resolve_subagents_dir(session_id, directory)
+    except Exception:
+        return None
+    if base is None:
+        return []
+    return _collect_agent_files(base)
+
+
+def load_subagent_summaries(
+    session_id: str,
+    directory: str | None = None,
+) -> list[SubagentThread]:
+    """Every thread as a summary (see ``summarize_subagent_threads``), read
+    only for agents whose transcript changed since the last request."""
+    files = _agent_files(session_id, directory)
+    if files is None:
+        return summarize_subagent_threads(
+            load_subagent_threads(session_id, directory))
+    by_id: dict[str, Any] = {}
+    for agent_id, path in files:
+        by_id.setdefault(agent_id, path)
+    output: list[SubagentThread] = []
+    for agent_id in sorted(by_id):
+        path = by_id[agent_id]
+        key = (session_id, agent_id, str(path))
+        signature = (_file_signature(path),
+                     _file_signature(_agent_metadata_sidecar_path(path)))
+        with _SUMMARY_CACHE_LOCK:
+            cached = _SUMMARY_CACHE.get(key)
+            if cached is not None and cached[0] == signature:
+                _SUMMARY_CACHE.move_to_end(key)
+                output.append(cached[1])
+                continue
+        with _SUMMARY_COLD_READ_LOCK:
+            with _SUMMARY_CACHE_LOCK:
+                cached = _SUMMARY_CACHE.get(key)
+            if cached is not None and cached[0] == signature:
+                output.append(cached[1])
+                continue
+            thread = summarize_subagent_threads(
+                [_load_one_thread(session_id, agent_id, directory)])[0]
+            # A transcript written during the read keeps its new signature out
+            # of the cache, so the next request reads it again. Stored before
+            # the read lock is released so a waiter for this agent reuses it.
+            if signature == (_file_signature(path),
+                             _file_signature(_agent_metadata_sidecar_path(path))):
+                with _SUMMARY_CACHE_LOCK:
+                    _SUMMARY_CACHE[key] = (signature, thread)
+                    _SUMMARY_CACHE.move_to_end(key)
+                    while len(_SUMMARY_CACHE) > _SUMMARY_CACHE_LIMIT:
+                        _SUMMARY_CACHE.popitem(last=False)
+        output.append(thread)
+    return output
+
+
+# Fields a summary keeps for a nested Agent/Task call: enough to walk to the
+# child card and label it. Other blocks are only counted.
 _SUMMARY_BLOCK_KEYS = frozenset({
-    "session_id", "parent_tool_use_id", "parent_agent_id", "agent_id",
-    "message_uuid", "source_block_index", "block_id", "role",
-    "name", "id", "summary", "is_error",
+    "block_id", "role", "name", "id", "summary", "is_error",
 })
 
 
 def summarize_subagent_threads(
     threads: list[SubagentThread],
 ) -> list[SubagentThread]:
-    """Every thread and block, without bodies: enough to count rows, nest
-    Agent cards and label each row. Blocks are marked ``stub``."""
-    return [{
-        **thread,
-        "blocks": [
-            {**{key: block[key] for key in _SUMMARY_BLOCK_KEYS if key in block},
-             "stub": True}
-            for block in thread.get("blocks", [])
-        ],
-    } for thread in threads]
+    """Threads without their timelines: ``block_count`` rows, plus a stub for
+    each nested Agent/Task call so the client can walk the card tree. Marked
+    ``summary``; the full timeline loads when a card is opened. A long
+    session's summaries were tens of MB when every block was kept."""
+    output = []
+    for thread in threads:
+        blocks = thread.get("blocks", [])
+        output.append({
+            **{key: value for key, value in thread.items() if key != "blocks"},
+            "summary": True,
+            "block_count": len(blocks),
+            "blocks": [
+                {**{key: block[key] for key in _SUMMARY_BLOCK_KEYS if key in block},
+                 "stub": True}
+                for block in blocks
+                if block.get("role") == "tool_use"
+                and block.get("name") in {"Agent", "Task"} and block.get("id")
+            ],
+        })
+    return output
 
 
 def subagent_subtree(

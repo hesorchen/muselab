@@ -12784,3 +12784,11 @@ html[data-theme="eyecare"] .hljs-symbol { color: #9a3e00; }
   .settings-modal .settings-foot .settings-foot-note { order: -1; flex: 1 1 100%; margin: 0; }
   .settings-modal .settings-foot .settings-logout { margin-right: 0; }
 }
+
+/* Running turn whose live view stopped receiving updates. */
+.turn-live-recovery { display: inline-flex; align-items: center; gap: 6px; color: var(--c-warning, #b45309); }
+.turn-live-reconnect {
+  border: 1px solid currentColor; border-radius: var(--r-sm, 4px); background: transparent;
+  color: inherit; font: inherit; font-size: var(--fs-xs); padding: 0 6px; line-height: 18px; cursor: pointer;
+}
+.turn-live-reconnect:hover { background: color-mix(in srgb, currentColor 12%, transparent); }

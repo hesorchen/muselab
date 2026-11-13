@@ -7,6 +7,9 @@ const museRichMessages = new WeakMap();
 // One shared 1s clock for running footers that have no pane timer.
 let museFooterClockTimer = 0;
 const museTranscriptPerf = new Map();
+// Background-read lane (see _acquireLowPrioritySlot); kept out of Alpine's
+// proxy because it holds promise resolvers.
+const museLowPriorityLane = { active: 0, waiters: [] };
 // One bounded worker, shared by history decoration and code highlighting.
 // A stalled parser is terminated; the complete plain text remains readable.
 const museRichWorker = (() => {
@@ -6601,14 +6604,107 @@ function portal() {
         }).catch(() => { /* diagnostics must never affect sending */ });
       } catch (_) { /* diagnostics must never affect sending */ }
     },
+    _reportLiveRecovery(sid, trigger, waitedMs, mode) {
+      const sid8 = /^[0-9a-f]{8}/.test(String(sid || "")) ? String(sid).slice(0, 8) : "none";
+      const known = ["replay_truncated", "bootstrap_overflow", "replay_gap", "live_backlog",
+        "live_barrier_missing", "child_stream_error", "replay_storage_error",
+        "reconnect_budget", "transport_silent"];
+      try {
+        fetch("/api/log/live-recovery", {
+          method: "POST",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify({
+            sid8, trigger: known.includes(trigger) ? trigger : "other",
+            mode: mode === "manual" ? "manual" : "auto",
+            waited_ms: Math.max(0, Math.min(100_000_000, Math.round(Number(waitedMs) || 0))),
+          }),
+          keepalive: true,
+        }).catch(() => { /* diagnostics must never affect recovery */ });
+      } catch (_) { /* diagnostics must never affect recovery */ }
+    },
+    // Footer note while a running turn's live view is not receiving updates.
+    liveRecoveryLabel(pane) {
+      if (!pane) return "";
+      void pane.streamElapsed;  // re-evaluate on the per-second stream tick
+      const zh = this.lang === "zh";
+      if (pane._canonicalResyncPending) return zh ? "实时更新中断，正在重新同步" : "Live updates paused; resyncing";
+      if (!pane.streaming || !pane.es) return "";
+      const at = pane.es._muxChannel
+        ? (Number(this._chatMuxLastTransportAt) || Number(this._chatMuxOpenedAt))
+        : Number(pane._lastSseTransportAt);
+      if (at && Date.now() - at > 45_000) return zh ? "连接中断，正在重连" : "Connection lost; reconnecting";
+      return "";
+    },
+    // The footer's reconnect button: what a page refresh does for this pane.
+    async reconnectLivePane(sid) {
+      const st = sid && this.tabState[sid];
+      if (!st) return;
+      st._reconnectGateCount = 0;
+      st._reconnectGateAt = 0;
+      if (st._canonicalResyncPending) {
+        this._requestSessionSync(sid, "canonical_replay", { forceReattach: true });
+        return;
+      }
+      this._reportLiveRecovery(sid, "transport_silent", 0, "manual");
+      const source = this._chatMuxSource;
+      if (st.es && st.es._muxChannel && source) {
+        await this._forceChatMuxReconnect(source, sid, st.activeTurnId);
+      } else if (st.es) {
+        try { st.es.dispatchEvent(new Event("error")); } catch (_) {}
+      }
+      void this.loadSession(sid, { quiet: true });
+    },
     _abortError(message = "request aborted") {
       const error = new Error(message);
       error.name = "AbortError";
       return error;
     },
+    // Background reads share one connection. Over plain HTTP the browser
+    // allows six connections to this server and the page holds four live
+    // streams, so a few slow background reads (Subagent timelines, history
+    // of tabs not on screen) used to take the last two and leave sending,
+    // stream recovery and reconnects queued until they timed out.
+    LOW_PRIORITY_FETCH_SLOTS: 1,
+    async _acquireLowPrioritySlot(signal) {
+      const lane = museLowPriorityLane;
+      if (lane.active < this.LOW_PRIORITY_FETCH_SLOTS) {
+        lane.active += 1;
+        return;
+      }
+      await new Promise((resolve, reject) => {
+        const onAbort = () => {
+          const index = lane.waiters.indexOf(waiter);
+          if (index >= 0) lane.waiters.splice(index, 1);
+          reject(this._abortError());
+        };
+        const waiter = () => {
+          if (signal) signal.removeEventListener("abort", onAbort);
+          resolve();
+        };
+        if (signal) signal.addEventListener("abort", onAbort, { once: true });
+        lane.waiters.push(waiter);
+      });
+    },
+    _releaseLowPrioritySlot() {
+      const lane = museLowPriorityLane;
+      const next = lane.waiters.shift();
+      // The slot passes straight to the next waiter; the count is unchanged.
+      if (next) next();
+      else lane.active = Math.max(0, lane.active - 1);
+    },
     async _fetchWithDeadline(
       url, options = {}, deadlineMs = this.REQUEST_DEADLINE_MS, consumeResponse = null,
     ) {
+      if (options.lowPriority) {
+        const { lowPriority, ...rest } = options;
+        // The deadline covers the request, not the wait for a slot.
+        await this._acquireLowPrioritySlot(rest.signal);
+        try {
+          return await this._fetchWithDeadline(url, rest, deadlineMs, consumeResponse);
+        } finally {
+          this._releaseLowPrioritySlot();
+        }
+      }
       const upstream = options.signal;
       if (upstream && upstream.aborted) throw this._abortError();
       const controller = new AbortController();
@@ -9180,6 +9276,7 @@ function portal() {
         _sessionActivityExpected: null,
         _reconnectTimer: null,
         _canonicalResyncPending: false,
+        _canonicalReattachAt: 0,
         // Per-session permission mirror. The active tab copies this primitive
         // into root `permission`; background tabs never read another tab's
         // selector value.
@@ -13893,6 +13990,34 @@ function portal() {
         || st.es !== ownedStream || String(st.activeTurnId || "") !== ownedTurnId
         || (backgroundOnly && (st.streaming || st.es)
           && activityTurnId && ownedTurnId && activityTurnId !== ownedTurnId);
+      // The turn is still running: waiting for it to end froze the live
+      // view for the whole turn, hiding new tool calls and any question the
+      // agent asked until a manual refresh. Reattach to the live turn, the
+      // same way a refresh does, after a short wait and at most once a
+      // minute so a stream that keeps resyncing cannot flicker.
+      const reattachDue = !preserveOwner && active && !backgroundOnly
+        && !st.es && (options.forceReattach || (waited >= 30_000
+          && Date.now() - (Number(st._canonicalReattachAt) || 0) >= 60_000));
+      if (reattachDue) {
+        st._canonicalReattachAt = Date.now();
+        this._reportLiveRecovery(sid, st._canonicalResyncReason || "reconnect_budget",
+          waited, options.forceReattach ? "manual" : "auto");
+        st._canonicalResyncPending = false;
+        st.sessionSync.canonicalStartedAt = 0;
+        st.sessionSync.canonicalRetryN = 0;
+        st._reconnectGateCount = 0;
+        st._reconnectGateAt = 0;
+        st.streaming = false;
+        await this.loadSession(sid, { quiet: true, signal: options.signal });
+        if (this.tabState[sid] !== st) return false;
+        void this.send({
+          reconnect: true,
+          sessionId: sid,
+          turnId: activityTurnId || ownedTurnId,
+          startedAt: activity?.started_at,
+        });
+        return true;
+      }
       if (preserveOwner || (((active && !backgroundOnly) || waited < minimumWaitMs)
           && waited < 31 * 60_000)) {
         this._requestSessionSync(sid, "canonical_replay", {
@@ -16094,7 +16219,7 @@ function portal() {
       try {
         const response = await this._fetchWithDeadline(
           `/api/chat/sessions/${encodeURIComponent(sid)}/subagents?view=summary`,
-          { headers: this.hdr() },
+          { headers: this.hdr(), lowPriority: true },
           20_000,
         );
         if (!response.ok) return false;
@@ -16164,8 +16289,9 @@ function portal() {
     },
     // Merge fetched threads into the pane, as the full refresh always did:
     // threads and blocks the snapshot lacks are kept, and live frames
-    // received after it win when final or longer. A summary never replaces a
-    // loaded body with its stub.
+    // received after it win when final or longer. A summary thread (counts
+    // and nested-card stubs only) never replaces a loaded timeline; it only
+    // updates the row count, and an open card whose count grew reloads.
     _mergeSubagentThreads(current, fetched) {
       const same = (a, b) => (String(a.parent_tool_use_id || "") === String(b.parent_tool_use_id || "")
         && String(a.agent_id || "") === String(b.agent_id || ""))
@@ -16176,28 +16302,73 @@ function portal() {
         blocks: Array.isArray(thread.blocks) ? thread.blocks.map(block => ({ ...block })) : [],
       }));
       const kept = [];
-      for (const previous of current || []) {
-        const target = incoming.find(thread => same(thread, previous));
-        if (!target) { kept.push(previous); continue; }
-        for (const old of previous.blocks || []) {
-          const index = target.blocks.findIndex(block => block.block_id === old.block_id);
-          if (index < 0) { target.blocks.push(old); continue; }
-          const fresh = target.blocks[index];
-          if (fresh.stub && !old.stub) target.blocks.splice(index, 1, old);
-          else if (old._live && (!old._livePartial
-            || String(old.text || "").length > String(fresh.text || "").length)) {
-            target.blocks.splice(index, 1, old);
+      const output = [];
+      for (const target of incoming) {
+        const previous = (current || []).find(thread => same(target, thread));
+        if (previous && target.summary && !previous.summary) {
+          // Keep the loaded timeline; remember how many rows the SDK has.
+          output.push({ ...previous, block_count: target.block_count });
+          continue;
+        }
+        if (previous) {
+          for (const old of previous.blocks || []) {
+            const index = target.blocks.findIndex(block => block.block_id === old.block_id);
+            if (index < 0) {
+              if (!old.stub) target.blocks.push(old);
+              continue;
+            }
+            const fresh = target.blocks[index];
+            if (old._live && (!old._livePartial
+              || String(old.text || "").length > String(fresh.text || "").length)) {
+              target.blocks.splice(index, 1, old);
+            }
           }
         }
+        output.push(target);
       }
-      return [...incoming, ...kept];
+      for (const previous of current || []) {
+        if (!incoming.some(thread => same(thread, previous))) kept.push(previous);
+      }
+      return [...output, ...kept];
     },
-    // A timeline that is open must show bodies, including rows that a later
-    // summary added: refetch that card's subtree when it holds stubs.
+    _subagentSubtreeThreads(state, parentToolUseId) {
+      const threads = (state && state.subagentThreads) || [];
+      const output = [];
+      const visited = new Set();
+      const walk = (parent, depth) => {
+        if (depth > 12 || visited.has(parent)) return;
+        visited.add(parent);
+        for (const thread of threads) {
+          if (thread.orphaned
+              || String(thread.parent_tool_use_id || "") !== String(parent)) continue;
+          output.push(thread);
+          for (const block of thread.blocks || []) {
+            if (block.role === "tool_use"
+                && (block.name === "Agent" || block.name === "Task")
+                && block.id) walk(String(block.id), depth + 1);
+          }
+        }
+      };
+      if (parentToolUseId) walk(String(parentToolUseId), 0);
+      return output;
+    },
+    // Rows the card's timeline has, loaded or not.
+    subagentTimelineCount(state, parentToolUseId) {
+      return this._subagentSubtreeThreads(state, parentToolUseId).reduce((sum, thread) => {
+        const loaded = thread.summary ? 0 : (thread.blocks || []).length;
+        return sum + Math.max(loaded, Number(thread.block_count) || 0);
+      }, 0);
+    },
+    // A thread is incomplete while only its summary is here, or when a later
+    // summary reported more rows than the loaded timeline has.
+    _subagentTimelineIncomplete(state, parentToolUseId) {
+      return this._subagentSubtreeThreads(state, parentToolUseId).some(thread =>
+        thread.summary || (Number(thread.block_count) || 0)
+          > (thread.blocks || []).filter(block => !block._live).length);
+    },
     _reloadOpenSubagentTimelines(sid, state) {
       for (const [parent, open] of Object.entries(state.subagentOpen || {})) {
-        if (!open) continue;
-        if (this.subagentTimelineFor(state, parent).some(block => block.stub)) {
+        if (open && this._subagentTimelineIncomplete(state, parent)) {
           void this._hydrateSubagentSubtree(sid, state, parent, { quiet: true });
         }
       }
@@ -16206,7 +16377,7 @@ function portal() {
       if (!state || !parent) return;
       if (!state.subagentOpen) state.subagentOpen = {};
       state.subagentOpen[parent] = !!open;
-      if (open && this.subagentTimelineFor(state, parent).some(block => block.stub)) {
+      if (open && this._subagentTimelineIncomplete(state, parent)) {
         void this._hydrateSubagentSubtree(sid, state, parent, { quiet: true });
       }
     },
@@ -16222,7 +16393,8 @@ function portal() {
           if (thread.orphaned
               || String(thread.parent_tool_use_id || "") !== String(parent)) continue;
           for (const block of thread.blocks || []) {
-            output.push({ ...block, _depth: depth });
+            // A summary carries only nested-card stubs: walk them, show none.
+            if (!thread.summary) output.push({ ...block, _depth: depth });
             if (block.role === "tool_use"
                 && (block.name === "Agent" || block.name === "Task")
                 && block.id) walk(String(block.id), depth + 1);
@@ -16248,9 +16420,9 @@ function portal() {
       if (!block) return "";
       return String(block.text || block.summary || block.preview || "");
     },
-    // Body placeholder for a row whose content has not loaded yet.
-    subagentStubNote(state, parent, block) {
-      if (!block || !block.stub || block.summary) return "";
+    // One line under an opened timeline while its rows load or failed to.
+    subagentLoadNote(state, parent) {
+      if (!this._subagentTimelineIncomplete(state, parent)) return "";
       const entry = state && state.subagentFull && state.subagentFull[parent];
       const zh = this.lang === "zh";
       if (entry && entry.error) return zh ? "加载失败，收起后再展开可重试" : "Failed to load; collapse and reopen to retry";
@@ -16274,7 +16446,7 @@ function portal() {
       try {
         const response = await this._fetchWithDeadline(
           `/api/chat/sessions/${encodeURIComponent(sid)}/hook-traces`,
-          { headers: this.hdr(), cache: "no-store" },
+          { headers: this.hdr(), cache: "no-store", lowPriority: true },
           15_000,
         );
         if (!response.ok) return false;
@@ -19550,8 +19722,14 @@ function portal() {
       // is transient, but an empty pane has no other owner that will reload it:
       // once the live turn re-attaches, history installs are deferred until the
       // turn ends and the reader sees only the current turn. Retry briefly.
-      for (let attempt = 0; attempt < 4; attempt++) {
+      // A read that timed out or failed on the network leaves an empty pane
+      // with no other owner either: after a restart the server can take
+      // longer than the read deadline for a minute or two, and the pane stayed
+      // on its spinner until the user switched away and back. Keep retrying
+      // while it is on screen, with a capped backoff.
+      for (let attempt = 0, failed = 0; attempt < 4 + failed; attempt++) {
         st._lastHistoryCancel = "";
+        st._lastHistoryStatus = "";
         try {
           loaded = await this._reloadSessionCoalesced(
             sid, quiet ? canonicalLoadOptions : {},
@@ -19560,9 +19738,15 @@ function portal() {
           loaded = false;
         }
         if (loaded || st._loaded || st.streaming || st.es
-            || this.tabState[sid] !== st
-            || st._lastHistoryCancel !== "unstable_snapshot") break;
-        await new Promise(resolve => setTimeout(resolve, 250 * (attempt + 1)));
+            || this.tabState[sid] !== st) break;
+        const readFailed = st._lastHistoryStatus === "error"
+          && sid === this.currentId && !st.messages.length && failed < 12;
+        if (!readFailed && st._lastHistoryCancel !== "unstable_snapshot") break;
+        if (readFailed) failed += 1;
+        const delayMs = readFailed
+          ? Math.min(15_000, 1000 * (2 ** Math.min(failed - 1, 4)))
+          : 250 * (attempt + 1);
+        await new Promise(resolve => setTimeout(resolve, delayMs));
         if (this.tabState[sid] !== st || st._loaded) break;
       }
       if (!token) {
@@ -19768,7 +19952,8 @@ function portal() {
           } else {
           r = await this._fetchWithDeadline(
             "/api/chat/sessions/" + sid + qs,
-            { headers: this.hdr(), signal: opts.signal },
+            // A tab that is not on screen reads its history in the background.
+            { headers: this.hdr(), signal: opts.signal, lowPriority: !isCurrent },
             full ? 60_000
               : Math.max(100, Number(this._sessionReadTimeoutMs) || 15000),
             consumeHistory,
@@ -20256,7 +20441,10 @@ function portal() {
         }
         historyPerf.total_ms = Math.round(perfNow() - historyPerfStarted);
         historyPerf.foreground = sid === this.currentId;
-        if (this.tabState[sid] === st) st._lastHistoryCancel = historyPerf.cancel_reason;
+        if (this.tabState[sid] === st) {
+          st._lastHistoryCancel = historyPerf.cancel_reason;
+          st._lastHistoryStatus = historyPerf.status;
+        }
         this._reportHistoryLoadPerf(historyPerf);
         // Re-check live: only clear the skeleton if this sid is STILL the
         // active tab. If the user switched away mid-load, the now-active tab
