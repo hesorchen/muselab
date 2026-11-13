@@ -72,7 +72,10 @@ def test_idle_hook_messages_are_consumed_before_the_orphan_queue(stream_env, mon
         client = Client()
         stream = chat._SessionStream(key, client)
         try:
-            await asyncio.wait_for(received.wait(), 2)
+            # Generous bound: the stream must drain all 1500 hook messages, but
+            # a loaded CI worker (py3.13 under xdist) took over 2 s to do so.
+            # A real hang still fails here; speed is not what this test checks.
+            await asyncio.wait_for(received.wait(), 10)
             assert stream._failure is None
             assert stream._turn is None and stream._background is None
             assert chat._session_has_scheduled_tasks(key[0])
