@@ -4080,7 +4080,10 @@ def test_history_paging_uses_smaller_mobile_pages_only_on_user_request():
     assert "await this.loadEarlierMessages(sid)" in auto
     reveal_start = app.index("    async _revealLaterHistory(sid) {")
     reveal = app[reveal_start:app.index("    _chatNearLaterEdge(el) {", reveal_start)]
-    assert "st._loadingLater || st.streaming || st.es" in reveal
+    assert "if (!st || st._loadingLater || !this._messageRangeHasLater(st)) return false;" in reveal
+    # A live pane only remounts rows it trimmed, up to the paused tail.
+    assert "if (pausedIndex < 0 || st.messageRange.visibleEnd > pausedIndex) return false;" in reveal
+    assert "if (live) this._boundLiveMessageRange(st);" in reveal
     assert "await this._fetchLaterWindow(sid)" in reveal
     assert "this._historyMountWindowSize()" in reveal
     assert "st.messages.indexOf(batch[0]) !== range.visibleEnd" in reveal
