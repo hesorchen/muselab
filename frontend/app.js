@@ -3082,7 +3082,18 @@ function portal() {
         // Core readiness is insufficient: await the modes, addons and CSS too.
         await this._loadCodemirror();
         await this.$nextTick();
-        if (!valid()) return;
+        if (this._cmMountVersion !== version) return;
+        if (!valid()) {
+          // The file or workspace changed while assets loaded but the editor
+          // is still open. Do not mount a buffer for a different owner;
+          // offer a retry that mounts whatever is selected now.
+          if (this.editing) {
+            this.editorError = this.lang === "zh"
+              ? "编辑器加载被打断，请重试。"
+              : "Editor loading was interrupted. Please retry.";
+          }
+          return;
+        }
         const host = this.$refs.cmHost;
         if (!host) return;
         const modeStr = this.cmMode(path);
@@ -3172,7 +3183,10 @@ function portal() {
         host.appendChild(ta);
         this._scheduleLivePreview(0);
       } finally {
-        if (valid()) this.editorLoading = false;
+        // A superseded mount leaves the flag to the mount that replaced it.
+        // Otherwise clear it even if this one bailed out: a workspace change
+        // mid-load used to leave "Loading editor…" up with no editor at all.
+        if (this._cmMountVersion === version) this.editorLoading = false;
       }
     },
     shortMode(mode) {
@@ -21718,11 +21732,23 @@ function portal() {
     // scrolls toward that end, mount the next resident batch, fetching the next
     // canonical page first when the resident repository is exhausted. Rows are
     // appended below the viewport, so the reading position does not move.
-    // Live panes keep their own frozen-range / paused-tail semantics.
+    // Live panes keep their own frozen-range / paused-tail semantics: rows
+    // after the paused tail stay unmounted until the reader returns to it.
+    // Loading earlier rows in a live pane, though, caps the window and can cut
+    // off rows up to and including the paused tail. Without remounting those,
+    // the reader never reached the paused tail again, so follow never resumed
+    // and the running status stayed hidden. Mount them back, stopping there.
     async _revealLaterHistory(sid) {
       const st = sid && this.tabState && this.tabState[sid];
-      if (!st || st._loadingLater || st.streaming || st.es
-          || !this._messageRangeHasLater(st)) return false;
+      if (!st || st._loadingLater || !this._messageRangeHasLater(st)) return false;
+      const live = this._isLiveMessagePane(st);
+      let revealLimit = Infinity;
+      if (live) {
+        const pausedIndex = st._pausedTailKey
+          ? st.messages.findIndex(m => m._k === st._pausedTailKey) : -1;
+        if (pausedIndex < 0 || st.messageRange.visibleEnd > pausedIndex) return false;
+        revealLimit = pausedIndex + 1;
+      }
       st._loadingLater = true;
       st._historyLaterError = false;
       try {
@@ -21736,8 +21762,8 @@ function portal() {
             return false;
           }
         }
-        const batch = st.messages.slice(
-          range.visibleEnd, range.visibleEnd + this._historyMountWindowSize());
+        const batch = st.messages.slice(range.visibleEnd, Math.min(
+          revealLimit, range.visibleEnd + this._historyMountWindowSize()));
         for (const m of batch) {
           if (m.role === "assistant" && m.text && !m.html) {
             const html = await this._renderHistoryMessageAsync(m, () =>
@@ -21747,11 +21773,18 @@ function portal() {
           m._noAnim = true;
         }
         // Rendering yields; a replacement or live turn may own the range now.
-        if (this.tabState[sid] !== st || st.streaming || st.es || !batch.length
+        if (this.tabState[sid] !== st || !batch.length
+            || (!live && this._isLiveMessagePane(st))
             || st.messages.indexOf(batch[0]) !== range.visibleEnd) return false;
+        // A live window keeps its DOM cap by dropping rows above the viewport;
+        // anchor the reading position so that trim does not move it.
+        const scrollEl = live && sid === this.currentId ? this._chatBodyElement() : null;
+        const anchor = scrollEl ? this._captureViewportMessageAnchor(scrollEl, sid) : null;
         range.visibleEnd = Math.min(st.messages.length, range.visibleEnd + batch.length);
+        if (live) this._boundLiveMessageRange(st);
         this._enforceMessageRangeInvariant(st);
         this._scheduleHistoryViewport(st, "newer");
+        if (anchor) this.$nextTick(() => this._restoreMessageAnchor(scrollEl, anchor));
         if (sid === this.currentId) {
           this.$nextTick(() => {
             const pane = this.tabState[sid] === st ? this._paneElement(sid) : null;
