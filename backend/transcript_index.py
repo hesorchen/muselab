@@ -129,6 +129,18 @@ def _load(path: Path) -> dict[str, Any] | None:
     return index
 
 
+def starts_notification_turn(record: dict[str, Any]) -> bool:
+    """Whether a record carrying task notifications opens its own turn.
+
+    A notification the CLI delivers on its own (a ``user`` row) starts a
+    headless continuation. One that arrives while a human turn is admitted or
+    running is delivered inside that turn as a ``queued_command`` attachment
+    (``renderedInHumanTurn``); it is context for the running turn, so turn
+    attribution must walk past it to the human prompt.
+    """
+    return bool(record.get("task_notifications")) and record.get("type") != "attachment"
+
+
 def _task_status_from_descriptor(desc: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
     out: list[tuple[str, dict[str, Any]]] = []
     for item in desc.get("task_notifications") or []:

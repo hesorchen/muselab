@@ -9588,3 +9588,80 @@ def test_successful_image_turn_with_meta_hint_commits_canonical_history(
     assert chat_mod.sess.get_message_annotations(sid)["image-assistant"]["turn_status"] == "completed"
     snapshots, _ = chat_mod._load_cancelled_turn_snapshots(sid)
     assert snapshots == []
+
+
+def test_notification_delivered_inside_the_turn_keeps_it_committed(
+    stream_env, client, monkeypatch, tmp_path,
+):
+    """A task notification the CLI attaches to a human turn is not a turn.
+
+    A background task that ends while the session is idle is delivered with
+    the next prompt as a queued_command attachment between that prompt and
+    the reply. Turn attribution stopped at the attachment, so the reply did
+    not look committed and a successful turn was shown as failed.
+    """
+    from datetime import datetime, timezone
+
+    chat_mod = stream_env
+    sid = _make_session(client)
+    transcript = tmp_path / f"{sid}.jsonl"
+    transcript.write_text("", encoding="utf-8")
+    monkeypatch.setattr(chat_mod, "_find_session_jsonl", lambda _sid: transcript)
+    monkeypatch.setattr(
+        chat_mod, "_turn_uuids_from_boundary",
+        chat_mod._real_turn_uuids_from_boundary_for_test,
+    )
+
+    def append(entry):
+        entry = {"sessionId": sid,
+                 "timestamp": datetime.now(timezone.utc).isoformat(), **entry}
+        with transcript.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry) + "\n")
+
+    notification = (
+        "<task-notification><task-id>bg1</task-id>"
+        "<tool-use-id>toolu_bg</tool-use-id><status>killed</status>"
+        "<summary>Task was stopped</summary></task-notification>"
+    )
+
+    class NotifiedClient(_FakeStreamClient):
+        async def query(self, prompt_or_gen):
+            await super().query(prompt_or_gen)
+            append({"uuid": "turn-user", "parentUuid": None, "type": "user",
+                    "message": {"content": "did CI finish?"}})
+            append({"uuid": "turn-notification", "parentUuid": "turn-user",
+                    "type": "attachment", "attachment": {
+                        "type": "queued_command", "prompt": notification,
+                        "commandMode": "task-notification"}})
+
+        async def receive_response(self):
+            append({"uuid": "turn-assistant", "parentUuid": "turn-notification",
+                    "type": "assistant", "message": {"content": [
+                        {"type": "text", "text": "CI passed"}]}})
+            yield AssistantMessage(
+                content=[TextBlock(text="CI passed")],
+                model="claude-sonnet-4-6", uuid="turn-assistant",
+            )
+            yield ResultMessage(
+                subtype="success", duration_ms=50, duration_api_ms=40,
+                is_error=False, num_turns=1, session_id=sid,
+                total_cost_usd=0.0, usage={},
+            )
+
+    fake = NotifiedClient([])
+
+    async def fake_get_client(*_args, **_kwargs):
+        return fake
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    response = client.get(
+        f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+        "&prompt=did-ci-finish&model=claude-sonnet-4-6",
+    )
+    assert response.status_code == 200, response.text
+    done = next(json.loads(data) for event, data in _parse_sse(response.text)
+                if event == "done")
+    assert done["is_error"] is False
+    assert done["assistant_uuid"] == "turn-assistant"
+    annotations = chat_mod.sess.get_message_annotations(sid)
+    assert annotations["turn-assistant"]["turn_status"] == "completed"
