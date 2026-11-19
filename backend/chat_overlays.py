@@ -975,7 +975,8 @@ def _cancelled_snapshot_canonical_span(
                 seen.add(current_uuid)
             # A task notification starts a separate headless continuation;
             # cancelling the launch turn must not relabel that later reaction.
-            if current.get("task_notifications"):
+            # One delivered inside this turn (an attachment) does not.
+            if transcript_idx.starts_notification_turn(current):
                 break
             # A compact summary is a user row but not a prompt: auto-compaction
             # mid-turn must not end the walk before it reaches the real one.

@@ -6544,7 +6544,7 @@ def _indexed_turn_context(
                 seen.add(current_uuid)
             origin_i = current_i
             if (current.get("real_user_prompt")
-                    or current.get("task_notifications")):
+                    or transcript_idx.starts_notification_turn(current)):
                 break
             parent = str(current.get("parent") or "")
             parent_i = by_uuid.get(parent) if parent else None
@@ -6647,7 +6647,8 @@ def _indexed_ui_records(
         uid = str(record.get("uuid") or "")
         if record_i in origin_resolving:
             return uid
-        if record.get("real_user_prompt") or record.get("task_notifications"):
+        if (record.get("real_user_prompt")
+                or transcript_idx.starts_notification_turn(record)):
             origin_cache[record_i] = uid
             return uid
         origin_resolving.add(record_i)
