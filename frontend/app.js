@@ -33395,6 +33395,40 @@ function portal() {
       // Mobile: @ mention is a chat-side action, jump to the chat pane
       if (this._isMobileLayout()) this.setMobileTab("chat");
     },
+    _scrollComposerCaretIntoView(ta) {
+      if (!ta || ta.scrollHeight <= ta.clientHeight) return;
+      const pos = ta.selectionEnd;
+      if (pos >= ta.value.length) { ta.scrollTop = ta.scrollHeight; return; }
+      // Measure the caret's line with an off-screen copy that wraps exactly
+      // like the textarea (same box width, font, padding and wrapping rules).
+      const cs = getComputedStyle(ta);
+      const mirror = document.createElement("div");
+      for (const prop of ["boxSizing", "width", "paddingTop", "paddingRight",
+        "paddingBottom", "paddingLeft", "borderTopWidth", "borderRightWidth",
+        "borderBottomWidth", "borderLeftWidth", "borderStyle", "fontFamily",
+        "fontSize", "fontWeight", "fontStyle", "letterSpacing", "lineHeight",
+        "tabSize", "textIndent", "textTransform", "wordSpacing",
+        "overflowWrap", "wordBreak"]) mirror.style[prop] = cs[prop];
+      Object.assign(mirror.style, {
+        position: "absolute", visibility: "hidden", top: "0", left: "-9999px",
+        whiteSpace: "pre-wrap", overflowY: "scroll", height: "auto",
+      });
+      mirror.textContent = ta.value.slice(0, pos);
+      const marker = document.createElement("span");
+      marker.textContent = "\u200b";
+      mirror.appendChild(marker);
+      document.body.appendChild(mirror);
+      const top = marker.offsetTop;
+      const lineHeight = marker.offsetHeight || parseFloat(cs.lineHeight) || 20;
+      mirror.remove();
+      const padTop = parseFloat(cs.paddingTop) || 0;
+      const padBottom = parseFloat(cs.paddingBottom) || 0;
+      if (top - padTop < ta.scrollTop) {
+        ta.scrollTop = Math.max(0, top - padTop);
+      } else if (top + lineHeight + padBottom > ta.scrollTop + ta.clientHeight) {
+        ta.scrollTop = top + lineHeight + padBottom - ta.clientHeight;
+      }
+    },
     autoGrow(ta) {
       // Grow to fit content up to max. The hard problem: iOS Safari
       // on touch forces font-size: 16px (anti-zoom) and reports a
@@ -34535,6 +34569,11 @@ function portal() {
           this.$nextTick(() => {
             ta.setSelectionRange(s + 1, s + 1);
             this.autoGrow(ta);
+            // Replacing the value programmatically does not scroll the
+            // textarea, and autoGrow's height reset clamps scrollTop too. Once
+            // the box hits its max height the new line landed below the fold
+            // and the view stayed put.
+            this._scrollComposerCaretIntoView(ta);
           });
         } else {
           this._setChatInput(this.input + "\n");
