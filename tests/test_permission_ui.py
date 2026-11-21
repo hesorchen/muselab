@@ -26,7 +26,7 @@ def test_permission_selector_matches_installed_sdk_modes():
     start = html.index("<!-- Permission mode -->")
     end = html.index("<!-- Reasoning effort.", start)
     toolbar = html[start:end]
-    rendered = set(re.findall(r'<option value="([^"]+)">', toolbar))
+    rendered = set(re.findall(r'<option value="([^"]+)"[^>]*>', toolbar))
 
     assert rendered == set(get_args(PermissionMode))
 
