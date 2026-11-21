@@ -2361,7 +2361,7 @@ function portal() {
         [".workbench-more-actions", ".workbench-more > summary", () => !!document.querySelector(".workbench-more[open]"), { width: 230, align: "end" }],
         ["#history-picker-pop", "#history-picker-trigger", () => this.sessionPickerOpen, { width: 320, maxHeight: 320 }],
         [".tab-picker-pop", ".tab-picker-btn", () => this.editorTabPickerOpen, { width: 280, maxHeight: 320 }],
-        [".ctx-breakdown-pop", ".chat-toolbar-ring", () => this.ctxBreakdown.show, { width: 340, maxHeight: 520, align: "end", above: true }],
+        [".ctx-breakdown-pop", ".chat-toolbar-ring", () => this.ctxBreakdown.show, { width: 340, maxHeight: 820, align: "end", above: true }],
       ];
       let active = [], frame = 0;
       const position = () => {
