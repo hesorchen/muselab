@@ -507,6 +507,26 @@ class ActivityService:
         for queue in stale:
             self._subscribers.pop(queue, None)
 
+    def publish_visible_change(self) -> None:
+        """Broadcast a resync when the live-filtered summary moved.
+
+        ``summary(filter_live=True)`` drops rows whose backing session can no
+        longer be opened. Deleting a session (or registering/unregistering its
+        workspace) therefore changes the visible counters without touching the
+        ledger, so those callers must trigger the same revision bump every
+        ledger mutation gets — otherwise connected clients would only notice
+        on their next summary poll.
+
+        Notification is best-effort: a broken ledger must never fail the
+        delete/workspace operation that triggered it.
+        """
+        try:
+            self.initialize_runtime_state()
+            with self._lock:
+                self._publish_locked(resync=True)
+        except Exception:
+            pass
+
     @contextlib.asynccontextmanager
     async def subscribe(
         self,

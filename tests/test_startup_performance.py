@@ -27,7 +27,7 @@ def test_boot_dispatches_context_before_noncritical_startup_work():
     assert "await contextReady;" in boot
 
 
-def test_ready_defers_decorative_snapshots_and_preview_prewarm():
+def test_ready_defers_decorative_snapshots_off_the_critical_path():
     deferred = _method("_scheduleDeferredBootWork", "_markReady")
     ready = _method("_markReady", "_agoLabel")
 
@@ -36,24 +36,15 @@ def test_ready_defers_decorative_snapshots_and_preview_prewarm():
         "this.fetchStats()",
         "this.loadTrash()",
         "this._checkInterruptedTurns()",
-        "this._prewarmPreviewLibs()",
     ):
         assert call in deferred
+    # No vendor bundle is injected from the boot path any more: KaTeX and
+    # hljs load from the render that needs them.
+    assert "_prewarmPreviewLibs" not in deferred
+    assert "this._loadKatex()" not in deferred
     assert 'window.requestIdleCallback(run, { timeout: 1500 })' in deferred
     assert "requestAnimationFrame(() => requestAnimationFrame(schedule))" in deferred
     assert "this._scheduleDeferredBootWork();" in ready
-
-
-def test_preview_prewarm_respects_readiness_and_slow_networks():
-    prewarm = _method("_prewarmPreviewLibs", "async _loadHljs")
-
-    assert "!this.appReady" in prewarm
-    assert "document.hidden" in prewarm
-    assert "connection.saveData" in prewarm
-    assert '["slow-2g", "2g"].includes(connection.effectiveType)' in prewarm
-    assert prewarm.index("!this.appReady") < prewarm.index(
-        "this._previewLibsPrewarmed = true"
-    )
 
 
 def test_dynamic_modules_and_lazy_assets_share_versioned_urls():

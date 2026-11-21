@@ -6784,3 +6784,20 @@ def test_running_turn_reattaches_instead_of_waiting_for_its_end():
     assert "waited >= 30_000" in replay and ">= 60_000" in replay
     assert "reconnect: true," in replay
     assert html.count('@click.stop="reconnectLivePane(') == 2
+
+
+def test_activity_summary_poll_is_sse_health_gated():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    sync_start = app.index("    _startSessionsSync() {")
+    sync_end = app.index("\n    _scheduleDeferredBootWork()", sync_start)
+    sync = app[sync_start:sync_end]
+    assert "if (!this._activitySseHealthy()) {" in sync
+    assert "this.fetchActivity({ summaryOnly: !this.activity.show })" in sync
+    health_start = app.index("    _activitySseHealthy() {")
+    health_end = app.index("\n    _bindActivityVisibility()", health_start)
+    health = app[health_start:health_end]
+    assert "EventSource.OPEN" in health
+    assert "this._activityLiveFailures" in health
+    # The session-list sync and stalled-stream recovery still run every tick.
+    assert "this._syncSessionListQuiet()" in sync
+    assert "this._recoverStalledStream(this.currentId)" in sync

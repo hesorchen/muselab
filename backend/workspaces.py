@@ -451,6 +451,10 @@ async def register_workspace(body: WorkspaceRequest) -> dict[str, Any]:
         # list pull instead of making the user wait for the stale TTL.
         from . import sessions
         sessions.invalidate_sessions_cache()
+        # A newly registered directory may surface existing JSONL history,
+        # including Activity rows that were filtered out while unregistered.
+        from .activity import activity as _activity
+        _activity.publish_visible_change()
         return asdict(entry)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -474,4 +478,9 @@ async def remove_workspace(path: str = Query(...)) -> dict[str, bool]:
         raise HTTPException(400, str(exc)) from exc
     from . import sessions
     sessions.invalidate_sessions_cache()
+    # Sessions under the removed workspace drop out of the live-filtered
+    # Activity summary; resync connected clients instead of waiting for the
+    # fallback poll.
+    from .activity import activity as _activity
+    _activity.publish_visible_change()
     return {"ok": True}
