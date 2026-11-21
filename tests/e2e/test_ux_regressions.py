@@ -186,6 +186,7 @@ _FOOTER_BOXES = """
     fork: rect(pane && pane.querySelector(".turn-fork-btn:not(.turn-retry-btn)")),
     retry: rect(pane && pane.querySelector(".turn-retry-btn")),
     footer: rect(pane && pane.querySelector(".turn-footer")),
+    usage: rect(pane && pane.querySelector(".turn-footer .turn-model-usage")),
     separator: (() => {
       const el = pane && pane.querySelector(".turn-footer");
       if (!el) return null;
@@ -215,6 +216,10 @@ def test_phone_turn_footer_keeps_fork_and_retry_inside_chat_body(
         assert box["width"] >= 24 and box["height"] >= 24, (name, box, body)
         assert box["left"] >= body["left"] - 1, (name, box, body)
         assert box["right"] <= body["right"] + 1, (name, box, body)
+    # One row: the token/cost summary is hidden on phones instead of
+    # wrapping the separator onto a second line.
+    assert boxes["usage"] is None or boxes["usage"]["width"] == 0, boxes
+    assert boxes["footer"]["height"] <= boxes["fork"]["height"] + 4, boxes
     # Nothing shoved horizontally out of the transcript.
     assert body["scrollWidth"] <= body["width"] + 2, boxes
     # The separator hairlines survive the narrow layout instead of collapsing.
