@@ -32,7 +32,10 @@ extraction uses the native output-token budget and disabled thinking.
 Repeated task observations that only change `updated_at` should not rewrite a
 sidecar. Failed expensive filesystem scans use a bounded retry delay at least as
 large as the preceding pass, capped at 30 seconds; healthy partial continuations
-keep their short yield. The logged retry duration is the actual retry deadline.
+that observed changes keep their short yield, while idle continuations over an
+oversized root back off exponentially from 30 seconds to 10 minutes so the cycle
+still eventually covers the tree without continuous scanning. The logged retry
+duration is the actual retry deadline.
 `sessions.rename_index` separates index lock, read, and write time without logging
 session names, paths, or contents. These timings distinguish local filesystem
 latency from SDK/network latency in a deployment that cannot be inspected directly.
