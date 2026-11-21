@@ -15666,6 +15666,73 @@ function portal() {
       // for every close click; killed by user request.
     },
 
+    // True when closing this tab would discard in-memory composer state.
+    // Persisted draft TEXT survives a close/reopen, but pending attachments
+    // and quotes do not, so the bulk-close confirm covers all of them.
+    _tabHasUnsentDraft(id) {
+      const st = id && this.tabState && this.tabState[id];
+      const draft = (st && st.draft) || null;
+      if (!draft) return false;
+      return !!(String(draft.input || "").trim()
+        || (draft.pendingImages || []).length
+        || (draft.pendingDocs || []).length
+        || this._sendableQuotes(draft.pendingQuotes, draft.input).length);
+    },
+
+    // Close many chat tabs in one pass: at most one confirm, one tab-store
+    // write, one prefs save, and one switch/newSession at the end. Matches
+    // closeChatTab's end state (hop to the last remaining workspace tab, or
+    // start a fresh session when the strip empties) without N sequential
+    // switches. Sessions are never deleted — closing is reversible from the
+    // history picker.
+    async closeChatTabs(ids) {
+      const closing = new Set((ids || []).filter(id => this.openTabIds.includes(id)));
+      if (!closing.size) return false;
+      const losing = [...closing].filter(id => this._tabHasUnsentDraft(id)).length;
+      if (losing) {
+        const zh = this.lang === "zh";
+        const ok = await this.confirm({
+          title: zh ? "关闭会话标签" : "Close session tabs",
+          body: zh
+            ? `${losing} 个标签含有未发送的草稿或附件，关闭后会丢失。会话本身仍保留在历史记录中。`
+            : `${losing} tab(s) contain unsent drafts or attachments that will be discarded. The sessions themselves stay in history.`,
+          okText: zh ? `关闭 ${closing.size} 个` : `Close ${closing.size}`,
+          danger: true,
+        });
+        if (!ok) return false;
+      }
+      const wasActive = closing.has(this.currentId);
+      this.openTabIds = this.openTabIds.filter(id => !closing.has(id));
+      for (const id of closing) this._disposeTabRuntime(id);
+      if (wasActive) {
+        const workspaceTabs = this.workspaceOpenTabIds();
+        if (workspaceTabs.length) {
+          this.currentId = workspaceTabs[workspaceTabs.length - 1];
+          await this.switchSession();
+        } else {
+          await this.newSession();
+        }
+      }
+      this._writeChatTabStore(this.openTabIds);
+      this.savePrefs();
+      return true;
+    },
+
+    // Close every workspace tab except the active one (or except the
+    // right-clicked tab when invoked from the context menu).
+    closeOtherChatTabs(keepId = this.currentId) {
+      this.closeTabMenu();
+      this.closeHistoryPicker();
+      const tabs = this.workspaceOpenTabIds();
+      const keep = tabs.includes(keepId) ? keepId : tabs[tabs.length - 1];
+      return this.closeChatTabs(tabs.filter(id => id !== keep));
+    },
+    closeAllChatTabs() {
+      this.closeTabMenu();
+      this.closeHistoryPicker();
+      return this.closeChatTabs(this.workspaceOpenTabIds());
+    },
+
     // Inline rename — tab name -> <input>. Enter saves, Esc cancels, blur saves.
     startRenameTab(id) {
       const s = this.sessions.find(x => x.id === id);
@@ -18273,14 +18340,7 @@ function portal() {
           this.closeTab(path);
           break;
         case "closeOthers":
-          // Switch first, mutate second. openFile owns the dirty-editor guard;
-          // if the user cancels, keep the original tab array intact.
-          if (this.selected !== path) {
-            await this.switchTab(path, { reveal: true });
-            if (this.selected !== path) return;
-          }
-          this.tabs = this.tabs.filter(t => t.path === path);
-          this.savePrefs();
+          await this.closeOtherPreviewTabs(path);
           break;
         case "closeRight": {
           const idx = this.tabs.findIndex(t => t.path === path);
@@ -19259,6 +19319,14 @@ function portal() {
       this.startRenameTab(id);
     },
     async menuClose(id) { this.closeTabMenu(); await this.closeChatTab(id); },
+    async menuCloseOthers(id) {
+      this.closeTabMenu();
+      await this.closeOtherChatTabs(id);
+    },
+    async menuCloseAll() {
+      this.closeTabMenu();
+      await this.closeAllChatTabs();
+    },
     async menuExportMarkdown(id) {
       this.closeTabMenu();
       if (!id) return;
@@ -29647,6 +29715,20 @@ function portal() {
       if (this.editing && !this._confirmLoseEdits()) return;
       this.tabs = [];
       this._clearPreviewState();
+      this.savePrefs();
+    },
+    // Keep `path` and drop every other preview tab. Shared by the preview
+    // tab right-click menu and the open-tabs picker footer.
+    async closeOtherPreviewTabs(path) {
+      if (!path) path = (this.tabs[0] || {}).path;
+      if (!path) return;
+      // Switch first, mutate second. openFile owns the dirty-editor guard;
+      // if the user cancels, keep the original tab array intact.
+      if (this.selected !== path) {
+        await this.switchTab(path, { reveal: true });
+        if (this.selected !== path) return;
+      }
+      this.tabs = this.tabs.filter(t => t.path === path);
       this.savePrefs();
     },
 

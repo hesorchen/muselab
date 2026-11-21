@@ -962,6 +962,27 @@
                 <span class="ellipsis" x-text="t.name"></span>
               </div>
             </template>
+            <!-- Bulk-close footer for file tabs. Mobile users cannot
+                 right-click, and the per-tab × requires precision taps when
+                 many previews are open. Same footer treatment as the history
+                 picker's clear-old row. Hidden when no file tab is open. -->
+            <div class="session-picker-footer" x-show="tabs.length > 0">
+              <div class="session-picker-footer-actions">
+                <button type="button" class="session-picker-bulk-btn"
+                        data-close-scope="others"
+                        @click.stop="editorTabPickerOpen=false; closeOtherPreviewTabs(selected)"
+                        :disabled="tabs.length < 2"
+                        :title="lang==='zh' ? '关闭其他文件标签（当前标签保留）' : 'Close other file tabs (keep the current one)'">
+                  <span x-text="lang==='zh' ? '关闭其他' : 'Close others'"></span>
+                </button>
+                <button type="button" class="session-picker-bulk-btn"
+                        data-close-scope="all"
+                        @click.stop="editorTabPickerOpen=false; closeAllTabs()"
+                        :title="lang==='zh' ? '关闭全部文件标签' : 'Close all file tabs'">
+                  <span x-text="(lang==='zh' ? '关闭全部' : 'Close all') + ' (' + tabs.length + ')'"></span>
+                </button>
+              </div>
+            </div>
           </div>
         </div>
         <!-- Scrolling tab strip — only this part overflows horizontally. -->
@@ -1908,13 +1929,31 @@
                     x-text="lang==='zh' ? '加载更多' : 'Load more'"></button>
             <div x-show="!sessionHistoryLoading && !sessionHistoryError && filteredSessions().length === 0" class="session-picker-empty"
                  x-text="lang==='zh' ? (sessionPickerSearch ? '没有匹配' : '暂无会话') : (sessionPickerSearch ? 'No match' : 'No sessions')"></div>
-            <!-- Footer: one-click bulk-clear of stale history. Sits at the very
-                 bottom of the list so it's out of the way of normal row clicks.
-                 Hidden during a search (the visible set is filtered, so the
-                 count would mislead). Deletes only sessions older than 7 days;
-                 pinned + currently-open are always kept (see purgeOldSessions). -->
-            <div class="session-picker-footer" x-show="!sessionPickerSearch && filteredSessions().length > 0">
+            <!-- Footer: bulk actions pinned to the bottom of the list.
+                 Two independent groups share one sticky footer so they never
+                 overlap: closing session TABS (never deletes sessions; scoped
+                 to the current workspace's strip) and the pre-existing purge
+                 of stale history. The tab actions stay available during a
+                 search because they act on the strip, not the filtered rows. -->
+            <div class="session-picker-footer"
+                 x-show="workspaceOpenTabIds().length || (!sessionPickerSearch && filteredSessions().length > 0)">
+              <div class="session-picker-footer-actions" x-show="workspaceOpenTabIds().length">
+                <button type="button" class="session-picker-bulk-btn"
+                        data-close-scope="others"
+                        @click.stop="closeOtherChatTabs()"
+                        :disabled="workspaceOpenTabIds().length < 2"
+                        :title="lang==='zh' ? '关闭其他会话标签（当前标签保留，会话不删除）' : 'Close other session tabs (keep the current one; sessions stay)'">
+                  <span x-text="lang==='zh' ? '关闭其他标签' : 'Close other tabs'"></span>
+                </button>
+                <button type="button" class="session-picker-bulk-btn"
+                        data-close-scope="all"
+                        @click.stop="closeAllChatTabs()"
+                        :title="lang==='zh' ? '关闭全部会话标签（会话仍保留在历史记录）' : 'Close all session tabs (sessions stay in history)'">
+                  <span x-text="(lang==='zh' ? '关闭全部标签' : 'Close all tabs') + ' (' + workspaceOpenTabIds().length + ')'"></span>
+                </button>
+              </div>
               <button class="session-picker-clear-old"
+                      x-show="!sessionPickerSearch && filteredSessions().length > 0"
                       @click.stop="purgeOldSessions()"
                       :title="lang==='zh' ? '删除 7 天前的会话（置顶和当前会话保留）' : 'Delete sessions older than 7 days (pinned & current kept)'">
                 <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -2003,6 +2042,10 @@
                   x-text="lang==='zh' ? '重命名' : 'Rename'"></button>
           <button @click="menuClose(tabCtxMenu && tabCtxMenu.id)"
                   x-text="lang==='zh' ? '关闭 tab' : 'Close tab'"></button>
+          <button @click="menuCloseOthers(tabCtxMenu && tabCtxMenu.id)"
+                  x-text="lang==='zh' ? '关闭其他' : 'Close others'"></button>
+          <button @click="menuCloseAll()"
+                  x-text="lang==='zh' ? '关闭全部' : 'Close all'"></button>
           <button @click="menuFork(tabCtxMenu && tabCtxMenu.id)"
                   :disabled="!canForkSession(tabCtxMenu && tabCtxMenu.id)"
                   x-text="forkingSessionId === (tabCtxMenu && tabCtxMenu.id)

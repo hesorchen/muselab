@@ -867,6 +867,8 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
      mobile so it doesn't overlap the bottom tab bar. */
   .chat-tab-history .session-picker-pop { max-height: 50vh; }
   .session-picker-row { padding: 10px 12px; }   /* easier tap target */
+  /* Bulk tab-close actions must be comfortably tappable on phones. */
+  .session-picker-footer-actions .session-picker-bulk-btn { min-height: 40px; }
 
   /* Right-click / long-press context menu — bigger buttons for touch. */
   .tab-ctx-menu { min-width: 200px; }
@@ -3498,6 +3500,31 @@ pre.text {
   background: var(--c-danger-soft);
 }
 .session-picker-clear-old svg { flex-shrink: 0; }
+/* Bulk tab-close row inside the shared picker footer. Neutral (not danger)
+   because closing tabs never deletes sessions; disabled when there is
+   nothing to close (e.g. a single open tab for "close others"). */
+.session-picker-footer-actions {
+  display: flex;
+  gap: 4px;
+}
+.session-picker-footer-actions + .session-picker-clear-old { margin-top: 4px; }
+.session-picker-bulk-btn {
+  flex: 1 1 0; min-width: 0;
+  display: flex; align-items: center; justify-content: center;
+  padding: 6px 8px;
+  font-size: var(--fs-xs); color: var(--c-fg-2);
+  background: var(--c-bg-2); border: 1px solid var(--c-border);
+  border-radius: 6px;
+  cursor: pointer; text-align: center;
+  transition: background var(--t-base), color var(--t-base), border-color var(--t-base);
+}
+.session-picker-bulk-btn span {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.session-picker-bulk-btn:hover:not(:disabled) {
+  color: var(--c-fg-0); background: var(--c-bg-3); border-color: var(--c-fg-4);
+}
+.session-picker-bulk-btn:disabled { opacity: 0.45; cursor: default; }
 .session-picker-row.open:not(.active) {
   /* Visual marker so users can tell which sessions are already open as tabs. */
   background: var(--c-bg-2);
