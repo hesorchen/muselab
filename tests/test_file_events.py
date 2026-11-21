@@ -1693,6 +1693,7 @@ async def test_partial_reconcile_uses_fairness_yield_not_failure_backoff(
 
     async def partial_then_complete(_state):
         calls.append(file_events.monotonic())
+        _state.last_reconcile_changes = 1
         return len(calls) == 1
 
     monkeypatch.setattr(
@@ -1707,6 +1708,34 @@ async def test_partial_reconcile_uses_fairness_yield_not_failure_backoff(
     assert state.reconcile_failures == 0
     assert state.reconcile_retry_at == 0.0
     await manager.shutdown()
+
+
+def test_idle_partial_continuations_back_off_exponentially(
+    app_module,
+    temp_root,
+    monkeypatch,
+):
+    import backend.file_events as file_events
+
+    monkeypatch.setattr(file_events, "_PARTIAL_RECONCILE_YIELD_S", 0.02)
+    monkeypatch.setattr(file_events, "_PARTIAL_RECONCILE_BACKOFF_BASE_S", 0.04)
+    monkeypatch.setattr(file_events, "_PARTIAL_RECONCILE_BACKOFF_MAX_S", 0.1)
+    state = file_events._WatchState(
+        root=temp_root,
+        workspace_id="partial-backoff",
+        initialized=True,
+    )
+
+    delays = [
+        file_events.FileWatchManager._record_partial_continuation(
+            state, productive=False)
+        for _ in range(5)
+    ]
+    assert delays == [0.04, 0.08, 0.1, 0.1, 0.1]
+    assert state.reconcile_partials == 5
+    assert file_events.FileWatchManager._record_partial_continuation(
+        state, productive=True) == 0.02
+    assert state.reconcile_partials == 0
 
 
 @pytest.mark.asyncio
@@ -3562,4 +3591,185 @@ async def test_worker_resident_reconcile_applies_changes_and_resumes(
         assert "sub/added.txt" in paths
         assert "sub/f0.txt" not in paths
     finally:
+        await manager.shutdown()
+
+
+def _fill_bulk_tree(root: Path, count: int = 200) -> Path:
+    bulk = root / "bulk"
+    bulk.mkdir()
+    for index in range(count):
+        (bulk / f"f{index:03d}.txt").write_text(str(index), encoding="utf-8")
+    return bulk
+
+
+async def _count_scan_passes(manager, state, monkeypatch, window_s: float) -> int:
+    passes = 0
+    real_reconcile = manager._reconcile_and_broadcast
+
+    async def counting(current):
+        nonlocal passes
+        passes += 1
+        return await real_reconcile(current)
+
+    monkeypatch.setattr(manager, "_reconcile_and_broadcast", counting)
+    task = asyncio.create_task(manager._reconcile_after_watch(state))
+    try:
+        await asyncio.sleep(window_s)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    return passes
+
+
+@pytest.mark.asyncio
+async def test_idle_partial_reconcile_over_file_limit_is_bounded(
+    app_module,
+    temp_root,
+    monkeypatch,
+):
+    """An oversized unchanged root must not spin through bounded passes."""
+    from backend import file_events
+    from backend.workspace_store import WorkspaceStore
+    from backend.workspaces import registry
+
+    _fill_bulk_tree(temp_root)
+    store = WorkspaceStore(temp_root)
+    entry = registry.entry_for(temp_root)
+    store.reconcile(entry.id, temp_root, entry.name)
+    manager = file_events.FileWatchManager(store)
+    state = file_events._WatchState(
+        root=temp_root.resolve(),
+        workspace_id=entry.id,
+        name=entry.name,
+        initialized=True,
+    )
+    monkeypatch.setattr(file_events, "_SCAN_MAX_FILES", 20)
+    # raising=False keeps the probe meaningful on the unfixed tree, which has
+    # no such knobs: the pass count then exposes the hot loop.
+    monkeypatch.setattr(
+        file_events, "_PARTIAL_RECONCILE_BACKOFF_BASE_S", 10.0, raising=False)
+    monkeypatch.setattr(
+        file_events, "_PARTIAL_RECONCILE_BACKOFF_MAX_S", 10.0, raising=False)
+
+    try:
+        passes = await _count_scan_passes(
+            manager, state, monkeypatch, window_s=2.5)
+        # The unchanged tree needs ~11 bounded passes to cover 200 entries at
+        # 20 per pass. Only the first may run before the continuation delay.
+        assert passes <= 2
+        assert state.scan_progress
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_under_file_limit_completes_in_one_pass(
+    app_module,
+    temp_root,
+    monkeypatch,
+):
+    from backend import file_events
+    from backend.workspace_store import WorkspaceStore
+    from backend.workspaces import registry
+
+    _fill_bulk_tree(temp_root)
+    store = WorkspaceStore(temp_root)
+    entry = registry.entry_for(temp_root)
+    store.reconcile(entry.id, temp_root, entry.name)
+    manager = file_events.FileWatchManager(store)
+    state = file_events._WatchState(
+        root=temp_root.resolve(),
+        workspace_id=entry.id,
+        name=entry.name,
+        initialized=True,
+    )
+    calls = 0
+    real_reconcile = manager._reconcile_and_broadcast
+
+    async def counting(current):
+        nonlocal calls
+        calls += 1
+        return await real_reconcile(current)
+
+    monkeypatch.setattr(manager, "_reconcile_and_broadcast", counting)
+    try:
+        await manager._reconcile_after_watch(state)
+        assert calls == 1
+        assert state.reconcile_retry_at == 0.0
+        assert getattr(state, "reconcile_partials", 0) == 0
+        assert state.scan_progress == {}
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_native_watcher_applies_change_during_partial_backoff(
+    app_module,
+    temp_root,
+    monkeypatch,
+):
+    """Continuation backoff must never hold up native watcher delivery."""
+    from backend import file_events
+    from backend.workspace_store import WorkspaceStore
+    from backend.workspaces import registry
+
+    _fill_bulk_tree(temp_root)
+    store = WorkspaceStore(temp_root)
+    entry = registry.entry_for(temp_root)
+    store.reconcile(entry.id, temp_root, entry.name)
+    manager = file_events.FileWatchManager(store)
+    state = file_events._WatchState(
+        root=temp_root.resolve(),
+        workspace_id=entry.id,
+        name=entry.name,
+        initialized=True,
+    )
+    manager._states[state.root] = state
+    monkeypatch.setattr(file_events, "_SCAN_MAX_FILES", 20)
+    monkeypatch.setattr(
+        file_events, "_PARTIAL_RECONCILE_BACKOFF_BASE_S", 2.0, raising=False)
+    monkeypatch.setattr(
+        file_events, "_PARTIAL_RECONCILE_BACKOFF_MAX_S", 2.0, raising=False)
+    note = temp_root / "bulk" / "late.txt"
+    delivered_during_backoff: list[bool] = []
+
+    async def fake_awatch(*_paths, **options):
+        deadline = file_events.monotonic() + 5
+        while (
+            file_events.monotonic() < deadline
+            and state.reconcile_partials < 1
+        ):
+            await asyncio.sleep(0.01)
+        delivered_during_backoff.append(
+            state.reconcile_retry_at > file_events.monotonic())
+        note.write_text("late", encoding="utf-8")
+        yield {(Change.added, str(note))}
+        await options["stop_event"].wait()
+
+    monkeypatch.setattr(file_events, "awatch", fake_awatch)
+    watch_task = asyncio.create_task(manager._watch(state))
+    state.task = watch_task
+    try:
+        await asyncio.wait_for(state.watch_ready.wait(), timeout=2)
+        async with manager._lock:
+            manager._queue_reconcile_locked(state)
+        deadline = file_events.monotonic() + 3
+        indexed = False
+        while file_events.monotonic() < deadline:
+            with store._connect() as db:
+                row = db.execute(
+                    "SELECT path FROM files WHERE workspace_id = ? AND path = ?",
+                    (entry.id, "bulk/late.txt"),
+                ).fetchone()
+            if row is not None:
+                indexed = True
+                break
+            await asyncio.sleep(0.02)
+        assert indexed is True
+        # The change landed while the incomplete cycle waited, not after the
+        # bounded passes finished.
+        assert delivered_during_backoff == [True]
+    finally:
+        watch_task.cancel()
+        await asyncio.gather(watch_task, return_exceptions=True)
         await manager.shutdown()

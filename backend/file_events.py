@@ -53,7 +53,13 @@ _MAX_EVENT_SUBSCRIBERS = 64
 _MAX_CONCURRENT_RECONCILES = 4
 _SCAN_CANCEL_GRACE_S = 0.25
 _SCAN_EXCHANGE_TIMEOUT_S = max(30.0, _SCAN_MAX_SECONDS * 3)
+# A continuation pass that observed nothing new must not immediately walk the
+# next chunk of an oversized root. Real changes keep the short fairness yield
+# so catch-up stays fast; idle continuations space out up to the cap while the
+# cycle still eventually reaches the authoritative end-of-tree pass.
 _PARTIAL_RECONCILE_YIELD_S = 0.01
+_PARTIAL_RECONCILE_BACKOFF_BASE_S = 30.0
+_PARTIAL_RECONCILE_BACKOFF_MAX_S = 600.0
 _NATIVE_DIRECTORY_WATCH_HARD_CAP = 131_072
 _WATCH_LINGER_S = 30.0
 _MAX_IDLE_WATCHERS = 3
@@ -230,6 +236,8 @@ class _WatchState:
     reconcile_attempts: int = 0
     reconcile_failures: int = 0
     reconcile_retry_at: float = 0.0
+    reconcile_partials: int = 0
+    last_reconcile_changes: int = 0
     reconcile_cancel: asyncio.Event = field(default_factory=asyncio.Event)
     scan_progress: dict[str, Any] = field(default_factory=dict)
     stop_task: asyncio.Task[None] | None = None
@@ -479,6 +487,24 @@ class FileWatchManager:
     def _reset_reconcile_retry(state: _WatchState) -> None:
         state.reconcile_failures = 0
         state.reconcile_retry_at = 0.0
+
+    @staticmethod
+    def _record_partial_continuation(
+        state: _WatchState,
+        *,
+        productive: bool,
+    ) -> float:
+        """Delay the next bounded pass of an incomplete reconcile cycle."""
+        if productive:
+            # This pass observed real work, so finish the catch-up promptly.
+            state.reconcile_partials = 0
+            return _PARTIAL_RECONCILE_YIELD_S
+        state.reconcile_partials += 1
+        return min(
+            _PARTIAL_RECONCILE_BACKOFF_MAX_S,
+            _PARTIAL_RECONCILE_BACKOFF_BASE_S
+            * (2 ** min(state.reconcile_partials - 1, 16)),
+        )
 
     def _queue_reconcile_locked(self, state: _WatchState) -> None:
         """Coalesce full scans, retaining a requested closing pass."""
@@ -1612,22 +1638,32 @@ class FileWatchManager:
                     armed = await self._wait_for_armed_watcher(state)
                     if not armed and state.task is not None:
                         return
+                was_initialized = state.initialized
                 partial = await self._reconcile_and_broadcast(state)
                 if partial:
                     # An accepted bounded continuation is healthy work. Yield
-                    # briefly for other roots instead of entering failure backoff.
+                    # briefly for other roots instead of entering failure
+                    # backoff, but never spin through an idle oversized tree:
+                    # a pass that observed nothing new waits before resuming.
                     self._reset_reconcile_retry(state)
-                    state.reconcile_retry_at = (
-                        monotonic() + _PARTIAL_RECONCILE_YIELD_S
+                    productive = (
+                        not was_initialized
+                        or bool(state.last_reconcile_changes)
+                    )
+                    state.reconcile_retry_at = monotonic() + (
+                        self._record_partial_continuation(
+                            state, productive=productive)
                     )
                     state.reconcile_pending = True
                 else:
+                    state.reconcile_partials = 0
                     self._reset_reconcile_retry(state)
             except asyncio.CancelledError:
                 raise
             except WorkspaceScanCancelled:
                 return
             except Exception as exc:
+                state.reconcile_partials = 0
                 state.reconcile_error = exc
                 self._broadcast(
                     state,
@@ -1728,6 +1764,10 @@ class FileWatchManager:
             # refresh. A watcher generation that changes anywhere after the
             # snapshot begins must queue one more armed closing pass.
             state.reconcile_running = False
+            state.last_reconcile_changes = int(metrics["changes"] or 0)
+            if metrics["resync"]:
+                state.last_reconcile_changes = max(
+                    state.last_reconcile_changes, 1)
             _perf_event(
                 "files.reconcile",
                 workspace=short_id(state.workspace_id),
