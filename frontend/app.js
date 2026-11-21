@@ -1788,7 +1788,8 @@ function portal() {
         // is pressed out of habit (blur the focus). Only confirm when dirty.
         if (this.editing) { if (this._confirmLoseEdits()) this.editing = false; return; }
         if (this.selectedPaths.size) { this.clearTreeSelection(); return; }  // 清空多选
-        if (this.isTabStreaming(this.currentId)) { this.stop(); return; } // 停止当前会话
+        if (this.isTabStreaming(this.currentId)
+            || this.manualCompactActive(this.currentId)) { this.stop(); return; } // 停止当前会话
       }
       // Delete / Backspace → batch-trash the multi-selection. Only fires when
       // there's an explicit batch set (size > 0) and focus is outside any
@@ -8576,14 +8577,14 @@ function portal() {
     // Label for the 📦 compact-in-progress bubble. An auto-compact rides the
     // turn's own stream, so streamElapsed (already ticking once a second) is
     // its elapsed time to within a second — and showing it is the whole point:
-    // the silent version of this bubble ran 9m19s before failing. The manual
-    // compact has no stream and no ticker, so it stays a bare label.
+    // the silent version of this bubble ran 9m19s before failing. A manual
+    // compact has no stream, so runCompact drives `_compactElapsed` itself.
     compactPendingLabel() {
       const zh = this.lang === "zh";
       const base = zh ? "压缩对话中…" : "Compacting conversation…";
       const st = this.activeSessionPane();
       if (!st._compactStartedAt) return base;
-      const secs = st.streamElapsed || 0;
+      const secs = st._compactElapsed || st.streamElapsed || 0;
       if (secs < 2) return base;
       return base + " · " + this.fmtStreamElapsed(secs);
     },
@@ -12561,7 +12562,18 @@ function portal() {
         rec.observer = new PerformanceObserver(list => rec.collect(list.getEntries()));
         rec.observer.observe({ type: "longtask", buffered: false });
       } catch (_) { rec.observer = null; }
-      rec.timer = setTimeout(() => this._finishTranscriptPerf(token, "cancelled", "timeout"), 90000);
+      rec.timer = setTimeout(() => {
+        // The awaited settle path can stall indefinitely (double rAF never
+        // fires while the page is backgrounded; returnToLatest can wedge).
+        // Merely stopping perf sampling would leave the opaque shield and the
+        // inert chat body up with no way out, so lift it through the normal
+        // failure path — but only if this token still owns the load.
+        if (this._ownsTranscriptLoad(token)) {
+          this._failTranscriptLoad(token, "timeout");
+        } else {
+          this._finishTranscriptPerf(token, "cancelled", "timeout");
+        }
+      }, 90000);
       museTranscriptPerf.set(sid, rec);
       return token;
     },
@@ -12602,7 +12614,7 @@ function portal() {
         return false;
       }
     },
-    _failTranscriptLoad(token) {
+    _failTranscriptLoad(token, reason = "failed") {
       if (!this._ownsTranscriptLoad(token)) return false;
       // A failed foreground load is not surfaced: most "failures" are a newer
       // load superseding this one or the tail-follow step being interrupted,
@@ -12613,7 +12625,7 @@ function portal() {
       token.state.messagesLoading = false;
       token.state.messagesReady = true;
       token.state.transcriptLoadPhase = "error";
-      this._finishTranscriptPerf(token, "error", "failed");
+      this._finishTranscriptPerf(token, "error", reason);
       return true;
     },
     _releaseTranscriptLoadForLive(st) {
@@ -34130,6 +34142,7 @@ function portal() {
         this.toast(this.t("ctx.compact_wait_streaming"), "warn", 2500);
         return;
       }
+      if (st && st._compactAbort) return;  // manual compact already in flight
       // Empty-session guard. The target session's frontend message
       // mirror may be transiently empty (loadSession in flight on
       // background tabs), so fall back to backend's message_count.
@@ -34174,6 +34187,21 @@ function portal() {
       // along to unrelated tabs.
       const cst = this._ensureTabState(sid);
       cst.compacting = true;
+      // Manual compact has no turn stream behind it, so nothing else ticks
+      // the bubble's elapsed time. Stamp a start and drive it here; the auto
+      // path gets the same two fields from compact_progress + its stream.
+      cst._compactStartedAt = Date.now();
+      cst._compactElapsed = 0;
+      if (cst._compactTimer) clearInterval(cst._compactTimer);
+      cst._compactTimer = setInterval(() => {
+        cst._compactElapsed = (Date.now() - cst._compactStartedAt) / 1000;
+      }, 1000);
+      // The POST is only the wait side of the operation. Disconnecting does
+      // not cancel the CLI /compact server-side (the endpoint keeps going and
+      // commits the result to the transcript), so Stop aborts this wait and
+      // says so rather than pretending the work was interrupted.
+      const compactAbort = new AbortController();
+      cst._compactAbort = compactAbort;
       let recoveredSession = null;
       // A short toast confirms the kick — the bottom pending bubble is what
       // the user actually watches for the full 20–60s window, not the toast.
@@ -34186,7 +34214,8 @@ function portal() {
 
       try {
         const r = await fetch(`/api/chat/sessions/${sid}/native-compact`,
-                                { method: "POST", headers: this.hdr() });
+                                { method: "POST", headers: this.hdr(),
+                                  signal: compactAbort.signal });
         if (!r.ok) {
           const raw = await r.text();
           let detail = raw;
@@ -34234,12 +34263,23 @@ function portal() {
         }
         this.toast(this.lang === "zh" ? "📦 压缩完成" : "📦 Compacted", "success", 2000);
       } catch (e) {
-        this.toast((this.lang === "zh" ? "压缩失败：" : "Compact failed: ") + e.message, "error", 5000);
+        // stopCompact() aborted our wait on purpose and owns the notice.
+        if (!(e && e.name === "AbortError")) {
+          this.toast((this.lang === "zh" ? "压缩失败：" : "Compact failed: ") + e.message, "error", 5000);
+        }
       } finally {
+        if (cst._compactTimer) {
+          clearInterval(cst._compactTimer);
+          cst._compactTimer = null;
+        }
+        cst._compactStartedAt = 0;
+        cst._compactElapsed = 0;
+        if (cst._compactAbort === compactAbort) cst._compactAbort = null;
         cst.compacting = false;
         // Auto-drain runs against the compacted session, not currentId —
         // a background auto-compact must drain its own queue, not the
-        // user's currently-visible tab's queue.
+        // user's currently-visible tab's queue. After a Stop the server may
+        // still be compacting; a drained turn simply waits for that lock.
         if (!recoveredSession) {
           this.$nextTick(() => this._drainPendingQueue(sid));
         }
@@ -34250,6 +34290,27 @@ function portal() {
           this.$nextTick(() => this._refreshCtxMeter && this._refreshCtxMeter());
         }
       }
+    },
+
+    // Whether a manual (POST native-compact) compact is waiting in this tab.
+    // The Stop button uses this instead of folding `compacting` into
+    // isTabStreaming: auto-compact rides a real turn stream, and those
+    // callers must keep seeing streaming-only semantics.
+    manualCompactActive(tid) {
+      const st = tid && this.tabState && this.tabState[tid];
+      return !!(st && st._compactAbort);
+    },
+    stopCompact(sid = this.currentId) {
+      const st = sid && this.tabState && this.tabState[sid];
+      if (!st || !st._compactAbort) return false;
+      try { st._compactAbort.abort(); } catch (_) {}
+      this.toast(
+        this.lang === "zh"
+          ? "已停止等待压缩；压缩可能仍在服务端继续，完成后重新打开会话即可看到结果"
+          : "Stopped waiting for the compact. It may still finish on the server — reopen the session later to see the result.",
+        "info", 6000,
+      );
+      return true;
     },
 
     _chatInputHistory() {
@@ -37864,11 +37925,20 @@ function portal() {
       }
     },
     async stop() {
-      // Stop has exactly one meaning: interrupt the active turn for the current
-      // session. Queued messages keep their independent edit/delete actions.
+      // Stop interrupts the active turn for the current session (or, when only
+      // a manual compact is pending, its client-side wait). Queued messages
+      // keep their independent edit/delete actions.
       const sid = this.currentId;
       if (!sid) return;
       const st = this._ensureTabState(sid);
+      // Only a bare manual compact (no turn stream behind it) is owned by the
+      // client-side wait. Auto-compact rides a live turn: Stop there keeps its
+      // existing meaning (interrupt the turn).
+      if (st._compactAbort && !this.isTabStreaming(sid)
+          && !this._hasPendingAdmission(st) && !st._uncertainSubmission) {
+        this.stopCompact(sid);
+        return;
+      }
       if (!this.isTabStreaming(sid) && !this._hasPendingAdmission(st) && !st._uncertainSubmission) return;
       const ownerTurnId = String(st.activeTurnId || "");
       if (!ownerTurnId && st._composerSubmitToken) {

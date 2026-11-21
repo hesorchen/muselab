@@ -2604,7 +2604,7 @@ def test_stop_control_interrupts_session_and_never_removes_queue_items():
     start = app.index("async stop() {")
     stop = app[start:app.index("// ====== ask_user_question", start)]
 
-    assert 'x-show="isTabStreaming(currentId) || _hasPendingAdmission(activeSessionPane())' in html
+    assert 'x-show="isTabStreaming(currentId) || manualCompactActive(currentId) || _hasPendingAdmission(activeSessionPane())' in html
     assert "chat-toolbar-stop" in html
     assert "sendState._stoppingTurnId || sendState._uncertainSubmission" in app
     assert "this._holdPendingSnapshot(sid, true)" in app

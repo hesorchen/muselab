@@ -5045,7 +5045,15 @@ html[data-theme="light"] .msg.user .bubble:not(.is-scheduled-trigger) { color: v
     margin: 4px 0 2px;
     gap: 5px;
     min-height: 14px;
+    /* The status/metadata chips plus Fork/Retry are wider than a phone
+       transcript. Wrapping keeps the right-hand buttons inside the pane
+       instead of pushing them out of view (and the hairlines collapse to a
+       fixed stub so a wrapped row still reads as a boundary). */
+    flex-wrap: wrap;
+    row-gap: 3px;
   }
+  .turn-footer::before,
+  .turn-footer::after { flex: 0 0 14px; }
   .turn-model { max-width:90px; }
   .turn-fork-btn {
     width: 30px;

@@ -381,7 +381,7 @@
              hidden on desktop so it isn't duplicated. -->
         <button @click="openPalette()" class="icon-btn files-keep-mobile files-palette-mobile"
                 :title="lang==='zh' ? '命令面板（搜索文件 / 会话 / 操作）' : 'Command palette'"
-                aria-label="Command palette">
+                :aria-label="lang==='zh' ? '命令面板' : 'Command palette'">
           <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
           </svg>
@@ -1571,7 +1571,7 @@
              search" — it's app-global. -->
         <button @click="reloadApp()" class="icon-btn"
                 :title="lang==='zh' ? '重新加载（卡住时的兜底：完整刷新页面，等同关掉再打开）' : 'Reload (escape hatch when stuck: full page reload, like closing and reopening)'"
-                aria-label="Reload app">
+                :aria-label="lang==='zh' ? '重新加载应用' : 'Reload app'">
           <svg><use href="#i-refresh"/></svg>
         </button>
         <details class="workbench-more" @click.outside="$el.removeAttribute('open')"
@@ -1587,24 +1587,24 @@
         </button>
         <button @click="toggleSkillsDrawer()" class="icon-btn"
                 :title="t('set.skills.drawer_open')"
-                aria-label="Open skills list">
+                :aria-label="lang==='zh' ? '打开技能列表' : 'Open skills list'">
           <svg><use href="#i-puzzle"/></svg>
         <span class="workbench-action-label" x-text="t('set.skills.drawer_open')"></span></button>
         <button @click="openImageGen()" class="icon-btn"
                 :title="lang==='zh' ? 'Codex Image 2 生图' : 'Codex Image 2 image generation'"
-                aria-label="Codex Image 2">
+                :aria-label="lang==='zh' ? 'Codex Image 2 生图' : 'Codex Image 2'">
           <svg><use href="#i-image"/></svg>
         <span class="workbench-action-label" x-text="lang==='zh'?'生成图片':'Generate an image'"></span></button>
         <button @click="toggleMcpDrawer()" class="icon-btn"
                 :title="(lang==='zh'?'MCP 服务 (':'MCP servers (') + mcp.servers.length + ')'"
-                aria-label="Open MCP servers">
+                :aria-label="lang==='zh' ? '打开 MCP 服务' : 'Open MCP servers'">
           <svg><use href="#i-plug"/></svg>
         <span class="workbench-action-label" x-text="lang==='zh'?'MCP 服务':'MCP servers'"></span></button>
           </div>
         </details>
         <button @click="openPalette()" class="icon-btn chat-head-palette"
                 :title="lang==='zh' ? '命令面板  ⌘K' : 'Command palette  ⌘K'"
-                aria-label="Command palette">
+                :aria-label="lang==='zh' ? '命令面板' : 'Command palette'">
           <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
           </svg>
@@ -2389,7 +2389,7 @@
                         </svg>
                       </span>
                       <span class="icon"><svg><use href="#i-brain"/></svg></span>
-                      <span class="thinking-label-text">thinking</span>
+                      <span class="thinking-label-text" x-text="lang==='zh' ? '思考过程' : 'thinking'"></span>
                       <span x-show="!isMsgExpanded(i, m, false, pane, paneMsgs)" class="thinking-preview" x-text="thinkingPreview(m)"></span>
                     </div>
                     <pre x-data="thinkingViewport()"
@@ -3435,12 +3435,12 @@
                     :disabled="permissionControlDisabled()"
                     :aria-busy="tabState[currentId]?._permissionChangePending"
                     :title="permissionControlTitle()">
-              <option value="bypassPermissions">bypass</option>
-              <option value="acceptEdits">acceptEdits</option>
-              <option value="default">default</option>
-              <option value="dontAsk">dontAsk</option>
-              <option value="auto">auto</option>
-              <option value="plan">plan</option>
+              <option value="bypassPermissions" x-text="permissionModeLabel('bypassPermissions')"></option>
+              <option value="acceptEdits" x-text="permissionModeLabel('acceptEdits')"></option>
+              <option value="default" x-text="permissionModeLabel('default')"></option>
+              <option value="dontAsk" x-text="permissionModeLabel('dontAsk')"></option>
+              <option value="auto" x-text="permissionModeLabel('auto')"></option>
+              <option value="plan" x-text="permissionModeLabel('plan')"></option>
             </select>
           </label>
           <!-- `effort.label`, not `effort.title`: the latter is tooltip prose
@@ -3738,12 +3738,12 @@
                     :disabled="permissionControlDisabled()"
                     :aria-busy="tabState[currentId]?._permissionChangePending"
                     :title="permissionControlTitle()">
-              <option value="bypassPermissions">bypass</option>
-              <option value="acceptEdits">acceptEdits</option>
-              <option value="default">default</option>
-              <option value="dontAsk">dontAsk</option>
-              <option value="auto">auto</option>
-              <option value="plan">plan</option>
+              <option value="bypassPermissions" x-text="permissionModeLabel('bypassPermissions')"></option>
+              <option value="acceptEdits" x-text="permissionModeLabel('acceptEdits')"></option>
+              <option value="default" x-text="permissionModeLabel('default')"></option>
+              <option value="dontAsk" x-text="permissionModeLabel('dontAsk')"></option>
+              <option value="auto" x-text="permissionModeLabel('auto')"></option>
+              <option value="plan" x-text="permissionModeLabel('plan')"></option>
             </select>
             <!-- Reasoning effort. Options come from this model's exact
                  /api/chat/providers effort_levels capability list. This keeps
@@ -3870,7 +3870,7 @@
                     x-show="_currentQueueLen() > 0"
                     x-text="_currentQueueLen()"></span>
             </button>
-            <button x-show="isTabStreaming(currentId) || _hasPendingAdmission(activeSessionPane()) || activeSessionPane()._uncertainSubmission?.kind==='turn'" @click="stop()"
+            <button x-show="isTabStreaming(currentId) || manualCompactActive(currentId) || _hasPendingAdmission(activeSessionPane()) || activeSessionPane()._uncertainSubmission?.kind==='turn'" @click="stop()"
                     class="btn-danger chat-toolbar-send chat-toolbar-stop"
                     :disabled="workspaceSwitching || !!(tabState[currentId] && (tabState[currentId]._stoppingTurnId || tabState[currentId]._cancelBeforeStream))"
                     :aria-label="t('btn.stop')"
@@ -5653,12 +5653,12 @@
           <div class="settings-row">
             <label for="setting-settings-draftdefaults-permission" x-text="t('set.label.default_permission')"></label>
             <select id="setting-settings-draftdefaults-permission" x-model="settings.draftDefaults.permission" class="settings-input">
-              <option value="bypassPermissions" x-text="lang==='zh' ? 'bypass（无提示）' : 'bypass (no prompts)'"></option>
-              <option value="acceptEdits">acceptEdits</option>
-              <option value="default">default</option>
-              <option value="dontAsk">dontAsk</option>
-              <option value="auto">auto</option>
-              <option value="plan">plan</option>
+              <option value="bypassPermissions" x-text="permissionModeLabel('bypassPermissions')"></option>
+              <option value="acceptEdits" x-text="permissionModeLabel('acceptEdits')"></option>
+              <option value="default" x-text="permissionModeLabel('default')"></option>
+              <option value="dontAsk" x-text="permissionModeLabel('dontAsk')"></option>
+              <option value="auto" x-text="permissionModeLabel('auto')"></option>
+              <option value="plan" x-text="permissionModeLabel('plan')"></option>
             </select>
           </div>
           <div class="settings-row">
@@ -6109,7 +6109,7 @@
         <span class="modal-title">⌨ <span x-text="lang==='zh' ? '键盘快捷键' : 'Keyboard shortcuts'"></span></span>
         <button class="modal-close" @click="cheatSheet.show=false"
                 :title="lang==='zh' ? '关闭' : 'Close'"
-                aria-label="Close">×</button>
+                :aria-label="lang==='zh' ? '关闭' : 'Close'">×</button>
       </div>
       <div class="modal-body">
         <table class="cheatsheet-table">
@@ -6606,7 +6606,8 @@
         <button class="btn-ghost sm" type="button" x-show="sessionTodoCount(true)"
                 @click="clearCompletedSessionUserTodos()"
                 x-text="lang==='zh' ? '清除已完成' : 'Clear completed'"></button>
-        <button class="modal-close" @click="closeSessionTodoBoard()" aria-label="Close">×</button>
+        <button class="modal-close" @click="closeSessionTodoBoard()"
+                :aria-label="lang==='zh' ? '关闭' : 'Close'">×</button>
       </div>
       <form class="session-todo-compose" @submit.prevent="addSessionUserTodo()">
         <input type="text" maxlength="240" autocomplete="off" autofocus
@@ -6738,7 +6739,8 @@
               :aria-hidden="!activity.loading">
           <span class="spinner-sm"></span>
         </span>
-        <button class="modal-close" @click="closeActivityCenter()" aria-label="Close">×</button>
+        <button class="modal-close" @click="closeActivityCenter()"
+                :aria-label="lang==='zh' ? '关闭' : 'Close'">×</button>
       </div>
       <div class="activity-searchbar" role="search">
         <svg aria-hidden="true"><use href="#i-search"/></svg>
