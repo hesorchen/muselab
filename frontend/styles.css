@@ -6497,7 +6497,9 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   border-bottom: 1px solid var(--c-border);
   font-weight: var(--fw-semibold);
 }
-.ctx-breakdown-body { padding: 10px 14px; max-height: 60vh; overflow-y: auto; }
+/* The popup itself is height-capped and scrolls (see _initAnchoredPopups);
+   a second 60vh cap here made a ~12-row breakdown scroll on phones. */
+.ctx-breakdown-body { padding: 10px 14px; }
 .ctx-breakdown-body.err { color: var(--c-danger); }
 .ctx-breakdown-summary {
   font-weight: var(--fw-semibold); margin-bottom: var(--sp-2);
