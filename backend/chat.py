@@ -8508,6 +8508,11 @@ async def delete_session_api(sid: str) -> dict:
     removed = await purge_session_storage_async(sid)
     if not removed:
         raise HTTPException(404, "session not found")
+    # The deleted session's ledger row is filtered out of the live summary,
+    # which changes the visible counters without a ledger mutation — tell
+    # connected clients to resync so their badge updates without the poll.
+    from .activity import activity as _activity
+    _activity.publish_visible_change()
     return {"ok": True}
 
 
@@ -8567,6 +8572,11 @@ async def purge_old_sessions_api(req: PurgeOldReq | None = None) -> dict:
             continue
         if await purge_session_storage_async(sid):
             deleted.append(sid)
+    if deleted:
+        # Same live-filter change as a single delete: push a resync instead of
+        # waiting for every client's fallback summary poll.
+        from .activity import activity as _activity
+        _activity.publish_visible_change()
     return {"ok": True, "deleted": len(deleted), "ids": deleted, "days": days}
 
 

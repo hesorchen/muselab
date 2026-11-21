@@ -340,6 +340,28 @@ def test_background_finish_retry_repairs_unread_without_reordering(
     assert payload["summary"]["unread"] == 0
 
 
+def test_visible_filter_change_publishes_resync(tmp_path, monkeypatch):
+    """A deleted session changes the live-filtered summary without a ledger
+    mutation, so it must still fan out a resync frame to SSE clients."""
+    service = _service(tmp_path, monkeypatch)
+    service.start("s1", summary="finished task")
+    service.finish("s1", "completed")
+    assert service.summary(filter_live=True)["unread"] == 1
+
+    async def exercise():
+        async with service.subscribe() as queue:
+            from backend import activity as activity_module
+            monkeypatch.setattr(activity_module.sessions, "list_sessions", lambda: [])
+            await asyncio.to_thread(service.publish_visible_change)
+            payload = await asyncio.wait_for(queue.get(), timeout=1)
+            return payload, service.summary(filter_live=True)
+
+    payload, filtered = asyncio.run(exercise())
+    assert payload["resync"] is True
+    assert payload["summary"]["unread"] == 0
+    assert filtered["unread"] == 0
+
+
 def test_completed_moves_from_review_to_history_after_ack(tmp_path, monkeypatch):
     service = _service(tmp_path, monkeypatch)
     service.start("s1", summary="produce result")

@@ -2707,7 +2707,15 @@ function portal() {
           }
         } catch (_) { /* best-effort; next tick retries */ }
         await this._recoverStalledStream(this.currentId);
-        await this.fetchActivity({ summaryOnly: !this.activity.show });
+        // The activity EventSource pushes the same summary this endpoint
+        // returns on every ledger change, so polling it while the stream is
+        // connected is pure duplication. Keep the poll as the fallback for
+        // the windows where the stream is down or reconnecting; the ticket /
+        // backoff path nulls _activityLiveSource on error, and the `ready`
+        // frame re-arms the health check.
+        if (!this._activitySseHealthy()) {
+          await this.fetchActivity({ summaryOnly: !this.activity.show });
+        }
       }, 10_000);
     },
 
@@ -2716,15 +2724,14 @@ function portal() {
       this._deferredBootWorkScheduled = true;
       const run = () => {
         // These snapshots decorate an already-usable shell. Keeping them off the
-        // critical path prevents six unrelated endpoints and preview bundles
-        // from competing with context/session startup on tunneled connections.
+        // critical path prevents these endpoints from competing with
+        // context/session startup on tunneled connections.
         void Promise.resolve(this.fetchActivity()).catch(() => false).finally(
           () => this.ackCurrentActivity(),
         );
         void Promise.resolve(this.fetchStats()).catch(() => false);
         void Promise.resolve(this.loadTrash()).catch(() => false);
         void Promise.resolve(this._checkInterruptedTurns()).catch(() => false);
-        this._prewarmPreviewLibs();
       };
       const schedule = () => {
         try {
@@ -5845,15 +5852,14 @@ function portal() {
       tmp.innerHTML = safe;
       const looksLikeMath = /\$\$|\\\(|\\\[|\$[^$\n]+\$/.test(text);
       if (!window.renderMathInElement && looksLikeMath) {
-        this._loadKatex().then(() => {
-          // KaTeX just finished loading. The bubble that triggered this load
-          // (and any rendered before the fetch resolved) fell through with raw
-          // `$$` delimiters because chat bubbles render once into a stored
-          // `m.html` — they are NOT live mdRender bindings, so nothing
-          // recomputes them on its own. Recompute the math-bearing ones now
-          // that KaTeX is available; subsequent renders typeset inline.
-          this._rerenderMathMessages();
-        }).catch((e) => console.warn("[muselab] katex lazy load failed:", e));
+        // KaTeX just started loading. The bubble that triggered this load
+        // (and any rendered before the fetch resolved) fell through with raw
+        // `$$` delimiters because chat bubbles render once into a stored
+        // `m.html` — they are NOT live mdRender bindings, so nothing
+        // recomputes them on its own. _scheduleMathRerender recomputes the
+        // math-bearing bubbles once the library is ready; subsequent renders
+        // typeset inline.
+        this._scheduleMathRerender();
       }
       // Only walk the DOM for math when the source actually carries a math
       // delimiter. renderMathInElement on a delimiter-free bubble is a no-op
@@ -5924,13 +5930,31 @@ function portal() {
     // into a stored `m.html` (not a live mdRender binding), so the bubbles
     // that rendered before the load resolved keep raw `$$` forever. Once KaTeX
     // is present, recompute the math-bearing bubbles (and the markdown preview
-    // pane) so they typeset. Runs at most once per session.
+    // pane) so they typeset. Repeat triggers fold into the in-flight load.
+    _scheduleMathRerender() {
+      if (this._katexRerenderPromise) return this._katexRerenderPromise;
+      this._katexRerenderPromise = this._loadKatex()
+        .then(() => this._rerenderMathMessages())
+        .catch((e) => console.warn("[muselab] katex lazy load failed:", e))
+        .finally(() => { this._katexRerenderPromise = null; });
+      return this._katexRerenderPromise;
+    },
+
+    // Sweep every open tab, not just the active one: idle tab preloading and
+    // background history loads can paint math bubbles before KaTeX lands, and
+    // those stored `m.html` strings would otherwise stay raw on tab switch.
     _rerenderMathMessages() {
       if (!window.renderMathInElement) return;
       const RE = /\$\$|\\\(|\\\[|\$[^$\n]+\$/;
-      const owner = this.activeSessionPane();
-      const messages = owner.messages;
-      if (Array.isArray(messages)) {
+      const active = this.activeSessionPane();
+      const owners = [{ sid: this.currentId, state: active }];
+      for (const sid in (this.tabState || {})) {
+        const st = this.tabState[sid];
+        if (st && st !== active) owners.push({ sid, state: st });
+      }
+      for (const owner of owners) {
+        const messages = owner.state && owner.state.messages;
+        if (!Array.isArray(messages)) continue;
         for (const m of messages) {
           if (m && typeof m.text === "string" && m.html && RE.test(m.text)) {
             this._mdCacheDelete(m.text);  // drop stale (raw-$$) cache entry
@@ -5938,18 +5962,37 @@ function portal() {
             if (m.text.length >= 16 * 1024) {
               m._htmlSourceText = "";
               void this._renderHistoryMessageAsync(m, () =>
-                this.activeSessionPane() === owner && owner.messages.includes(m))
-                .then(html => { if (html !== null) m.html = html; }).catch(() => {});
+                this.tabState[owner.sid] === owner.state
+                && owner.state.messages.includes(m))
+                .then(html => {
+                  if (html === null) return;
+                  m.html = html;
+                  this._scheduleMathHighlight();
+                }).catch(() => {});
             } else m.html = this._renderHistoryMessage(m);
           }
         }
       }
+      // Assigning m.html replaces the bubble's DOM subtree (Alpine x-html),
+      // which discards the hljs classes highlightCode had already applied.
+      // Re-run the chunked highlighter on the visible pane; the data-hl
+      // sentinel makes the pass a no-op for blocks that were not replaced.
+      this._scheduleMathHighlight();
       // Markdown file-preview pane keeps its own rendered string.
       if (this.editing && this.editorIsMd) this._scheduleLivePreview();
       if (!this.editing && typeof this.rawText === "string" && this.previewMode === "md" && RE.test(this.rawText)) {
         this._mdCacheDelete(this.rawText);
         this.renderedMd = this._renderPreviewMd(this.rawText);
       }
+    },
+
+    // Assigning m.html above replaced the bubble DOM (and its hljs classes);
+    // one chunked pass over the visible pane restores code highlighting.
+    _scheduleMathHighlight() {
+      this.$nextTick(() => {
+        const pane = this._paneElement(this.currentId);
+        void this.highlightCode(".chat-body", pane ? [pane] : null);
+      });
     },
 
     // Path-shaped strings inside inline <code> become clickable `.file-link`
@@ -29853,11 +29896,11 @@ function portal() {
       // querySelectorAll + per-node walk on every highlight pass (warm tab
       // switches re-run this over a long body).
       //
-      // Doing the collection before the hljs guard means a preview/chat with
+      // Doing the collection before any vendor load means a preview/chat with
       // ZERO fenced blocks (e.g. a prose-only markdown file) pays neither the
       // 124 KB hljs download nor a highlight pass — it goes straight to
-      // runArtifacts and returns. Previously the unconditional `if (!hljs)`
-      // guard fetched + parsed hljs on the FIRST preview open regardless of
+      // runArtifacts and returns. The old unconditional `if (!hljs)` guard
+      // fetched + parsed hljs on the FIRST preview open regardless of
       // content, which is exactly the kind of cold-load freeze we're killing.
       //
       // scopeEls (optional): when the caller knows the new content is confined
@@ -29882,8 +29925,9 @@ function portal() {
         // previews (.text) are raw read-only views where auto-rendering
         // embedded HTML / running Mermaid would be unexpected. Note: mermaid
         // / html blocks ARE <pre><code> nodes, so when present they're already
-        // in `nodes` above and hljs loads via the guard below; a no-block root
-        // still scans here (cheap querySelectorAll, no vendor load).
+        // in `nodes` above and the render worker loads hljs for them; a
+        // no-block root still scans here (cheap querySelectorAll, no vendor
+        // load).
         if (root === ".chat-body" || root === ".markdown") {
           return this._renderArtifacts(root, scopeEls).catch(e =>
             console.warn("[muselab] artifacts render failed:", e));
@@ -29959,20 +30003,17 @@ function portal() {
       return out;
     },
     // Candidate languages for highlightAuto when a code block has no explicit
-    // language tag. Computed once (filtered to whatever hljs actually has
-    // registered, so an unbundled language never throws). Covers the langs that
-    // realistically show up in chat; anything outside still renders, just as
-    // plain text instead of mis-detected exotic syntax.
+    // language tag. Covers the langs that realistically show up in chat; the
+    // render worker filters this list against the grammars it actually has
+    // registered, so a name it cannot parse is simply skipped. The page keeps
+    // no highlight.js copy of its own — the worker owns both loading and
+    // highlighting.
     _hlAutoSubset() {
       if (this.__hlSubset) return this.__hlSubset;
-      const want = ["python", "javascript", "typescript", "json", "bash",
+      this.__hlSubset = ["python", "javascript", "typescript", "json", "bash",
         "shell", "yaml", "sql", "java", "go", "rust", "c", "cpp", "csharp",
         "html", "xml", "css", "scss", "markdown", "diff", "ini", "dockerfile",
         "makefile", "php", "ruby", "kotlin", "swift", "lua", "plaintext"];
-      const hl = window.hljs;
-      this.__hlSubset = hl
-        ? want.filter(l => { try { return !!hl.getLanguage(l); } catch { return false; } })
-        : want;
       return this.__hlSubset;
     },
     // Highlight a single <code> block (extracted from highlightCode so the
@@ -31483,122 +31524,16 @@ function portal() {
       return this[key];
     },
 
-    // highlight.js is ~150 KB (124 KB core + 24 KB extra language files for
-    // dockerfile / makefile / protobuf / accesslog / graphql) — only fires
-    // when a message / file preview contains a ```fenced``` code block.
-    // Plenty of "let me ask Muse a question" turns have zero code, so we
-    // skip the download until the first highlightCode() call.
-    // The hljs theme CSS (~4 KB) IS preloaded in index.html to prevent a
-    // brief unstyled flash when the script lands and re-highlights blocks.
-    // Language files load in parallel after the core (they depend on
-    // window.hljs existing); _loadAssets's sequential model would block
-    // them serially, so we hand-roll the parallel tail here.
-    // Idle prewarm of the preview vendor bundles so a markdown file's
-    // post-paint $nextTick (highlightCode → _renderArtifacts) doesn't pay the
-    // cold load+compile of hljs / katex / mermaid (mermaid alone is ~3.3 MB).
-    // Scheduled on requestIdleCallback (fallback: a deferred timeout) so it
-    // never competes with the initial app render. Each step is fire-and-forget
-    // and swallows errors — the on-demand lazy loaders remain the fallback.
-    _prewarmPreviewLibs() {
-      if (this._previewLibsPrewarmed || !this.appReady) return;
-      // Hidden tabs, data-saver and genuinely slow cellular links should keep
-      // bandwidth and parse budget for user-requested work. On-demand loaders
-      // remain available when the user actually opens rich preview content.
-      if (typeof document !== "undefined" && document.hidden) return;
-      const connection = typeof navigator !== "undefined"
-        ? navigator.connection : null;
-      if (connection && (connection.saveData
-          || ["slow-2g", "2g"].includes(connection.effectiveType))) return;
-      this._previewLibsPrewarmed = true;
-      // Each job below injects + parses a heavy vendor bundle on the main
-      // thread. Firing them all inside ONE idle slice re-creates the freeze
-      // we're trying to avoid: hljs + katex injected back-to-back evaluate in
-      // a tight cluster right when the user opens their first file. Instead
-      // drain the queue ONE job per idle callback, so the browser can service
-      // user interaction between each parse. Order matters — hljs/katex serve
-      // the common read-only markdown preview, so they go first.
-      const queue = [
-        // hljs: load the bundle, then force-compile the auto-detect subset
-        // with one throwaway pass so the FIRST real highlight is cheap.
-        () => this._loadHljs().then(() => {
-          try { window.hljs && window.hljs.highlightAuto("x", this._hlAutoSubset()); } catch (_) {}
-        }),
-        // katex: the dominant cost is the script parse at load time, so simply
-        // loading it off the click path is the win.
-        () => this._loadKatex(),
-        // mermaid is deliberately NOT prewarmed: its 3.2 MB download + parse
-        // costs far more than every other vendor combined, and most sessions
-        // never render a single diagram. _renderArtifacts lazy-loads it on the
-        // first actual ```mermaid block, which is rare enough that the one-time
-        // cold load there is acceptable.
-        //
-        // CodeMirror (~308 KB, 18 files) is also NOT prewarmed here: it's
-        // editor-only, and read-only preview — the overwhelmingly common path —
-        // never needs it. Bundling it into startup added the biggest chunk to
-        // the idle parse burst. It now warms on edit-button hover/focus instead
-        // (see the toggleEdit button in index.html), so the first click-to-edit
-        // is still near-instant without taxing every preview open.
-      ];
-      const idle = (fn) => {
-        try {
-          if (typeof window !== "undefined" && window.requestIdleCallback) {
-            window.requestIdleCallback(fn, { timeout: 3000 });
-          } else {
-            setTimeout(fn, 300);
-          }
-        } catch (_) { setTimeout(fn, 300); }
-      };
-      const drain = () => {
-        const job = queue.shift();
-        if (!job) return;
-        // Do not schedule the next heavy parse until this job has settled.
-        // One idle callback per item alone is not enough: requestIdleCallback
-        // may run again while the previous asset is still downloading or
-        // evaluating, clustering hljs and KaTeX work on the main thread.
-        Promise.resolve().then(job).catch(() => {}).finally(() => {
-          if (queue.length) idle(drain);
-        });
-      };
-      idle(drain);
-    },
-
-    async _loadHljs() {
-      if (window.hljs) return;
-      if (this._hljsLoadPromise) return this._hljsLoadPromise;
-      const inject = (path) => new Promise((resolve, reject) => {
-        const src = this._staticAssetUrl(path);
-        if (document.querySelector(`script[src="${src}"]`)) {
-          // Already in DOM — just wait for window.hljs to materialize.
-          const t0 = Date.now();
-          (function wait() {
-            if (window.hljs) return resolve();
-            if (Date.now() - t0 > 5000) return reject(new Error("hljs ready timeout"));
-            setTimeout(wait, 50);
-          })();
-          return;
-        }
-        const s = document.createElement("script");
-        s.src = src;
-        s.onload = resolve;
-        s.onerror = () => reject(new Error("load failed: " + src));
-        document.head.appendChild(s);
-      });
-      this._hljsLoadPromise = (async () => {
-        await inject("/static/vendor/highlight.min.js");
-        if (!window.hljs) throw new Error("hljs loaded but window.hljs missing");
-        await Promise.all([
-          inject("/static/vendor/hljs-langs/dockerfile.min.js"),
-          inject("/static/vendor/hljs-langs/makefile.min.js"),
-          inject("/static/vendor/hljs-langs/protobuf.min.js"),
-          inject("/static/vendor/hljs-langs/accesslog.min.js"),
-          inject("/static/vendor/hljs-langs/graphql.min.js"),
-        ]);
-      })().catch(e => {
-        this._hljsLoadPromise = null;   // allow retry next call
-        throw e;
-      });
-      return this._hljsLoadPromise;
-    },
+    // Code highlighting and math are NOT prewarmed at boot. The render worker
+    // loads the highlight.js core with the first fenced code block and pulls a
+    // language pack only when a block explicitly names that language (see
+    // render-worker.js) — a prose-only session downloads neither. KaTeX loads
+    // from _mdRenderUncached / _renderLivePreview the first time content with
+    // math delimiters is about to render, and _rerenderMathMessages() typesets
+    // bubbles painted while that fetch was in flight. The hljs theme CSS
+    // (~4 KB) is preloaded in index.html so highlighting never flashes
+    // unstyled. mermaid (~3.2 MB) and CodeMirror stay on-demand for the same
+    // reason — see _renderArtifacts and the edit-button warmers.
 
     // KaTeX is ~562 KB (with fonts) of math rendering — only fires when a
     // message body contains $...$, $$...$$, \(...\), or \[...\] delimiters.
@@ -39897,6 +39832,17 @@ function portal() {
       return this._retryDelay(this._activityLiveFailures, {
         baseMs: 1000, maxMs: 30000, jitterMs: 500,
       });
+    },
+    // True only while the activity SSE stream is established and has not seen
+    // a reconnect failure. Every ledger mutation publishes its summary on that
+    // stream, so the 10 s sessions loop can skip GET /api/activity/summary;
+    // when this returns false (initial connect, ticket failure, onerror,
+    // background tab) the poll resumes as the fallback.
+    _activitySseHealthy() {
+      const es = this._activityLiveSource;
+      const open = typeof EventSource !== "undefined" ? EventSource.OPEN : 1;
+      if (!es || es.readyState !== open) return false;
+      return !this._activityLiveFailures;
     },
     _bindActivityVisibility() {
       if (this._activityLiveVisibilityBound
