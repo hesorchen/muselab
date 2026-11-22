@@ -66,6 +66,12 @@ app._requestSessionSync = () => false;
 app.loadSession = async () => false;
 app._scheduleIdlePreload = () => {};
 app._fetchTabUsage = async () => {};
+// Hold the constructed mounted window still. In the real cases it stays
+// short of the tail (live paused-tail limit / reader away from the bottom);
+// on a slower runner the bottom-scroll reveal would otherwise widen it to
+// the tail before the footers are measured.
+app._revealLaterHistory = async () => false;
+app.returnToLatest = async () => false;
 const sid = app.currentId, st = app._ensureTabState(sid);
 st.messages.splice(0, st.messages.length,
   ...arg.rows.map((row, n) => ({...row, _k: 'rf' + n})));
