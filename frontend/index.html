@@ -3108,13 +3108,9 @@
               <!-- x-show keeps child bindings alive, including full-turn
                    ownership scans. Mount them only at a turn boundary so
                    hidden rows in warm panes do not repeat that work on SSE. -->
-              <template x-if="(m.role !== 'user' || m.turn_status || m._interrupted || m._failed)
-                     && (i === paneMsgs.length - 1
-                       || (paneMsgs[i + 1] && (
-                         (paneMsgs[i + 1].role === 'user'
-                           && paneMsgs[i + 1]._steeringAdjustment !== true)
-                         || paneMsgs[i + 1].display_kind === 'runtime_continuation'
-                       )))">
+              <!-- The mount rule lives in rowHostsTurnFooter() so the pending
+                   footer below reaches the same verdict on the same slice. -->
+              <template x-if="rowHostsTurnFooter(paneMsgs, i)">
                 <div class="turn-footer"
                      x-show="turnFooterStatus(m, pane)
                        && (
@@ -3260,7 +3256,8 @@
                block arrives, whereupon that block's own footer takes over. -->
           <!-- Auto-compact has its distinct 📦 placeholder and wins this slot.
                Visibility follows the single live source, _paneMainLoopLive,
-               and yields to a tail row that already hosts its own footer. -->
+               and yields to the mounted tail row when that row already shows
+               its own footer (same rowHostsTurnFooter rule as the x-if). -->
           <div x-show="_paneMainLoopLive(activeSession) && !_paneTailHostsFooter(activeSession)
                        && (!activeSession.messages.length
                          || !activeSession.messages[activeSession.messages.length-1]._admissionPending)
@@ -3278,16 +3275,19 @@
                       @click.stop="reconnectLivePane(currentId)"
                       x-text="lang==='zh' ? '重新连接' : 'Reconnect'"></button>
             </span>
-            <span x-show="activeSession._streamStartedAt"
+            <!-- Same time / elapsed / model contract as the row footer: a turn
+                 owned only by the server's main-loop flag has no local stream
+                 fields, and must not render as a bare "Running". -->
+            <span x-show="paneRunningStartedAt(activeSession)"
                   class="msg-ts"
-                  x-text="fmtTurnTime(activeSession._streamStartedAt)"></span>
-            <span x-show="activeSession.streamElapsed >= 1"
+                  x-text="fmtTurnTime(paneRunningStartedAt(activeSession))"></span>
+            <span x-show="paneRunningElapsed(activeSession) >= 1"
                   class="msg-elapsed"
-                  x-text="'· ' + fmtStreamElapsed(activeSession.streamElapsed)"></span>
-            <span x-show="activeSession.streamingModel"
+                  x-text="'· ' + fmtStreamElapsed(paneRunningElapsed(activeSession))"></span>
+            <span x-show="paneRunningModel(activeSession)"
                   class="turn-model"
-                  :title="activeSession.streamingModel"
-                  x-text="'· ' + modelLabel(activeSession.streamingModel)"></span>
+                  :title="paneRunningModel(activeSession)"
+                  x-text="'· ' + modelLabel(paneRunningModel(activeSession))"></span>
           </div>
 
           <!-- Standalone streaming rows are retired. Before the first response
