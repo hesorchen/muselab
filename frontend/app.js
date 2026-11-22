@@ -4976,15 +4976,36 @@ function portal() {
       return !!(m && Array.isArray(rows) && rows.length
         && rows[rows.length - 1] === m);
     },
-    // Whether the tail row mounts its own turn footer (mirrors the row-footer
-    // x-if in index.html). Exactly one place shows the live status: that row,
-    // or else the pane-level pending footer. A user tail carrying a status
-    // flag hosts a row footer, so the pending footer must not repeat it.
+    // One source of truth for "does this row mount the per-turn footer?".
+    // The row template's x-if and the pane-level pending footer both call it,
+    // on the SAME revealed slice (paneMsgs), so the two places cannot drift
+    // into stacking two footers or stranding a live turn with none. The old
+    // repo-tail shortcut ignored the next-row rules (steering adjustments,
+    // runtime continuations) and the mounted window, so a steering row at the
+    // repository tail — or a window that had not reached the tail yet — made
+    // the pending footer repeat a row footer that was already on screen.
+    rowHostsTurnFooter(rows, i) {
+      const list = Array.isArray(rows) ? rows : [];
+      const m = list[i];
+      if (!m) return false;
+      if (!(m.role !== "user" || m.turn_status || m._interrupted || m._failed)) {
+        return false;
+      }
+      const next = list[i + 1];
+      return !next
+        || next.display_kind === "runtime_continuation"
+        || (next.role === "user" && next._steeringAdjustment !== true);
+    },
+    // Whether the last row this pane actually mounts shows its own footer.
+    // Exactly one place shows the live status: that mounted tail row, or else
+    // the pane-level pending footer. Evaluating the revealed slice (not the
+    // repository tail) keeps this in lockstep with the row x-if above.
     _paneTailHostsFooter(pane) {
-      const rows = pane && pane.messages;
-      const tail = Array.isArray(rows) && rows.length ? rows[rows.length - 1] : null;
-      return !!(tail && (tail.role !== "user"
-        || tail.turn_status || tail._interrupted || tail._failed));
+      const rows = this._visiblePaneMessages(pane);
+      if (!rows.length) return false;
+      const tail = rows[rows.length - 1];
+      return this.rowHostsTurnFooter(rows, rows.length - 1)
+        && !!this.turnFooterStatus(tail, pane);
     },
     turnFooterStatus(m, pane) {
       const stored = String((m && m.turn_status)
@@ -5151,6 +5172,29 @@ function portal() {
         if (live) return live;
       }
       const meta = (this.sessions || []).find(session => session.id === sid);
+      return String((meta && meta.model) || "");
+    },
+    // Pending-footer mirrors of the row footer's live fields. A turn owned by
+    // the server's main-loop flag (started on another device, resumed after a
+    // restart) has no local stream timer or model, so fall back to the same
+    // server-derived clock and session model the row footer uses instead of
+    // rendering a bare "Running" with no time / elapsed / model.
+    paneRunningStartedAt(pane) {
+      return Number((pane && (pane._streamStartedAt
+        || pane._runningTurnStartHint)) || 0);
+    },
+    paneRunningElapsed(pane) {
+      const value = Math.max(
+        Number((pane && pane.streamElapsed) || 0),
+        this._clockedRunningElapsed(pane),
+      );
+      return Number.isFinite(value) && value >= 0 ? value : 0;
+    },
+    paneRunningModel(pane) {
+      const live = String((pane && pane.streamingModel) || "");
+      if (live) return live;
+      const meta = (this.sessions || []).find(
+        session => session.id === (pane && pane._sid));
       return String((meta && meta.model) || "");
     },
     // True when index i in messages[] is the tail of a turn — i.e. it

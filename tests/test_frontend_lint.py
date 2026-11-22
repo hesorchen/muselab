@@ -2906,7 +2906,12 @@ def test_runtime_continuation_history_identity_footer_and_fork_guards():
     assert 'tail.display_kind === "runtime_continuation"' in fork
     assert "tail.forkable === false" in fork
     assert 'next.display_kind !== "runtime_continuation"' in fork
-    assert "paneMsgs[i + 1].display_kind === 'runtime_continuation'" in html
+    # The row-footer mount rule keeps continuation rows as turn boundaries; it
+    # now lives in one function shared with the pending footer.
+    rule = app[app.index("    rowHostsTurnFooter(rows, i) {"):]
+    rule = rule[:rule.index("\n    },")]
+    assert 'next.display_kind === "runtime_continuation"' in rule
+    assert 'x-if="rowHostsTurnFooter(paneMsgs, i)"' in html
     # Runtime continuations have no preceding user row, but are still a new
     # assistant turn. Their stable data-message-key exempts them from the
     # adjacent non-user rule that hides avatars inside one ordinary turn.
@@ -3849,9 +3854,9 @@ def test_transcript_active_session_ui_reads_through_pane_facade():
         "activeSession.messages",
         "activeSession.messagesReady",
         "activeSession.messagesLoading",
-        "activeSession.streaming",
-        "activeSession.streamingModel",
-        "activeSession.streamElapsed",
+        "_paneMainLoopLive(activeSession)",
+        "paneRunningModel(activeSession)",
+        "paneRunningElapsed(activeSession)",
         "queueDisplayItems(activeSession)",
     ):
         assert binding in transcript or binding in outbox
@@ -4327,8 +4332,8 @@ def test_long_chat_state_keeps_complete_normalized_history_and_generation_safety
     assert "pane.streaming" in pane
     # The single shared footer reads through the active-session façade rather
     # than duplicating elapsed timers inside every warm transcript pane.
-    assert "activeSession.streamElapsed" in html
-    assert 'x-text="\'· \' + fmtStreamElapsed(activeSession.streamElapsed)"' in html
+    assert "paneRunningElapsed(activeSession)" in html
+    assert 'fmtStreamElapsed(paneRunningElapsed(activeSession))' in html
     assert "messages.length" not in re.sub(r"<!--.*?-->", "", pane, flags=re.S)
     assert "streaming &&" not in re.sub(r"<!--.*?-->", "", pane, flags=re.S).replace(
         "pane.streaming &&", "")
@@ -5332,7 +5337,13 @@ def test_running_turn_footer_is_owned_by_active_user_boundary():
     footer_start = html.index('<div class="turn-footer"')
     footer = html[html.rfind("<template", 0, footer_start):]
     footer = footer[:footer.index('<button class="turn-fork-btn"')]
-    assert "paneMsgs[i + 1]._steeringAdjustment !== true" in footer
+    # Mount rule is shared with the pending footer instead of duplicated here.
+    assert 'x-if="rowHostsTurnFooter(paneMsgs, i)"' in footer
+    rule_start = app.index("    rowHostsTurnFooter(rows, i) {")
+    rule_end = app.index("\n    // Whether the last row", rule_start)
+    rule = app[rule_start:rule_end]
+    assert "next._steeringAdjustment !== true" in rule
+    assert 'next.display_kind === "runtime_continuation"' in rule
 
     turn_tail_start = app.index("isTurnTail(i) {")
     turn_tail_end = app.index("\n    turnForkMessageId", turn_tail_start)
@@ -5393,7 +5404,10 @@ def test_turn_footer_falls_back_to_transcript_time_and_shows_model_and_state():
     assert "m.turn_status = turnStatus" in mark
     assert "if (!m.memoryRecall && memoryRecall)" in mark
     assert "if (!tailCandidate && lastUserCandidate && turnStatus)" in mark
-    assert "m.role !== 'user' || m.turn_status || m._interrupted || m._failed" in footer
+    rule = app[app.index("    rowHostsTurnFooter(rows, i) {"):]
+    rule = rule[:rule.index("\n    },")]
+    assert 'm.role !== "user" || m.turn_status || m._interrupted || m._failed' in rule
+    assert 'x-if="rowHostsTurnFooter(paneMsgs, i)"' in footer
 
 
 def test_queue_controls_validate_mutations_and_block_send_during_interrupt():
@@ -5534,28 +5548,34 @@ def test_pre_response_state_uses_the_same_turn_separator_not_a_left_bubble():
     assert 'class="turn-footer turn-pending-footer"' in html
     pending_start = html.index('class="turn-footer turn-pending-footer"')
     pending = html[html.rfind("<div", 0, pending_start):html.index("</div>", pending_start)]
-    # One live footer: the pane-level copy yields to a tail row that hosts one.
+    # One live footer: the pane-level copy yields to a mounted tail row that
+    # hosts one, and both read the same rule/slice (rowHostsTurnFooter).
     assert "!_paneTailHostsFooter(activeSession)" in pending
     assert "role === 'user'" not in pending
     app_js = (FRONTEND / "app.js").read_text(encoding="utf-8")
     hosts = app_js[app_js.index("    _paneTailHostsFooter(pane) {"):]
     hosts = hosts[:hosts.index("\n    },")]
-    for flag in ('tail.role !== "user"', "tail.turn_status", "tail._interrupted", "tail._failed"):
-        assert flag in hosts
+    assert "this._visiblePaneMessages(pane)" in hosts
+    assert "this.rowHostsTurnFooter(rows, rows.length - 1)" in hosts
+    rule = app_js[app_js.index("    rowHostsTurnFooter(rows, i) {"):]
+    rule = rule[:rule.index("\n    },")]
+    for flag in ('m.role !== "user"', "m.turn_status", "m._interrupted", "m._failed"):
+        assert flag in rule
     assert "!activeSession.compacting" in pending
     assert "_paneMainLoopLive(activeSession)" in pending
     assert 'class="msg assistant"' not in pending
     assert "assistant-avatar" not in pending
     assert 'class="turn-running-dots"' in pending
     assert "streamPhaseLabel(activeSession.streamPhase)" in pending
-    assert "fmtTurnTime(activeSession._streamStartedAt)" in pending
-    assert "fmtStreamElapsed(activeSession.streamElapsed)" in pending
-    assert "modelLabel(activeSession.streamingModel)" in pending
+    # Same live-field contract as the row footer, incl. server-owned turns.
+    assert "fmtTurnTime(paneRunningStartedAt(activeSession))" in pending
+    assert "fmtStreamElapsed(paneRunningElapsed(activeSession))" in pending
+    assert "modelLabel(paneRunningModel(activeSession))" in pending
 
     footer_start = html.index('<div class="turn-footer"')
     footer = html[html.rfind("<template", 0, footer_start):]
     footer = footer[:footer.index('<button class="turn-fork-btn"')]
-    assert "m.role !== 'user'" in footer
+    assert "rowHostsTurnFooter(paneMsgs, i)" in footer
     assert "turnFooterStatus(m, pane) === 'running'" in footer
 
 
